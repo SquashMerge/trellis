@@ -3,6 +3,8 @@
 use super::shared::DeclarationId;
 use super::*;
 
+mod digest;
+
 type RouteKey = (usize, String);
 type Route = BTreeSet<RouteKey>;
 
@@ -200,21 +202,6 @@ struct ModuleEdge {
 pub(super) struct Catalog {
     scopes: Vec<Scope>,
     scope_indexes: BTreeMap<usize, ScopeIndex>,
-    export_memo: BTreeMap<(usize, usize, bool, bool), std::sync::Arc<ExportMemo>>,
-    export_traces: Vec<ExportTrace>,
-    /// Whether a nearer binding blocks the extern prelude for a first segment, by the scope
-    /// `external_target`'s walk reaches, the segment and strictness (#1210): the walk from
-    /// that scope up reads the same scopes for every lookup with no import excluded.
-    prelude_memo: BTreeMap<(usize, String, bool), bool>,
-    /// A site's own path's names, by the first scope that could bind its first segment and
-    /// the path (#1210): every site whose scope climbs to it reads the same answer.
-    path_memo: BTreeMap<(usize, Vec<String>), std::sync::Arc<Names>>,
-    /// Whether a dependency's statement macro's import reads its package, by the import's
-    /// scope and start (#1223), within one pass of `prove_known_macros`.
-    import_memo: BTreeMap<(usize, usize), bool>,
-    /// Tests read without the two memos above, to compare the answers.
-    #[cfg(test)]
-    memos: bool,
     files: BTreeMap<usize, usize>,
     file_declarations: BTreeMap<usize, DeclarationId>,
     roots: BTreeMap<usize, BTreeSet<usize>>,
@@ -237,10 +224,72 @@ pub(super) struct Catalog {
     /// The statement macro calls, the standard library's (#1210) and dependencies' (#1223),
     /// read as binding nothing until a proof fails.
     statement_macros: Vec<StatementMacro>,
+}
+
+/// Accounting and lookup state for one build, not resolution-semantic identity.
+pub(super) struct RustExecution {
+    export_memo: BTreeMap<(usize, usize, bool, bool), std::sync::Arc<ExportMemo>>,
+    export_traces: Vec<ExportTrace>,
+    /// Whether a nearer binding blocks the extern prelude for a first segment, by the scope
+    /// `external_target`'s walk reaches, the segment and strictness (#1210): the walk from
+    /// that scope up reads the same scopes for every lookup with no import excluded.
+    prelude_memo: BTreeMap<(usize, String, bool), bool>,
+    /// A site's own path's names, by the first scope that could bind its first segment and
+    /// the path (#1210): every site whose scope climbs to it reads the same answer.
+    path_memo: BTreeMap<(usize, Vec<String>), std::sync::Arc<Names>>,
+    /// Whether a dependency's statement macro's import reads its package, by the import's
+    /// scope and start (#1223), within one pass of `prove_known_macros`.
+    import_memo: BTreeMap<(usize, usize), bool>,
+    /// Tests read without the two memos above, to compare the answers.
+    #[cfg(test)]
+    memos: bool,
     /// While `scan` is inside an expression statement whose macro calls are all
     /// statement macros: the scope of the outermost such statement.
     statement_owner: Option<usize>,
     pub(super) work: Work,
+}
+
+pub(super) struct RustResolver<'a> {
+    catalog: &'a mut Catalog,
+    execution: &'a mut RustExecution,
+}
+
+impl std::ops::Deref for RustResolver<'_> {
+    type Target = Catalog;
+    fn deref(&self) -> &Catalog {
+        self.catalog
+    }
+}
+
+impl std::ops::DerefMut for RustResolver<'_> {
+    fn deref_mut(&mut self) -> &mut Catalog {
+        self.catalog
+    }
+}
+
+impl RustExecution {
+    fn new(work: Work) -> Self {
+        Self {
+            export_memo: BTreeMap::new(),
+            export_traces: Vec::new(),
+            prelude_memo: BTreeMap::new(),
+            path_memo: BTreeMap::new(),
+            import_memo: BTreeMap::new(),
+            #[cfg(test)]
+            memos: true,
+            statement_owner: None,
+            work,
+        }
+    }
+}
+
+impl Catalog {
+    pub(super) fn resolver<'a>(&'a mut self, execution: &'a mut RustExecution) -> RustResolver<'a> {
+        RustResolver {
+            catalog: self,
+            execution,
+        }
+    }
 }
 /// A crate root: a conventional root of the checkout's package, or a library or binary
 /// root of a proved Cargo workspace member (#772). Its modules live in its directory.
@@ -267,17 +316,10 @@ impl Catalog {
         packages: &external::RustPackages,
         work: Work,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Self> {
-        let mut result = Self {
+    ) -> Result<(Self, RustExecution)> {
+        let mut catalog = Self {
             scopes: Vec::new(),
             scope_indexes: BTreeMap::new(),
-            export_memo: BTreeMap::new(),
-            export_traces: Vec::new(),
-            prelude_memo: BTreeMap::new(),
-            path_memo: BTreeMap::new(),
-            import_memo: BTreeMap::new(),
-            #[cfg(test)]
-            memos: true,
             files: BTreeMap::new(),
             file_declarations: BTreeMap::new(),
             roots: BTreeMap::new(),
@@ -288,9 +330,9 @@ impl Catalog {
             variants: BTreeMap::new(),
             shadows: MacroShadows::default(),
             statement_macros: Vec::new(),
-            statement_owner: None,
-            work,
         };
+        let mut execution = RustExecution::new(work);
+        let mut result = catalog.resolver(&mut execution);
         result.read_macro_rules(docs, trees, check)?;
         let declarations = result.index_files(docs, trees, workspace, check)?;
         let mut edges = Vec::new();
@@ -318,8 +360,11 @@ impl Catalog {
         result.keep_lost_owners_unknown(docs, trees, &edges, check)?;
         result.prove_known_macros(docs, packages, check)?;
         result.build_scope_indexes(check)?;
-        Ok(result)
+        Ok((catalog, execution))
     }
+}
+
+impl RustResolver<'_> {
     /// The declarations of every Rust file by range, and each file's module scope.
     fn index_files<'a>(
         &mut self,
@@ -524,8 +569,9 @@ impl Catalog {
     fn build_scope_indexes(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
         for id in 0..self.scopes.len() {
             self.step(check)?;
-            let scope = &self.scopes[id];
-            self.scope_indexes
+            let scope = &self.catalog.scopes[id];
+            self.catalog
+                .scope_indexes
                 .entry(scope.document)
                 .or_insert_with(|| ScopeIndex {
                     ranges: Vec::new(),
@@ -534,11 +580,11 @@ impl Catalog {
                 .ranges
                 .push((id, scope.start, scope.end));
         }
-        for index in self.scope_indexes.values_mut() {
+        for index in self.catalog.scope_indexes.values_mut() {
             index.ranges.sort_by_key(|&(id, start, _)| (start, id));
             check()?;
             index.max_ends.resize(index.ranges.len(), 0);
-            index.build(0, index.ranges.len(), &mut self.work, check)?;
+            index.build(0, index.ranges.len(), &mut self.execution.work, check)?;
         }
         Ok(())
     }
@@ -604,7 +650,7 @@ impl Catalog {
     fn step(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
         check()?;
         ensure!(
-            self.work.charge(1),
+            self.execution.work.charge(1),
             "bounded_work: reference Rust resolution"
         );
         Ok(())
@@ -753,11 +799,11 @@ impl Catalog {
                         // Read as any other statement, its nested blocks scopes of their own;
                         // its calls are held as `scan` reaches them, each failed proof making
                         // this scope opaque too, as the statement's macro call did before.
-                        let outer = self.statement_owner;
-                        self.statement_owner = Some(outer.unwrap_or(scope));
+                        let outer = self.execution.statement_owner;
+                        self.execution.statement_owner = Some(outer.unwrap_or(scope));
                         self.proofs.extend(proof);
                         let descended = self.descend(docs, item, declarations, edges, depth, check);
-                        self.statement_owner = outer;
+                        self.execution.statement_owner = outer;
                         descended?;
                         continue;
                     }
@@ -875,9 +921,9 @@ impl Catalog {
                 }
             }
         }
-        self.statement_macros.push(StatementMacro {
+        self.catalog.statement_macros.push(StatementMacro {
             scope,
-            owner: self.statement_owner.unwrap_or(scope),
+            owner: self.execution.statement_owner.unwrap_or(scope),
             source,
             path,
             global,
@@ -1136,10 +1182,10 @@ impl Catalog {
     }
     /// Drops every memo of what the scopes read, once a scope has changed.
     fn forget_reads(&mut self) {
-        self.export_memo.clear();
-        self.prelude_memo.clear();
-        self.path_memo.clear();
-        self.import_memo.clear();
+        self.execution.export_memo.clear();
+        self.execution.prelude_memo.clear();
+        self.execution.path_memo.clear();
+        self.execution.import_memo.clear();
     }
     fn proves_known_macro(
         &mut self,
@@ -1408,7 +1454,7 @@ impl Catalog {
         self.step(check)?;
         let key = (at, import.0);
         if self.memos()
-            && let Some(&proved) = self.import_memo.get(&key)
+            && let Some(&proved) = self.execution.import_memo.get(&key)
         {
             return Ok(proved);
         }
@@ -1422,7 +1468,7 @@ impl Catalog {
             packages,
             check,
         )?;
-        self.import_memo.insert(key, proved);
+        self.execution.import_memo.insert(key, proved);
         Ok(proved)
     }
     /// The module a glob's path names when it is an ancestor of `scope`'s module, read as
@@ -1518,7 +1564,7 @@ impl Catalog {
                 argument,
                 (public, crate_only),
                 item_uncertain || restricted,
-                &mut self.work,
+                &mut self.execution.work,
                 check,
             )?;
             // Indexed once here; a name lookup then reads only its matches (#894).
@@ -1775,10 +1821,10 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<usize>> {
         self.step(check)?;
-        let Some(index) = self.scope_indexes.get(&document) else {
+        let Some(index) = self.catalog.scope_indexes.get(&document) else {
             return Ok(None);
         };
-        index.enclosing(start, end, &mut self.work, check)
+        index.enclosing(start, end, &mut self.execution.work, check)
     }
     fn root(&self, scope: usize) -> Option<usize> {
         let module = self.scopes[scope].module;
@@ -2365,8 +2411,8 @@ impl Catalog {
         candidate.proof.insert(declaring.document);
         // The answer depends on the route, as a refused re-entry does: no export set
         // computed around it is cached.
-        self.charge(self.export_traces.len(), check)?;
-        for trace in &mut self.export_traces {
+        self.charge(self.execution.export_traces.len(), check)?;
+        for trace in &mut self.execution.export_traces {
             trace.consulted.insert((scope, name.clone()));
             trace.cycle = true;
         }
@@ -2564,8 +2610,8 @@ impl Catalog {
     ) -> Result<bool> {
         self.step(check)?;
         let inserted = route.insert(key.clone());
-        self.charge(self.export_traces.len(), check)?;
-        for trace in &mut self.export_traces {
+        self.charge(self.execution.export_traces.len(), check)?;
+        for trace in &mut self.execution.export_traces {
             trace.consulted.insert(key.clone());
             trace.cycle |= !inserted;
         }
@@ -2652,19 +2698,19 @@ impl Catalog {
         // Depth and waiver mode affect unknown sets. Cached computations are valid only
         // when none of their consulted route keys is already visiting in this caller.
         let key = (module, depth, context.waive_external, context.foreign);
-        if let Some(memo) = self.export_memo.get(&key).cloned() {
+        if let Some(memo) = self.execution.export_memo.get(&key).cloned() {
             self.charge(memo.consulted.len(), check)?;
             if memo.consulted.is_disjoint(route) {
                 for consulted in &memo.consulted {
-                    self.charge(self.export_traces.len(), check)?;
-                    for trace in &mut self.export_traces {
+                    self.charge(self.execution.export_traces.len(), check)?;
+                    for trace in &mut self.execution.export_traces {
                         trace.consulted.insert(consulted.clone());
                     }
                 }
                 return Ok(memo.names.clone());
             }
         }
-        self.export_traces.push(ExportTrace::default());
+        self.execution.export_traces.push(ExportTrace::default());
         let route_key = (module, "*".to_owned());
         let already_visiting = route.contains(&route_key);
         let resolved = (|| {
@@ -2677,14 +2723,14 @@ impl Catalog {
             self.compute_exports(module, depth, route, context, check)
         })();
         // Only remove our own insertion; a rejected insertion belongs to the caller.
-        let trace = self.export_traces.pop().expect("export trace");
+        let trace = self.execution.export_traces.pop().expect("export trace");
         if !already_visiting {
             route.remove(&route_key);
         }
         let names = std::sync::Arc::new(resolved?);
         if !trace.cycle {
             self.charge(trace.consulted.len(), check)?;
-            self.export_memo.insert(
+            self.execution.export_memo.insert(
                 key,
                 std::sync::Arc::new(ExportMemo {
                     names: names.clone(),
@@ -2817,7 +2863,11 @@ impl Catalog {
             };
             self.step(check)?;
             if remember {
-                if let Some(&blocked) = self.prelude_memo.get(&(at, first.to_owned(), strict)) {
+                if let Some(&blocked) =
+                    self.execution
+                        .prelude_memo
+                        .get(&(at, first.to_owned(), strict))
+                {
                     break blocked;
                 }
                 visited.push(at);
@@ -2833,7 +2883,8 @@ impl Catalog {
             };
         };
         for at in visited {
-            self.prelude_memo
+            self.execution
+                .prelude_memo
                 .insert((at, first.to_owned(), strict), blocked);
         }
         Ok(blocked)
@@ -3074,12 +3125,12 @@ impl Catalog {
             }
         }
         let key = (start, path);
-        let names = match self.path_memo.get(&key).cloned() {
+        let names = match self.execution.path_memo.get(&key).cloned() {
             Some(names) => names,
             None => {
                 let names = self.path(start, &key.1, false, 1, route, context, check)?;
                 let names = std::sync::Arc::new(names);
-                self.path_memo.insert(key, names.clone());
+                self.execution.path_memo.insert(key, names.clone());
                 names
             }
         };
@@ -3094,7 +3145,7 @@ impl Catalog {
     /// Whether the prelude and path memos are read: tests compare reads without them.
     #[cfg(test)]
     fn memos(&self) -> bool {
-        self.memos
+        self.execution.memos
     }
     /// The parent of block `scope` when the block cannot bind `name`: it declares nothing of
     /// that name in either namespace and imports nothing of it, has no glob, is read whole,
@@ -3106,7 +3157,7 @@ impl Catalog {
         if scope == at.module
             || at.opaque
             || at.cut
-            || !self.export_traces.is_empty()
+            || !self.execution.export_traces.is_empty()
             || at.explicit.contains_key(&key(TYPE))
             || at.explicit.contains_key(&key(VALUE))
             || at.imports.named.contains_key(name)
@@ -4232,31 +4283,26 @@ mod cache_tests {
         }
     }
 
-    fn catalog(scopes: Vec<Scope>) -> Catalog {
-        Catalog {
-            roots: (0..scopes.len())
-                .map(|id| (id, BTreeSet::from([0])))
-                .collect(),
-            scopes,
-            scope_indexes: BTreeMap::new(),
-            export_memo: BTreeMap::new(),
-            export_traces: Vec::new(),
-            prelude_memo: BTreeMap::new(),
-            path_memo: BTreeMap::new(),
-            import_memo: BTreeMap::new(),
-            memos: true,
-            files: BTreeMap::new(),
-            file_declarations: BTreeMap::new(),
-            ambiguous: BTreeSet::new(),
-            externs: BTreeMap::new(),
-            uniform: BTreeSet::new(),
-            proofs: Vec::new(),
-            variants: BTreeMap::new(),
-            shadows: MacroShadows::default(),
-            statement_macros: Vec::new(),
-            statement_owner: None,
-            work: Work::new(work::reference_limit(0, 0)),
-        }
+    fn catalog(scopes: Vec<Scope>) -> (Catalog, RustExecution) {
+        (
+            Catalog {
+                roots: (0..scopes.len())
+                    .map(|id| (id, BTreeSet::from([0])))
+                    .collect(),
+                scopes,
+                scope_indexes: BTreeMap::new(),
+                files: BTreeMap::new(),
+                file_declarations: BTreeMap::new(),
+                ambiguous: BTreeSet::new(),
+                externs: BTreeMap::new(),
+                uniform: BTreeSet::new(),
+                proofs: Vec::new(),
+                variants: BTreeMap::new(),
+                shadows: MacroShadows::default(),
+                statement_macros: Vec::new(),
+            },
+            RustExecution::new(Work::new(work::reference_limit(0, 0))),
+        )
     }
 
     fn exported_function(names: &Names, depth: usize, proof: &[usize]) {
@@ -4283,7 +4329,8 @@ mod cache_tests {
             for warm_first in [false, true] {
                 let mut module = scope(0, 0);
                 bind(&mut module, VALUE, "f", candidate(0, None, &[0]));
-                let mut catalog = catalog(vec![module]);
+                let (mut semantic, mut execution) = catalog(vec![module]);
+                let mut catalog = semantic.resolver(&mut execution);
                 let mut check = || Ok(());
                 if warm_first {
                     let names = catalog
@@ -4325,7 +4372,8 @@ mod cache_tests {
                 outer.imports.push(star(&["super"]));
                 let mut inner = scope(1, 1);
                 bind(&mut inner, VALUE, "f", candidate(1, None, &[1]));
-                let mut catalog = catalog(vec![outer, inner]);
+                let (mut semantic, mut execution) = catalog(vec![outer, inner]);
+                let mut catalog = semantic.resolver(&mut execution);
                 catalog
                     .file_declarations
                     .insert(1, candidate(1, Some(1), &[1]).declaration);
@@ -4380,7 +4428,8 @@ mod cache_tests {
         let mut module = scope(0, 0);
         bind(&mut module, VALUE, "f", candidate(0, None, &[0]));
         module.imports.push(star(&["std", "collections"]));
-        let mut mode_catalog = catalog(vec![module]);
+        let (mut semantic, mut execution) = catalog(vec![module]);
+        let mut mode_catalog = semantic.resolver(&mut execution);
         let mut check = || Ok(());
         for (depth, waive_external) in [
             (1, true),
@@ -4409,7 +4458,8 @@ mod cache_tests {
         forwarding.imports.push(star(&["super"]));
         let mut origin = scope(1, 1);
         bind(&mut origin, VALUE, "f", candidate(1, None, &[1]));
-        let mut forwarding_catalog = catalog(vec![forwarding, origin]);
+        let (mut semantic, mut execution) = catalog(vec![forwarding, origin]);
+        let mut forwarding_catalog = semantic.resolver(&mut execution);
         forwarding_catalog
             .file_declarations
             .insert(1, candidate(1, Some(1), &[1]).declaration);
@@ -4447,7 +4497,8 @@ mod cache_tests {
         let mut target = scope(1, 1);
         target.parent = Some(0);
         bind(&mut target, VALUE, "f", candidate(1, None, &[1]));
-        let mut catalog = catalog(vec![root, target]);
+        let (mut semantic, mut execution) = catalog(vec![root, target]);
+        let mut catalog = semantic.resolver(&mut execution);
         let mut check = || Ok(());
         for (name, proof) in [
             ("left", vec![0, 1, 2]),
@@ -4475,12 +4526,45 @@ mod cache_tests {
 
     #[test]
     fn catalog_steps_use_the_injected_request_limit() {
-        let mut catalog = catalog(Vec::new());
-        catalog.work = Work::new(1);
+        let (mut semantic, mut execution) = catalog(Vec::new());
+        let mut catalog = semantic.resolver(&mut execution);
+        catalog.execution.work = Work::new(1);
         catalog.step(&mut || Ok(())).unwrap();
         let error = catalog.step(&mut || Ok(())).unwrap_err();
         assert!(error.to_string().starts_with("bounded_work:"));
-        assert_eq!(catalog.work.used, 2);
+        assert_eq!(catalog.execution.work.used, 2);
+    }
+
+    #[test]
+    fn external_records_charge_every_call_and_union_only_the_source_accumulator() {
+        let manifest = external::ManifestInput {
+            source_set_id: "fixture".into(), native_revision_id: "native".into(),
+            dependency_hash: "dependency".into(), path: "Cargo.toml".into(),
+            content_hash: Some("hash".into()),
+            bytes: Some(b"[package]\nname='fixture'\nversion='0.1.0'\n[dependencies]\nserde='1'\n[dev-dependencies]\nserde='1'\n".to_vec()),
+        };
+        let packages =
+            external::RustPackages::new(&[manifest], &mut Work::new(1_000_000), &mut || Ok(()))
+                .unwrap();
+        let descriptor = packages.resolve("fixture", "serde", true).unwrap();
+        assert_eq!(descriptor.evidence.len(), 2);
+        let (mut catalog, mut execution) = catalog(Vec::new());
+        let mut resolver = catalog.resolver(&mut execution);
+        let mut local = BTreeMap::new();
+        for call in 1..=3 {
+            resolver
+                .record_external(descriptor.clone(), &mut local, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(resolver.execution.work.used, call * 2);
+            assert_eq!(local.len(), 1);
+            assert_eq!(local.values().next().unwrap().evidence, descriptor.evidence);
+        }
+        let mut other_source = BTreeMap::new();
+        resolver
+            .record_external(descriptor, &mut other_source, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(resolver.execution.work.used, 8);
+        assert_eq!(other_source.len(), 1);
     }
 
     #[test]
@@ -4534,7 +4618,7 @@ mod memo_tests {
         docs: Vec<&'a DocumentInput>,
         trees: Vec<Tree>,
         packages: external::RustPackages,
-        catalog: Catalog,
+        catalog: (Catalog, RustExecution),
     }
 
     /// `files` under `MANIFEST`, its documents in key order.
@@ -4572,10 +4656,13 @@ mod memo_tests {
                 ("src/lib.rs", "use anyhow::bail;\nmod empty {}\nmod a;\n"),
                 ("src/a.rs", &a),
             ]);
-            let Read { catalog, .. } = read(&snapshot);
+            let Read {
+                catalog: (catalog, execution),
+                ..
+            } = read(&snapshot);
             assert_eq!(catalog.statement_macros.len(), CALLS);
             assert!(catalog.statement_macros.iter().all(|held| !held.failed));
-            catalog.work.used
+            execution.work.used
         };
         // Certain globs, and uncertain ones that the route skips.
         for glob in [
@@ -4632,11 +4719,12 @@ mod memo_tests {
             docs,
             trees,
             packages,
-            mut catalog,
+            catalog: (mut semantic, mut execution),
         } = read(snapshot);
-        catalog.memos = remember;
+        let mut catalog = semantic.resolver(&mut execution);
+        catalog.execution.memos = remember;
         let mut check = || Ok(());
-        let before = catalog.work.used;
+        let before = catalog.execution.work.used;
         let mut external_packages = BTreeMap::new();
         let mut answers = Vec::new();
         for (document, doc) in docs.iter().enumerate() {
@@ -4676,7 +4764,7 @@ mod memo_tests {
             "{:?}",
             external_packages.keys().collect::<Vec<_>>()
         ));
-        (answers, catalog.work.used - before)
+        (answers, catalog.execution.work.used - before)
     }
 
     /// Globs (a crate glob, `use super::*` in nested test modules, a dependency's glob),
@@ -4754,8 +4842,9 @@ mod memo_tests {
             docs,
             trees,
             packages,
-            mut catalog,
+            catalog: (mut semantic, mut execution),
         } = read(&snapshot);
+        let mut catalog = semantic.resolver(&mut execution);
         let mut check = || Ok(());
         let mut work = Work::new(work::reference_limit(0, 0));
         let sites = extract(docs[0], &trees[0], &mut work, &mut check).unwrap();
@@ -4778,6 +4867,7 @@ mod memo_tests {
         // The two paths in `f` climb to the crate root; the one in `g` stops at `g`'s body,
         // whose import binds `a`.
         let starts: Vec<usize> = catalog
+            .execution
             .path_memo
             .keys()
             .map(|(start, key)| {
@@ -4791,11 +4881,12 @@ mod memo_tests {
         // Each walk for `a` reached the root, and every scope it passed is remembered.
         assert!(
             catalog
+                .execution
                 .prelude_memo
                 .get(&(root, "a".to_owned(), false))
                 .is_some_and(|&blocked| blocked)
         );
-        assert!(catalog.prelude_memo.len() > 2);
+        assert!(catalog.execution.prelude_memo.len() > 2);
     }
 
     /// The first proof passes in the first pass, its walk remembered as reaching the root;
@@ -4816,13 +4907,14 @@ mod memo_tests {
             docs,
             trees,
             packages,
-            mut catalog,
+            catalog: (mut semantic, mut execution),
         } = read(&snapshot);
+        let mut catalog = semantic.resolver(&mut execution);
         assert_eq!(catalog.proofs.len(), 2);
         assert!(catalog.proofs.iter().all(|proof| proof.failed));
         assert!(catalog.scopes[catalog.proofs[0].scope].opaque);
-        assert!(catalog.prelude_memo.is_empty());
-        assert!(catalog.path_memo.is_empty());
+        assert!(catalog.execution.prelude_memo.is_empty());
+        assert!(catalog.execution.path_memo.is_empty());
         let mut check = || Ok(());
         let mut work = Work::new(work::reference_limit(0, 0));
         let sites = extract(docs[0], &trees[0], &mut work, &mut check).unwrap();

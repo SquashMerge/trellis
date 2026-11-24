@@ -351,6 +351,11 @@ pub(crate) struct InterfaceWrapper {
 }
 
 impl Config {
+    /// Whether evaluation needs semantic evidence for authored rules.
+    pub(crate) fn has_rules(&self) -> bool {
+        !self.rules.is_empty()
+    }
+
     /// Authored `[[exceptions]]` entries, as the rules inventory lists them.
     pub fn exception_count(&self) -> usize {
         self.exceptions.len()
@@ -662,7 +667,6 @@ pub(crate) struct DocumentRuleRows {
 
 impl RulesBase {
     /// Every field, for comparing two results (#1301).
-    #[cfg(feature = "test-support")]
     pub(crate) fn canonical(&self) -> Value {
         // Exhaustive, so a new field fails to compile until it is compared.
         let Self {

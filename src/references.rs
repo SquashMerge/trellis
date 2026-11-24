@@ -11,13 +11,24 @@ use tree_sitter::{Node, Tree};
 use work::Work;
 
 pub(crate) mod callers;
-#[cfg(feature = "test-support")]
 mod canonical;
 mod cargo_workspace;
 pub mod external;
 mod java;
 mod javascript;
 mod js_workspace;
+mod package_parts;
+use package_parts::{ExternalPackageTable, SourcePackageDescriptors};
+mod incremental;
+#[cfg(all(test, feature = "test-support"))]
+mod incremental_tests;
+pub use incremental::ReferenceReplayTrace;
+pub(crate) use incremental::{ReferencePreparation, finish_incremental, prepare_incremental};
+pub(crate) use incremental::{SourceChargePlan, SourceFacts};
+#[cfg(feature = "test-support")]
+pub use work::{
+    ReferenceWorkLimitForTests, ReferenceWorkLimitGuardForTests, set_reference_work_limit_for_tests,
+};
 pub(crate) mod parallel_check;
 mod python;
 mod rust;
@@ -66,6 +77,9 @@ pub struct ReferenceBase {
     /// The sources in `identities` order; a source outside the scan stays `None`. Each is
     /// shared, so a later result can keep a source that did not change (#1301).
     sources: Vec<Option<Arc<SourceReferences>>>,
+    external_packages: ExternalPackageTable,
+    rust_catalog_digest: [u8; 32],
+    source_facts: Vec<SourceFacts>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
     /// How many projected documents (#620) are in each read status: older basis, catching
@@ -77,6 +91,7 @@ pub struct ReferenceBase {
     work_used: usize,
 }
 /// One source document's resolved sites.
+#[derive(Clone)]
 struct SourceReferences {
     projection: Option<crate::model::SemanticProjection>,
     /// By target, stored role (test = true) and the sites' feature gates.
@@ -84,14 +99,14 @@ struct SourceReferences {
     unresolved: Vec<(Site, &'static str)>,
     /// Modules that prove this source's mapped sites.
     proof: BTreeSet<usize>,
-    packages: BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
+    packages: BTreeSet<external::ExternalIdentity>,
     /// Coverage per stored role (test = true) and feature gates.
     coverage: BTreeMap<(bool, Vec<String>), SiteCoverage>,
     mapped: usize,
     semantic: usize,
 }
 /// The sites of one (target, role) edge: exact counts, and call-first samples (R5).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EdgeSites {
     count: usize,
     semantic: usize,
@@ -204,7 +219,8 @@ struct Lines {
     start: usize,
     end: usize,
 }
-struct RawSite {
+#[derive(Clone, Serialize)]
+pub(crate) struct RawSite {
     start: usize,
     end: usize,
     kind: &'static str,
@@ -515,14 +531,20 @@ fn resolve(
         request,
     };
     let mut catalogs = build_catalogs(read, limit, check)?;
-    let (declared, producers) = declared_targets(&docs, &mut catalogs.rust.work, check)?;
+    let rust_catalog_digest = catalogs.rust.digest();
+    let (declared, producers) = declared_targets(&docs, &mut catalogs.rust_execution.work, check)?;
     let locate = |document: usize, sid: &str| {
         sorted
             .get(document)
             .copied()
             .filter(|&index| declared.contains(&(index, sid)))
     };
-    let sources = selected_references(read, &mut catalogs, &locate, check)?;
+    let SelectedReferences {
+        sources,
+        external_packages,
+        facts: source_facts,
+    } = selected_references(read, &mut catalogs, &locate, check)?;
+    external_packages.validate(&sources)?;
     drop_trees(trees, workers);
     Ok(ReferenceBase {
         pin: snapshot.pin,
@@ -530,6 +552,9 @@ fn resolve(
         identities,
         modules,
         sources,
+        external_packages,
+        rust_catalog_digest,
+        source_facts,
         producers,
         document_status: docs
             .iter()
@@ -544,7 +569,7 @@ fn resolve(
                 counts
             }),
         sample_limit,
-        work_used: catalogs.rust.work.used,
+        work_used: catalogs.rust_execution.work.used,
     })
 }
 
@@ -575,9 +600,10 @@ struct ReadContext<'a, 'r> {
     request: &'a parallel_check::RequestCheck<'r>,
 }
 
-/// The language catalogs of one read. `rust.work` is the budget every later stage charges.
+/// The language catalogs and transient Rust state of one read.
 struct Catalogs {
     rust: rust::Catalog,
+    rust_execution: rust::RustExecution,
     packages: external::RustPackages,
     java: Box<java::Catalog>,
     python: Box<python::Catalog>,
@@ -670,7 +696,7 @@ fn admit_snapshot<'a>(
 }
 
 /// The four catalogs, each built under its own count of the limit; the counts are then
-/// admitted in catalog order into the one budget the Rust catalog keeps.
+/// admitted in catalog order into the one budget the Rust execution state keeps.
 fn build_catalogs(
     read: ReadContext<'_, '_>,
     limit: usize,
@@ -704,7 +730,7 @@ fn build_catalogs(
                     work,
                     &mut check,
                 )?;
-                let used = catalog.work.used;
+                let used = catalog.1.work.used;
                 return Ok((CatalogJob::Rust(Box::new((catalog, packages))), used));
             }
             1 => CatalogJob::Java(Box::new(java::Catalog::new(
@@ -761,7 +787,7 @@ fn build_catalogs(
     let CatalogJob::Rust(rust_job) = admit(catalogs.next().expect("Rust catalog"))? else {
         unreachable!()
     };
-    let (mut rust, packages) = *rust_job;
+    let ((rust, mut rust_execution), packages) = *rust_job;
     let CatalogJob::Java(java) = admit(catalogs.next().expect("Java catalog"))? else {
         unreachable!()
     };
@@ -773,9 +799,10 @@ fn build_catalogs(
         unreachable!()
     };
     let javascript = *javascript;
-    rust.work = work;
+    rust_execution.work = work;
     Ok(Catalogs {
         rust,
+        rust_execution,
         packages,
         java,
         python,
@@ -813,6 +840,19 @@ fn declared_targets<'a>(
     Ok((declared, producers))
 }
 
+struct SelectedReferences {
+    sources: Vec<Option<Arc<SourceReferences>>>,
+    external_packages: ExternalPackageTable,
+    facts: Vec<SourceFacts>,
+}
+
+struct CompletedFile {
+    source: usize,
+    found: SourceReferences,
+    packages: SourcePackageDescriptors,
+    facts: SourceFacts,
+}
+
 /// The references of every selected source, in batches of one prepared file per worker,
 /// each admitted in source order.
 fn selected_references(
@@ -820,7 +860,7 @@ fn selected_references(
     catalogs: &mut Catalogs,
     locate: &impl Fn(usize, &str) -> Option<usize>,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Vec<Option<Arc<SourceReferences>>>> {
+) -> Result<SelectedReferences> {
     let ReadContext {
         docs,
         trees,
@@ -831,10 +871,12 @@ fn selected_references(
     } = read;
     let mut sources: Vec<Option<Arc<SourceReferences>>> = Vec::new();
     sources.resize_with(docs.len(), || None);
+    let mut external_packages = ExternalPackageTable::new(docs.len());
+    let mut facts: Vec<SourceFacts> = (0..docs.len()).map(|_| SourceFacts::default()).collect();
     let mut site_count = 0usize;
     let mut target_documents: BTreeMap<usize, TargetDocument<'_>> = BTreeMap::new();
     for batch in selected.chunks(workers) {
-        let remaining = catalogs.rust.work.remaining();
+        let remaining = catalogs.rust_execution.work.remaining();
         let prepared = map_batch(batch, workers, request, |&source| {
             prepare_file(
                 source,
@@ -845,7 +887,12 @@ fn selected_references(
             )
         })?;
         for prepared in prepared {
-            let (source, found) = file_references(
+            let CompletedFile {
+                source,
+                found,
+                packages,
+                facts: source_facts,
+            } = file_references(
                 read,
                 catalogs,
                 prepared,
@@ -854,10 +901,19 @@ fn selected_references(
                 &mut target_documents,
                 check,
             )?;
+            ensure!(
+                found.packages == external_packages.complete(source, packages),
+                "store_unavailable: reference package completion"
+            );
             sources[source] = Some(Arc::new(found));
+            facts[source] = source_facts;
         }
     }
-    Ok(sources)
+    Ok(SelectedReferences {
+        sources,
+        external_packages,
+        facts,
+    })
 }
 
 /// One prepared file's sites, in site order: each resolved structurally by its language's
@@ -870,39 +926,43 @@ fn file_references<'a>(
     site_count: &mut usize,
     target_documents: &mut BTreeMap<usize, TargetDocument<'a>>,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<(usize, SourceReferences)> {
+) -> Result<CompletedFile> {
     let ReadContext {
         docs,
-        trees,
         sample_limit,
         request,
         ..
     } = read;
-    let Catalogs {
-        rust,
-        packages,
-        java,
-        python,
-        javascript,
-    } = catalogs;
     let PreparedFile {
         source,
         work,
         sites,
     } = prepared;
     let doc = docs[source];
+    #[cfg(feature = "test-support")]
+    crate::architecture_core::architecture_execution_event(
+        crate::architecture_core::ArchitectureExecutionEvent::ReferenceInvocation,
+        &doc.key,
+    )?;
     request.check()?;
-    merge_work(&mut rust.work, work.used, check)?;
+    let (before_work, before_sites) = (catalogs.rust_execution.work.used, *site_count);
+    let mut plan = SourceChargePlan {
+        prepared_work: work.used,
+        sites: Vec::new(),
+    };
+    let mut endpoints = incremental::semantic_endpoints(read, source)?;
+    merge_work(&mut catalogs.rust_execution.work, work.used, check)?;
     let mut found = SourceReferences {
         projection: doc.semantic.projection.clone(),
         edges: BTreeMap::new(),
         unresolved: Vec::new(),
         proof: BTreeSet::new(),
-        packages: BTreeMap::new(),
+        packages: BTreeSet::new(),
         coverage: BTreeMap::new(),
         mapped: 0,
         semantic: 0,
     };
+    let mut source_packages = SourcePackageDescriptors::new();
     for (
         ordinal,
         PreparedSite {
@@ -916,64 +976,47 @@ fn file_references<'a>(
         site.ordinal = ordinal;
         let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
         let historical = doc.semantic.projection.is_some();
-        let structural = match &raw {
-            // Historical claims cannot be resolved against N by spelling. Any
-            // independent structural fallback must remain explicitly native-N.
-            Some(_) if historical && anchor.is_some() => None,
-            None => None,
-            Some(_) if site.owner_syntax_id.is_none() => {
-                Some(SiteResolution::unknown("reference_owner_ambiguous"))
-            }
-            Some(item) if doc.key.language == "rust" => Some(rust.resolve(
-                source,
-                item,
-                packages,
-                &mut found.packages,
-                docs,
-                &trees[source],
-                check,
-            )?),
-            Some(item) if doc.key.language == "java" => {
-                Some(java.resolve(source, item, &mut found.packages, &mut rust.work, check)?)
-            }
-            Some(item) if doc.key.language == "python" => {
-                Some(python.resolve(source, item, &mut found.packages, &mut rust.work, check)?)
-            }
-            Some(item) if script_family(&doc.key.language) => Some(
-                javascript
-                    .as_ref()
-                    .expect("selected JavaScript catalog")
-                    .resolve(source, item, &mut found.packages, &mut rust.work, check)?,
+        let charge = shared::ChargeSite {
+            structural: shared::structural_charge(
+                raw,
+                historical && anchor.is_some(),
+                site.owner_syntax_id.is_none(),
             ),
-            Some(_) => Some(SiteResolution::unknown("module_mapping_unavailable")),
+            semantic: anchor.map(shared::SemanticCharge::new).transpose()?,
         };
-        let semantic =
-            anchor.and_then(|anchor| semantic_resolution(anchor, structural.as_ref(), locate));
-        let resolution = match (semantic, structural) {
-            // A semantic-only site inside its own module adds no module edge.
-            (Some(resolution), None) if resolution.targets.contains(&Target::Native(source)) => {
-                continue;
-            }
-            (Some(resolution), _) => {
-                let anchor = anchor.expect("semantic resolution has an anchor");
-                apply_semantic(&mut site, anchor);
-                resolution
-            }
-            (None, Some(resolution)) => resolution,
-            // A semantic-only site whose binding is not usable here is not a site.
-            (None, None) => continue,
+        let charged = shared::resolve_charge_site(
+            read,
+            catalogs,
+            source,
+            &charge,
+            &mut source_packages,
+            locate,
+            check,
+        )?;
+        incremental::resolution_endpoints(&mut endpoints, &charged);
+        plan.push(read, charge)?;
+        let Some((resolution, semantic)) = charged.effective(source) else {
+            continue;
         };
+        if semantic {
+            apply_semantic(
+                &mut site,
+                anchor.expect("semantic resolution has an anchor"),
+            );
+        }
         *site_count += 1;
         ensure!(
             *site_count <= site_limit(),
             "bounded_work: reference site count"
         );
-        if let (true, Some(SemanticOutcome::Internal(document, sid))) =
-            (site.mapping == "semantic", anchor.map(|a| &a.outcome))
-            && let Some(target) = locate(*document, sid)
-            && resolution.targets.contains(&Target::Native(target))
-        {
-            owner_step(&mut rust.work, check)?;
+        if let Some((target, sid)) = internal_target_charge(
+            semantic,
+            anchor.map(|a| &a.outcome),
+            &resolution,
+            locate,
+            &mut catalogs.rust_execution.work,
+            check,
+        )? {
             let entry = target_documents
                 .entry(target)
                 .or_insert_with(|| TargetDocument::new(docs[target]));
@@ -996,11 +1039,44 @@ fn file_references<'a>(
             site,
             resolution,
             sample_limit,
-            &mut rust.work,
+            &mut catalogs.rust_execution.work,
             check,
         )?;
     }
-    Ok((source, found))
+    found.packages = source_packages.keys().cloned().collect();
+    Ok(CompletedFile {
+        source,
+        found,
+        packages: source_packages,
+        facts: SourceFacts {
+            plan: Some(Arc::new(plan)),
+            work: catalogs.rust_execution.work.used - before_work,
+            sites: *site_count - before_sites,
+            endpoints: endpoints
+                .into_iter()
+                .map(u32::try_from)
+                .collect::<std::result::Result<_, _>>()?,
+        },
+    })
+}
+
+/// The lookup admission shared by output construction and compact charge replay.
+fn internal_target_charge<'a>(
+    semantic: bool,
+    outcome: Option<&'a SemanticOutcome>,
+    resolution: &SiteResolution,
+    locate: &impl Fn(usize, &str) -> Option<usize>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Option<(usize, &'a String)>> {
+    if let (true, Some(SemanticOutcome::Internal(document, sid))) = (semantic, outcome)
+        && let Some(target) = locate(*document, sid)
+        && resolution.targets.contains(&Target::Native(target))
+    {
+        owner_step(work, check)?;
+        return Ok(Some((target, sid)));
+    }
+    Ok(None)
 }
 
 /// What a semantic binding makes of the site it resolves: the mapping, the provenance and
@@ -1189,7 +1265,7 @@ impl ReferenceBase {
                 total.unresolved += row.unresolved;
                 total.semantic += row.semantic;
             }
-            for (identity, package) in &found.packages {
+            for (identity, package) in self.external_packages.selected(source, &found.packages) {
                 match external_packages.get_mut(identity) {
                     Some(existing) if existing.evidence != package.evidence => {
                         existing.evidence.extend(package.evidence.iter().cloned());
@@ -1387,40 +1463,21 @@ pub(crate) fn display_key(d: &Declaration) -> String {
 
 /// How a semantic binding resolves a site, or `None` to keep its structural result
 /// (`structural` is `None` for a semantic-only site, which is then dropped).
+#[cfg(test)]
 fn semantic_resolution(
     anchor: &SemanticAnchor,
     structural: Option<&SiteResolution>,
     locate: &impl Fn(usize, &str) -> Option<usize>,
 ) -> Option<SiteResolution> {
-    let historical = anchor.metadata.contains_key("projection");
-    match &anchor.outcome {
-        SemanticOutcome::Boundary => Some(SiteResolution::unknown("semantic_endpoint_catching_up")),
-        SemanticOutcome::External if historical => {
-            Some(SiteResolution::unknown("historical_external_claim"))
-        }
-        SemanticOutcome::Ambiguous | SemanticOutcome::Unresolved if historical => {
-            Some(SiteResolution::unknown("historical_resolution_unproven"))
-        }
-        // A target outside this snapshot is stale: the structural result stands.
-        SemanticOutcome::Internal(document, sid) => locate(*document, sid)
-            .map(|target| SiteResolution {
-                targets: BTreeSet::from([Target::Native(target)]),
-                ..SiteResolution::default()
-            })
-            .or_else(|| {
-                historical.then(|| SiteResolution::unknown("semantic_endpoint_catching_up"))
-            }),
-        // A proved package target says more than a binding outside the checkout.
-        SemanticOutcome::External => structural
-            .is_none_or(|resolution| resolution.targets.is_empty())
-            .then(SiteResolution::default),
-        // An unknown target keeps the structural result; it never makes a site of its own.
-        SemanticOutcome::Ambiguous | SemanticOutcome::Unresolved => None,
-    }
+    shared::semantic_charge_resolution(
+        &shared::SemanticCharge::new(anchor).ok()?,
+        structural,
+        locate,
+    )
 }
 
 enum CatalogJob {
-    Rust(Box<(rust::Catalog, external::RustPackages)>),
+    Rust(Box<((rust::Catalog, rust::RustExecution), external::RustPackages)>),
     Java(Box<java::Catalog>),
     Python(Box<python::Catalog>),
     Javascript(Box<Option<javascript::Catalog>>),

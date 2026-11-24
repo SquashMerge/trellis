@@ -958,24 +958,103 @@ the same build, and each rechecks the pin and rules hash, so a new revision or a
 file is never served from an older result. A daemon restart or an idle checkout's retirement
 drops the result, and the next activation builds it again.
 
-A build reads every document's native rows in one admitted read transaction, then the
-semantic rows of every document in a second admitted read at the same pin (#1301); a
-revision's rows are its own, so both reads see the same revision. It ends each read before the
-next starts, and only then resolves references, prepares rule rows and measures metrics. Both
-reads report `reading`. Publications never wait on the
+A build reads every document's native rows and Architecture input fingerprints in one admitted
+read transaction. It parses the admitted documents and builds fresh catalogs, then reads semantic
+rows in a second admitted read at the same pin (#1301, #1308). With an eligible prior core, this
+second read queries only Dirty sources; it still builds the complete document and endpoint
+eligibility index. Without a base, on a full-build gate, or with nonempty `[[rules]]` and selected
+semantic evidence, it reads all sources. Full semantic reads for rules do not force reference
+extraction for clean sources. A revision's rows are its own, so both reads see the same revision.
+Each read ends before the next begins, and no read lease is retained while computing.
+Native admission reports `reading`; semantic admission belongs to `resolving`. Publications never wait on the
 Architecture read (owner ruling 2026-11-20, #1245): a live publication raises a write intent,
 each of the build's reads gives its snapshot up at its next check, and the owner reads again only once
 the publication has ended. A read that gives way publishes nothing. During a burst of edits
 the Architecture view therefore lags, answering `building`, until the edits stop. The index
 keeps its rollback (DELETE) journal (Decision 0008). A retirement waits for those reads at most,
 never for the computing, and a read waits for the owner before it admits its own transaction.
-A build keeps no source text, syntax trees or semantic rows, only the
-per-source reference rows (up to 50 sampled sites per edge, calls first), rule rows, metric rows and each
-finished summary, so a checkout holds one result, bounded by the existing reference and rule
-budgets. A checkout keeps at most two: the head's, and the one it replaced or an older retained
-revision a page is showing. Every read projects from the result.
+A completed core keeps no source text, syntax trees or catalogs. Alongside per-source reference
+rows (up to 50 sampled sites per edge, calls first), rule rows, metric rows and summaries, it
+retains a DocumentKey-sorted dependency index: native and semantic input fingerprints, declaration
+ID sets, complete endpoint documents, per-source Work and pre-sampling site counts, semantic
+admission counts, and bounded ordered resolver charge plans. Global fingerprints cover manifests,
+root configuration, producers, raw selections and the Rust catalog.
 
-A build resolves references and prepares declaration rules for the whole revision, under the
+A checkout keeps at most two results: the head's, and the one it replaced or an older retained
+revision a page is showing. The base is its newest eligible earlier successful core in the same
+generation and live-rules eligibility episode, with complete dependencies and metrics. Startup,
+first index, an older-revision request and a rules transition have no base; changing rules A→B→A
+does not resurrect A's old base. Failed or stopped attempts do not displace the base. Eviction
+releases a result when no reader or in-flight computation still borrows it.
+
+Dirty is the union of native changes, semantic changes (including every currently projected
+document), and sources with endpoints in documents whose declaration-ID sets changed. Only Dirty
+sources run `file_references`.
+
+Semantic changes include revision-derived provenance (owner ruling 2026-11-24, #1308). An
+imported or rejoined provenance ID is derived from the reading revision's native revision
+(Decision 0021 D2), and the reader also breaks ties by it: a call's representative proof and the
+order of anchors at the same range. So a document whose evidence, read at the build's own pin,
+carries such provenance is semantic Dirty whenever the build's native revision differs from its
+base's, even when its payload, state and freshness are unchanged. Literal provenance IDs do not
+depend on the revision, and a projected document reads at its semantic basis and is Dirty
+anyway. The dependency index keeps each document's flag and the base's native revision. Patch and
+reuse therefore apply only to sources without such evidence, or across builds at the same native
+revision. Answers do not change. Reusing semantic sources across native revisions, by
+materializing provenance IDs per core and breaking those ties by stable proof identity, is
+#1310. Other sources whose targets changed natively enter Patch: they
+clone reference display output to update internal sampled and unresolved target lines and
+anonymous display keys by document and syntax ID. Remaining whole-source reference Arcs are
+shared. Only native-changed documents are remeasured; unchanged metric and dependency subparts
+can be shared between the retained results.
+
+Source package membership is stable reference output, not revision-dependent evidence. Every
+core owns a fresh, source-specific package descriptor table with current captured manifest
+provenance, including for clean and patched sources. Projections union descriptors only from
+selected sources; an older core keeps its original table and provenance. This is not a rebase
+of semantic freshness, historical basis or `currentPin` metadata.
+
+Clean-source reuse still performs bounded lower-level resolver replay, in original source,
+site and worker-batch order against fresh catalogs and shared memo state. Retained preparation
+charges and fresh resolution, lookup and target-admission charges reproduce full-build global
+and per-source Work, including memo warming and current package-copy costs. It skips clean
+extraction and output construction, not every lower-level name-resolution call. No performance
+threshold or production-size measurement is claimed here.
+
+The ordered full-build gates are: no base; a changed document set (including add, delete or
+rename); changed captured manifests; changed root tsconfig/jsconfig fallback; changed producer
+set/identity or requested descriptors/languages; changed stable raw selections; a native change
+outside Rust; strictly more than half the documents Dirty; a changed semantic Rust catalog;
+and insufficient reference Work margin. Manifest provenance-only changes do not trigger the
+manifest gate. The Rust digest normalizes positions to per-document ranks while preserving
+coincident positions and all resolution-semantic fields.
+
+A semantic import changes stable producer or raw-selection identity and therefore builds in
+full. A native N→semantic S catch-up preserves the raw selection and the native revision, and is
+not an import; it is eligible for incremental computation. From a base built at N it reuses
+every source whose semantic state did not change. From an older base at another native
+revision, its sources with revision-derived provenance are also Dirty, so until #1310 semantic
+checkouts may build near-full or full after an edit, while native-only checkouts and same-revision
+catch-up still build incrementally. Projected documents remain semantic Dirty even when
+their raw selection is unchanged: their full projection DTO and historical basis are preserved,
+not rewritten to force reuse. The first edit after a producer run can therefore be near-full
+or full under the same gates.
+
+An ordinary incremental failure retries the independent original full computation at the same
+pin, preserving its success or kept failure, code and message. Reference margin fallback also
+runs full without that incremental margin. Give-way, cancellation and typed storage contention
+do not take this full retry: cancellation is sticky for the operation and outranks a carried
+integrity cause; contention keeps the existing bounded retry. A cancelled or yielded attempt
+publishes nothing, records no published path and is not compared.
+
+`TRELLIS_ARCHITECTURE_VERIFY=1` enables an independent same-pin, all-source full oracle (only
+the exact value `1` enables it). Equal canonical results retain the candidate, preserving
+sharing. A mismatch logs the first differing canonical path, pin and attempted build path
+without payloads, then serves the full result once. Dependency indexes and global/per-source
+Work participate in comparison. Stop and publication state are rechecked before retry,
+comparison and final publication.
+
+A build accounts for references and prepares declaration rules for the whole revision, under the
 existing budgets; layer-edge and exception work is charged per read, on the references that
 read selects. A revision over those budgets fails `bounded_work` for the summary, details and
 unscoped reads. A path-scoped MCP or CLI read then computes on the request: it reads the
@@ -986,7 +1065,10 @@ A scoped read does not compute while the owner is still building its revision: i
 an unscoped read and then answers `building`, so it never repeats the build's work (#798).
 
 A build reports its progress as `{phase,completed,total}`. The phases are `reading`,
-`resolving`, `evaluating` and `measuring`; `reading` and `measuring` advance per document.
+`resolving`, `evaluating` and `measuring`. Semantic Read B is part of `resolving`.
+`reading` advances per document; `measuring` may jump over all reused documents in one advance,
+then commits newly measured documents in admitted order. Waits, deadlines, kept errors and
+semantic freshness/current-pin contracts are unchanged.
 
 
 | Read | While the build runs |

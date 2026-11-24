@@ -351,7 +351,7 @@ fn catalog_budget(snapshot: &Snapshot, limit: usize) -> Result<Work> {
         workers: 1,
         request: &request,
     };
-    Ok(build_catalogs(read, limit, check)?.rust.work)
+    Ok(build_catalogs(read, limit, check)?.rust_execution.work)
 }
 
 /// docs/rules.md, "Work bounds and located failures": "Reference work has one

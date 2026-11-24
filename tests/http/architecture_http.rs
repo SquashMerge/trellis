@@ -89,24 +89,68 @@ async fn fixture_with_bytes(
     ProvisionedBrowser,
     String,
 ) {
+    fixture_sources(role_fixture, extra_sources, true).await
+}
+
+pub(super) async fn fixture_exact_sources(
+    sources: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
+    let sources: Vec<_> = sources
+        .iter()
+        .map(|(path, text)| (*path, text.as_bytes()))
+        .collect();
+    let fixture = fixture_sources(false, &sources, false).await;
+    let scheduler = fixture.1.browser_scheduler().unwrap();
+    let attempts = scheduler.architecture_attempts_for_tests();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert!(
+        attempts[0].published && attempts[0].compared,
+        "{attempts:?}"
+    );
+    assert_eq!(attempts[0].base, None);
+    assert_eq!(
+        attempts[0].path,
+        trellis::http::ArchitectureBuildPath::Full(trellis::http::FullReason::NoBase)
+    );
+    assert!(scheduler.architecture_differences_for_tests().is_empty());
+    fixture
+}
+
+async fn fixture_sources(
+    role_fixture: bool,
+    extra_sources: &[(&str, &[u8])],
+    defaults: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("checkout");
     fs::create_dir(&root).unwrap();
-    fs::write(root.join("sample.js"), "function sample(x) { return x; }\n").unwrap();
-    fs::create_dir(root.join("deep")).unwrap();
-    fs::write(
-        root.join("deep/extra.js"),
-        "function extra() { return 2; }\n",
-    )
-    .unwrap();
-    fs::write(root.join("empty.js"), "// no callable\n").unwrap();
+    if defaults {
+        fs::write(root.join("sample.js"), "function sample(x) { return x; }\n").unwrap();
+        fs::create_dir(root.join("deep")).unwrap();
+        fs::write(
+            root.join("deep/extra.js"),
+            "function extra() { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(root.join("empty.js"), "// no callable\n").unwrap();
+        fs::create_dir(root.join("zero")).unwrap();
+        fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
+    }
     for (path, source) in extra_sources {
         let path = root.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, source).unwrap();
     }
-    fs::create_dir(root.join("zero")).unwrap();
-    fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
     if role_fixture {
         fs::create_dir(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "mod roles; mod target;\n").unwrap();

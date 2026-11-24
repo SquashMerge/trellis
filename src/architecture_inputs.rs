@@ -7,6 +7,64 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// Architecture-only identities read beside the snapshot, never required of native fixtures.
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ArchitectureFingerprints {
+    pub documents: BTreeMap<DocumentKey, DocumentFingerprint>,
+    /// Admission metadata used to assemble current global state without reading clean payloads.
+    /// The finished dependency index keeps only the fingerprints, not this map.
+    pub semantic_states: BTreeMap<DocumentKey, SemanticInputState>,
+    pub producers: [u8; 32],
+    pub selections: [u8; 32],
+    /// The reading revision's native revision ID. Rejoined provenance IDs read at this pin
+    /// are derived from it (Decision 0021 D2), so it is compared with the base's (#1308).
+    pub native_revision: String,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticInputState {
+    pub default_producer: Option<String>,
+    pub projection: Option<crate::model::SemanticProjection>,
+    pub tuple: Option<SemanticTupleState>,
+    pub freshness: Option<SemanticFreshnessState>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticTupleState {
+    pub selected: bool,
+    pub state: String,
+    pub payload_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticFreshnessState {
+    /// The pin whose freshness map was read. For a current tuple this is a lookup pin,
+    /// not semantic identity; only a historical projection makes it a basis identity.
+    pub basis_pin: IndexPin,
+    pub values: BTreeMap<i64, String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct DocumentFingerprint {
+    pub native: NativeFingerprint,
+    pub semantic: [u8; 32],
+    pub sids: [u8; 32],
+    pub projected: bool,
+    /// The document's evidence, read at this build's own pin, has provenance whose ID is
+    /// derived from the reading native revision (imported or rejoined, not literal). Such a
+    /// source is semantic Dirty whenever the native revision differs from the base's (#1308).
+    pub revision_provenance: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct NativeFingerprint {
+    pub version_id: String,
+    pub coverage_requested: bool,
+    pub coverage_selected: bool,
+    pub coverage_state: String,
+    pub coverage_diagnostic: Option<String>,
+}
+
 pub struct DocumentInput {
     pub key: DocumentKey,
     pub file: SourceFile,
@@ -47,6 +105,9 @@ pub struct DocumentSemantic {
     /// The original coverage status, including unavailable/not-requested evidence.
     pub coverage_state: Option<String>,
     pub boundary: bool,
+    /// Dependency-only checkout endpoints, before representative selection, eligibility
+    /// suppression or reference sampling. Indices address the complete snapshot.
+    pub endpoint_documents: BTreeSet<usize>,
 }
 
 /// One bound name or call in a document.

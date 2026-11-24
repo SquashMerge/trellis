@@ -10,7 +10,15 @@
 //! A read waits on the owner's signal, and its wait is bounded by what the caller can afford.
 //! When that runs out it gets a typed [`ArchitectureBuilding`] with the progress so far.
 use super::DaemonState;
-use crate::architecture_core::{ArchitectureCore, ArchitectureProgress, CoreFailure};
+use crate::architecture_core::{
+    ArchitectureBuildPath, ArchitectureCore, ArchitectureProgress, ArchitectureReadA, CoreFailure,
+    FullReason, ReferenceWorkMargin, finish_architecture, prepare_architecture,
+};
+#[cfg(feature = "test-support")]
+use crate::architecture_core::{
+    ArchitectureExecutionBranch, ArchitectureExecutionHook, ArchitectureExecutionObserver,
+    ArchitectureExecutionScope, ArchitectureExecutionTrace,
+};
 use crate::model::IndexPin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -146,6 +154,17 @@ struct Running {
     pin: IndexPin,
     rules_hash: Option<String>,
     progress: Option<ArchitectureProgress>,
+    /// A borrowed base belongs to the episode at selection. Once invalidated, this
+    /// operation stays cancelled even if the live hash returns to its original value.
+    base_cancelled: Option<Arc<AtomicBool>>,
+}
+
+fn check_base_episode(cancelled: Option<&AtomicBool>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)),
+        "cancelled: architecture base episode ended"
+    );
+    Ok(())
 }
 
 #[derive(Default)]
@@ -171,11 +190,58 @@ struct OwnerState {
     head: Option<IndexPin>,
     retry_at: Option<Instant>,
     retries: u32,
+    /// A hash returning after a different live hash starts a new eligibility episode.
+    live_rules: Option<(uuid::Uuid, Option<String>)>,
+    eligible: Vec<CoreKey>,
 }
 /// A checkout holds at most this many cores.
 const PUBLISHED_CORES: usize = 2;
 
 impl OwnerState {
+    fn observe_rules(&mut self, key: &CoreKey) {
+        let live = (key.pin.index_generation, key.rules_hash.clone());
+        if self.live_rules.as_ref() != Some(&live) {
+            self.eligible.clear();
+            if let Some(cancelled) = self
+                .running
+                .as_ref()
+                .and_then(|run| run.base_cancelled.as_ref())
+            {
+                cancelled.store(true, Ordering::Release);
+            }
+            self.live_rules = Some(live);
+        }
+    }
+
+    /// The final admission and publication share the owner lock with observations.
+    /// A transition after the last compute check therefore cannot publish an old base.
+    fn finish_running(&mut self) -> anyhow::Result<()> {
+        let running = self.running.take();
+        check_base_episode(
+            running
+                .as_ref()
+                .and_then(|run| run.base_cancelled.as_deref()),
+        )
+    }
+
+    fn base(&self, key: &CoreKey) -> Option<Arc<ArchitectureCore>> {
+        if self.head != Some(key.pin) {
+            return None;
+        }
+        self.published
+            .iter()
+            .filter(|published| {
+                published.key.pin.index_generation == key.pin.index_generation
+                    && published.key.pin.index_revision < key.pin.index_revision
+                    && published.key.rules_hash == key.rules_hash
+                    && self.eligible.contains(&published.key)
+            })
+            .filter_map(|published| published.outcome.as_ref().ok())
+            .filter(|core| core.incremental_base_eligible())
+            .max_by_key(|core| core.pin.index_revision)
+            .cloned()
+    }
+
     fn answer(&self, pin: IndexPin, rules: CoreRules<'_>) -> Option<&Published> {
         self.published.iter().find(|p| p.answers(pin, rules))
     }
@@ -192,6 +258,14 @@ impl OwnerState {
         if self.older.as_ref() == Some(&published.key) {
             self.older = None;
         }
+        self.eligible.retain(|key| key.pin != published.key.pin);
+        if published
+            .outcome
+            .as_ref()
+            .is_ok_and(|core| core.incremental_base_eligible())
+        {
+            self.eligible.push(published.key.clone());
+        }
         self.published.retain(|p| p.key.pin != published.key.pin);
         self.published.insert(0, published);
         if self.published.len() > PUBLISHED_CORES {
@@ -199,6 +273,8 @@ impl OwnerState {
             let evicted = self.published.iter().rposition(|p| Some(p.key.pin) != head);
             self.published.remove(evicted.unwrap_or(PUBLISHED_CORES));
         }
+        self.eligible
+            .retain(|key| self.published.iter().any(|p| p.key == *key));
     }
     /// Ask the owner to look again. A retry that is due keeps its bound, so a stream of hints
     /// and reads cannot turn it into a hot loop or stop a fault from being reported; a retry
@@ -216,6 +292,28 @@ impl OwnerState {
 
 #[cfg(feature = "test-support")]
 type TestHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// One owner operation, including attempts that stopped without a publication.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub struct ArchitectureAttempt {
+    pub pin: IndexPin,
+    pub base: Option<IndexPin>,
+    pub path: ArchitectureBuildPath,
+    pub semantic_sources: Vec<crate::native_records::DocumentKey>,
+    /// Fresh commits of Retry when present, otherwise Candidate; never worker progress.
+    pub measured_sources: Vec<crate::native_records::DocumentKey>,
+    /// The same compute branch. Its accounting is complete only when that branch's
+    /// execution trace has `references: Some(...)`; invocation keys are always actual.
+    pub references: crate::references::ReferenceReplayTrace,
+    /// Actual invocation/commit observations, including incomplete branches.
+    pub executions:
+        std::collections::BTreeMap<ArchitectureExecutionBranch, ArchitectureExecutionTrace>,
+    pub progress: Vec<ArchitectureProgress>,
+    pub full_retries: usize,
+    pub compared: bool,
+    pub published: bool,
+}
 
 pub(crate) struct ArchitectureOwner {
     state: Mutex<OwnerState>,
@@ -245,6 +343,18 @@ pub(crate) struct ArchitectureOwner {
     /// The next later admission of a build fails with this integrity fault.
     #[cfg(feature = "test-support")]
     admission_fault: Mutex<Option<String>>,
+    #[cfg(feature = "test-support")]
+    attempts: Mutex<Vec<ArchitectureAttempt>>,
+    #[cfg(feature = "test-support")]
+    fault: Mutex<Option<(&'static str, String)>>,
+    #[cfg(feature = "test-support")]
+    mismatch: Mutex<Option<String>>,
+    #[cfg(feature = "test-support")]
+    differences: Mutex<Vec<String>>,
+    #[cfg(feature = "test-support")]
+    work_limit: Mutex<Option<crate::references::ReferenceWorkLimitForTests>>,
+    #[cfg(feature = "test-support")]
+    execution_hook: Mutex<Option<ArchitectureExecutionHook>>,
 }
 
 impl ArchitectureOwner {
@@ -270,6 +380,18 @@ impl ArchitectureOwner {
             verified: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-support")]
             admission_fault: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            attempts: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            fault: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            mismatch: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            differences: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            work_limit: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            execution_hook: Mutex::default(),
         })
     }
 
@@ -357,14 +479,17 @@ impl ArchitectureOwner {
     }
 
     /// Test support records the path of each build the owner publishes (#1301).
-    fn published_build(&self, _pin: IndexPin) {
+    fn published_build(&self, _pin: IndexPin, _path: ArchitectureBuildPath) {
         #[cfg(feature = "test-support")]
-        self.paths.lock().unwrap().push((
-            _pin,
-            crate::architecture_core::ArchitectureBuildPath::Full(
-                crate::architecture_core::FullReason::NoBase,
-            ),
-        ));
+        self.paths.lock().unwrap().push((_pin, _path));
+    }
+
+    fn verifying(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        if self.verify.load(Ordering::Acquire) {
+            return true;
+        }
+        verify_value(std::env::var_os("TRELLIS_ARCHITECTURE_VERIFY").as_deref())
     }
 
     /// A failed build retries on a bound; a later hint or read starts over.
@@ -394,9 +519,91 @@ fn cancelled(error: &anyhow::Error) -> bool {
 
 /// A failure the owner keeps as its revision's answer, with the precedence of a turn's own
 /// outcome: never a stop or contention, even over a cause that would repeat.
-#[cfg(feature = "test-support")]
 fn kept(error: &anyhow::Error) -> bool {
     !cancelled(error) && !contention(error) && CoreFailure::repeats(error)
+}
+
+/// A boundary read cannot turn an already stopped operation into a contention retry.
+fn recheck_build(
+    built: anyhow::Result<ArchitectureCore>,
+    recheck: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<ArchitectureCore> {
+    if built
+        .as_ref()
+        .is_err_and(|error| cancelled(error) || contention(error))
+    {
+        built
+    } else {
+        recheck().and(built)
+    }
+}
+
+fn verify_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+struct BuildRecord {
+    path: ArchitectureBuildPath,
+    semantic_sources: Vec<crate::native_records::DocumentKey>,
+    references: Mutex<crate::references::ReferenceReplayTrace>,
+    full_retries: usize,
+    compared: bool,
+    #[cfg(feature = "test-support")]
+    fault: Mutex<Option<(&'static str, String)>>,
+    #[cfg(feature = "test-support")]
+    mismatch: Mutex<Option<String>>,
+    #[cfg(feature = "test-support")]
+    execution_hook: Option<ArchitectureExecutionHook>,
+    #[cfg(feature = "test-support")]
+    executions:
+        std::collections::BTreeMap<ArchitectureExecutionBranch, Arc<ArchitectureExecutionObserver>>,
+}
+impl Default for BuildRecord {
+    fn default() -> Self {
+        Self {
+            path: ArchitectureBuildPath::Full(FullReason::NoBase),
+            semantic_sources: Vec::new(),
+            references: Mutex::default(),
+            full_retries: 0,
+            compared: false,
+            #[cfg(feature = "test-support")]
+            fault: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            mismatch: Mutex::default(),
+            #[cfg(feature = "test-support")]
+            execution_hook: None,
+            #[cfg(feature = "test-support")]
+            executions: Default::default(),
+        }
+    }
+}
+
+impl BuildRecord {
+    #[cfg(feature = "test-support")]
+    fn execution_scope(
+        &mut self,
+        branch: ArchitectureExecutionBranch,
+    ) -> ArchitectureExecutionScope {
+        let observer = ArchitectureExecutionObserver::new(branch, self.execution_hook.clone());
+        let scope = observer.enter();
+        self.executions.insert(branch, observer);
+        scope
+    }
+
+    fn fault(&self, _point: &'static str) -> anyhow::Result<()> {
+        #[cfg(feature = "test-support")]
+        {
+            let mut fault = self.fault.lock().unwrap();
+            if fault.as_ref().is_some_and(|(point, _)| *point == _point) {
+                let (_, message) = fault.take().unwrap();
+                if message.starts_with("storage_busy:") {
+                    return Err(crate::store::topology::StorageBusy.into());
+                }
+                anyhow::bail!("{message}");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn contention(error: &anyhow::Error) -> bool {
@@ -446,7 +653,13 @@ impl DaemonState {
         let Ok(head) = self.store.index_baseline() else {
             return;
         };
-        let rules = match crate::rules::load(std::path::Path::new(self.store.workspace_root())) {
+        let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
+        let observed_rules = loaded
+            .as_ref()
+            .ok()
+            .and_then(|config| config.as_ref())
+            .map(|config| config.content_hash.clone());
+        let rules = match loaded {
             Ok(config) => config.map(|config| config.content_hash),
             Err(_) => Some("unreadable".into()),
         };
@@ -454,6 +667,10 @@ impl DaemonState {
         // The head is recorded and its turn submitted under one lock, so the settled wait
         // never sees the head stepped with no turn due.
         let mut state = self.architecture.0.state.lock().unwrap();
+        state.observe_rules(&CoreKey {
+            pin: head,
+            rules_hash: observed_rules,
+        });
         if state.stepped == seen {
             return;
         }
@@ -693,9 +910,10 @@ impl DaemonState {
             pin: head,
             rules_hash: config.as_ref().map(|config| config.content_hash.clone()),
         };
-        let key = {
+        let (key, base, base_cancelled) = {
             let mut state = owner.state.lock().unwrap();
             state.head = Some(head);
+            state.observe_rules(&head_key);
             let head_done = state
                 .published
                 .iter()
@@ -720,30 +938,51 @@ impl DaemonState {
             }
             owner.stop.store(false, Ordering::Release);
             owner.head_may_have_moved.store(false, Ordering::Release);
+            let base = state.base(&key);
+            let base_cancelled = base.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
             state.running = Some(Running {
                 pin: key.pin,
                 rules_hash: key.rules_hash.clone(),
                 progress: None,
+                base_cancelled: base_cancelled.clone(),
             });
-            key
+            (key, base, base_cancelled)
         };
         let pin = key.pin;
+        #[cfg(feature = "test-support")]
+        let _work_limit = owner
+            .work_limit
+            .lock()
+            .unwrap()
+            .take()
+            .map(|limit| limit.apply());
         owner.changed.notify_all();
         owner.hook("architecture_build_started");
         #[cfg(feature = "test-support")]
         owner.builds.fetch_add(1, Ordering::AcqRel);
         let mut check = || {
+            if self.store.publication_writing() {
+                owner.hook("architecture_read_yielded");
+                anyhow::bail!("cancelled: architecture build yielded to a publication");
+            }
             anyhow::ensure!(
                 !owner.stop.load(Ordering::Acquire),
                 "cancelled: architecture build stopped"
             );
+            check_base_episode(base_cancelled.as_deref())?;
             if owner.head_may_have_moved.swap(false, Ordering::AcqRel) && self.head_moved(head) {
                 owner.hook("architecture_build_superseded");
                 anyhow::bail!("cancelled: architecture build superseded");
             }
+            // The head check can itself observe a new generation.
+            check_base_episode(base_cancelled.as_deref())?;
             Ok(())
         };
+        #[cfg(feature = "test-support")]
+        let progress_trace = Mutex::new(Vec::new());
         let progress = |progress: ArchitectureProgress| {
+            #[cfg(feature = "test-support")]
+            progress_trace.lock().unwrap().push(progress);
             if let Some(running) = owner.state.lock().unwrap().running.as_mut() {
                 running.progress = Some(progress);
             }
@@ -759,24 +998,81 @@ impl DaemonState {
             }
             Ok(())
         };
+        let mut record = BuildRecord::default();
+        #[cfg(feature = "test-support")]
+        {
+            *record.fault.lock().unwrap() = owner.fault.lock().unwrap().take();
+            *record.mismatch.lock().unwrap() = owner.mismatch.lock().unwrap().take();
+            record.execution_hook = owner.execution_hook.lock().unwrap().take();
+        }
+        #[cfg(feature = "test-support")]
+        let base_pin = base.as_ref().map(|core| core.pin);
         let built = self.architecture_build(
             (lease, response),
-            pin,
-            config.as_ref(),
+            (pin, config.as_ref(), base),
             &mut check,
             (&give_way, &|point| owner.hook(point)),
-            &progress,
+            (&progress, &mut record),
         );
-        #[cfg(feature = "test-support")]
-        let built = self.architecture_verified(owner, pin, config.as_ref(), built);
+        let built = recheck_build(check().and(built), || self.architecture_current_rules(&key));
+        let built =
+            self.architecture_verified((pin, config.as_ref()), built, &mut check, &mut record);
         owner.hook("architecture_build_finished");
+        // Hooks can order a publication or retirement here too. Nothing checked before
+        // the hook proves this operation is still current afterwards.
+        let built = recheck_build(check().and(built), || self.architecture_current_rules(&key));
         let mut state = owner.state.lock().unwrap();
-        state.running = None;
+        let finished = state.finish_running();
+        let built = if built.as_ref().is_err_and(cancelled) {
+            built
+        } else {
+            // Episode cancellation outranks a carried integrity or contention error,
+            // without replacing an earlier give-way/stop.
+            finished.and(built)
+        };
+        #[cfg(feature = "test-support")]
+        let executions: std::collections::BTreeMap<_, _> = record
+            .executions
+            .iter()
+            .map(|(branch, observer)| (*branch, observer.snapshot()))
+            .collect();
+        #[cfg(feature = "test-support")]
+        let execution = executions
+            .get(&ArchitectureExecutionBranch::Retry)
+            .or_else(|| executions.get(&ArchitectureExecutionBranch::Candidate))
+            .cloned()
+            .unwrap_or_default();
+        #[cfg(feature = "test-support")]
+        let references = {
+            let mut references = execution.references.clone().unwrap_or_default();
+            references.file_references = execution.file_references;
+            references
+        };
+        #[cfg(feature = "test-support")]
+        owner.attempts.lock().unwrap().push(ArchitectureAttempt {
+            pin,
+            base: base_pin,
+            path: record.path.clone(),
+            semantic_sources: record.semantic_sources.clone(),
+            measured_sources: execution.measured_sources,
+            references,
+            executions,
+            progress: progress_trace.into_inner().unwrap(),
+            full_retries: record.full_retries,
+            compared: record.compared,
+            published: built.is_ok()
+                || built.as_ref().is_err_and(|error| {
+                    kept(error)
+                        || (!cancelled(error)
+                            && !contention(error)
+                            && state.retries >= CONTENTION_RETRIES)
+                }),
+        });
         // The precedence `kept` follows: a stop, then contention, then a repeating failure.
         match built {
             Ok(core) => {
                 state.retries = 0;
-                owner.published_build(pin);
+                owner.published_build(pin, record.path);
                 state.publish(Published {
                     key,
                     outcome: Ok(Arc::new(core)),
@@ -790,7 +1086,7 @@ impl DaemonState {
                 return;
             }
             Err(error) if CoreFailure::repeats(&error) => {
-                owner.published_build(pin);
+                owner.published_build(pin, record.path);
                 state.publish(Published {
                     key,
                     outcome: Err(CoreFailure::of(&error)),
@@ -803,7 +1099,7 @@ impl DaemonState {
                 return;
             }
             Err(error) => {
-                owner.published_build(pin);
+                owner.published_build(pin, record.path);
                 state.publish(Published {
                     key,
                     outcome: Err(CoreFailure::of(&error)),
@@ -825,38 +1121,193 @@ impl DaemonState {
     fn architecture_build(
         &self,
         (lease, response): (super::AdmissionLease, crate::store::EvidenceResponse),
-        pin: IndexPin,
-        config: Option<&crate::rules::Config>,
+        (pin, config, base): (
+            IndexPin,
+            Option<&crate::rules::Config>,
+            Option<Arc<ArchitectureCore>>,
+        ),
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         (give_way, hook): (
             &(impl Fn() -> anyhow::Result<()> + Sync),
             &dyn Fn(&'static str),
         ),
-        progress: &(dyn Fn(ArchitectureProgress) + Sync),
+        (progress, record): (&(dyn Fn(ArchitectureProgress) + Sync), &mut BuildRecord),
     ) -> anyhow::Result<ArchitectureCore> {
-        let input = {
+        #[cfg(feature = "test-support")]
+        let _execution = record.execution_scope(ArchitectureExecutionBranch::Candidate);
+        let incremental = base.is_some();
+        let candidate = (|| {
             let mut read_check = || {
                 give_way()?;
                 check()
             };
+            hook("architecture_read_a");
             let input = response
                 .architecture_native_input(pin, &mut read_check, progress)
                 .and_then(|input| response.finish(input));
             drop(response);
             drop(lease);
-            let mut input = input?;
+            let input = input?;
+            read_check()?;
+            record.fault("prepare")?;
+            let mut plan = prepare_architecture(
+                ArchitectureReadA {
+                    input,
+                    store: &self.store,
+                    config,
+                    measure: true,
+                    progress,
+                    trace: &record.references,
+                    #[cfg(feature = "test-support")]
+                    work_limit: self.architecture_work_limit(),
+                },
+                base,
+                &mut read_check,
+            )?;
+            record.path = plan.path.clone();
+            record.semantic_sources = plan.semantic_keys();
             read_check()?;
             hook("architecture_read_b");
             let (lease, response) = self.architecture_admission()?;
-            let read = response
-                .architecture_semantic_input(&mut input, &mut read_check)
-                .and_then(|()| response.finish(()));
+            hook("architecture_read_b_admitted");
+            let read = record.fault("read_b").and_then(|()| {
+                response
+                    .architecture_plan_read_b(&mut plan, &mut read_check)
+                    .and_then(|read| response.finish(read))
+            });
             drop(response);
             drop(lease);
-            read?;
-            input
-        };
-        ArchitectureCore::compute(&self.store, input, config, true, check, progress)
+            // A stop outranks even an integrity or contention error carried by B.
+            read_check()?;
+            let read = read?;
+            record.fault("finish")?;
+            finish_architecture(plan, read, &mut read_check)
+        })();
+        give_way()?;
+        check()?;
+        match candidate {
+            Err(error)
+                if incremental
+                    && !cancelled(&error)
+                    && !contention(&error)
+                    && (matches!(record.path, ArchitectureBuildPath::Incremental { .. })
+                        || record.path == ArchitectureBuildPath::Full(FullReason::NoBase)) =>
+            {
+                record.path = ArchitectureBuildPath::Full(
+                    if error.downcast_ref::<ReferenceWorkMargin>().is_some() {
+                        FullReason::ReferenceWorkMargin
+                    } else {
+                        FullReason::IncrementalFailure
+                    },
+                );
+                hook("architecture_full_retry");
+                give_way()?;
+                check()?;
+                self.architecture_current_rules(&CoreKey {
+                    pin,
+                    rules_hash: config.map(|config| config.content_hash.clone()),
+                })?;
+                check()?;
+                *record.references.lock().unwrap() = Default::default();
+                record.full_retries += 1;
+                #[cfg(feature = "test-support")]
+                let _execution = record.execution_scope(ArchitectureExecutionBranch::Retry);
+                self.architecture_full(pin, config, check, progress, record)
+            }
+            result => result,
+        }
+    }
+
+    fn architecture_current_rules(&self, key: &CoreKey) -> anyhow::Result<()> {
+        use anyhow::Context;
+        self.architecture.0.hook("architecture_before_recheck");
+        let head = self.architecture.0.state.lock().unwrap().head;
+        let lease = self
+            .background_lease()
+            .context("cancelled: architecture read retired")?;
+        let selected = self
+            .store
+            .evidence_response_daemon_local()
+            .and_then(|response| response.selected_pin(None));
+        drop(lease);
+        let selected = selected.map_err(|error| {
+            if contention(&error) {
+                error
+            } else {
+                error.context("cancelled: architecture head not admitted")
+            }
+        })?;
+        let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
+        let current = loaded.ok().flatten().map(|config| config.content_hash);
+        // An observation ends the episode even when this operation cannot publish.
+        // In particular, a later return to A must not resurrect its pre-B base.
+        self.architecture
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .observe_rules(&CoreKey {
+                pin: selected,
+                rules_hash: current.clone(),
+            });
+        anyhow::ensure!(
+            head == Some(selected),
+            "cancelled: architecture head superseded"
+        );
+        anyhow::ensure!(
+            current == key.rules_hash,
+            "cancelled: architecture rules superseded"
+        );
+        Ok(())
+    }
+
+    /// Independent original full computation: fresh A and all-source B at the same pin.
+    fn architecture_full(
+        &self,
+        pin: IndexPin,
+        config: Option<&crate::rules::Config>,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+        progress: &(dyn Fn(ArchitectureProgress) + Sync),
+        record: &mut BuildRecord,
+    ) -> anyhow::Result<ArchitectureCore> {
+        #[cfg(feature = "test-support")]
+        let _work_limit = self.architecture_work_limit().apply();
+        check()?;
+        let (lease, response) = self.architecture_admission()?;
+        let input = response
+            .architecture_native_input(pin, check, progress)
+            .and_then(|input| response.finish(input));
+        drop(response);
+        drop(lease);
+        let mut input = input?;
+        record.semantic_sources = input.document_keys();
+        progress(ArchitectureProgress {
+            phase: "resolving",
+            completed: 0,
+            total: record.semantic_sources.len(),
+        });
+        check()?;
+        let (lease, response) = self.architecture_admission()?;
+        let read = response
+            .architecture_semantic_input(&mut input, check)
+            .and_then(|()| response.finish(()));
+        drop(response);
+        drop(lease);
+        check()?;
+        read?;
+        self.architecture.0.hook("architecture_full_compute");
+        record.fault("full_compute")?;
+        check()?;
+        let limit = input.reference_limit(check)?;
+        let core = ArchitectureCore::compute(&self.store, input, config, true, check, progress)?;
+        record.semantic_sources = core.document_keys();
+        *record.references.lock().unwrap() = core.full_reference_trace(limit);
+        Ok(core)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn architecture_work_limit(&self) -> crate::references::ReferenceWorkLimitForTests {
+        crate::references::ReferenceWorkLimitForTests::capture()
     }
 
     /// A lease and an admitted read for a build's later read. Without a lease the runtime is
@@ -886,78 +1337,83 @@ impl DaemonState {
         Ok((lease, response))
     }
 
-    /// Verify mode (#1301): build `pin` again in full, with its own reads, and require the
-    /// same core or the same kept failure as `built`; the full build is the one published. A
-    /// difference panics with its first differing path. A build that stopped has nothing to
-    /// compare, and neither has a full build that stopped: `built` stands.
-    #[cfg(feature = "test-support")]
+    /// Compare with independently admitted full inputs. Equality retains the candidate's
+    /// shared parts; a mismatch serves the full result without a second publication.
     fn architecture_verified(
         &self,
-        owner: &ArchitectureOwner,
-        pin: IndexPin,
-        config: Option<&crate::rules::Config>,
+        (pin, config): (IndexPin, Option<&crate::rules::Config>),
         built: anyhow::Result<ArchitectureCore>,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+        record: &mut BuildRecord,
     ) -> anyhow::Result<ArchitectureCore> {
-        if !owner.verify.load(Ordering::Acquire) || built.as_ref().is_err_and(|error| !kept(error))
+        check()?;
+        let owner = &self.architecture.0;
+        if !owner.verifying() || built.as_ref().is_err_and(|error| !kept(error)) {
+            return built;
+        }
+        owner.hook("architecture_verify_started");
+        check()?;
+        let mut oracle = BuildRecord::default();
+        #[cfg(feature = "test-support")]
+        let _execution = record.execution_scope(ArchitectureExecutionBranch::Oracle);
+        #[cfg(feature = "test-support")]
         {
-            return built;
+            *oracle.fault.lock().unwrap() = record.fault.lock().unwrap().take();
         }
-        let stopped = || {
-            anyhow::ensure!(
-                !owner.stop.load(Ordering::Acquire),
-                "cancelled: architecture build stopped"
-            );
-            Ok(())
-        };
-        let mut check = stopped;
-        // The full build gives way to a publication as the build did, without its hooks.
-        let give_way = || {
-            anyhow::ensure!(
-                !self.store.publication_writing(),
-                "cancelled: architecture verify read yielded to a publication"
-            );
-            Ok(())
-        };
-        let full = self.architecture_admission().and_then(|admitted| {
-            self.architecture_build(
-                admitted,
-                pin,
-                config,
-                &mut check,
-                (&give_way, &|_| {}),
-                &|_| {},
-            )
-        });
+        let full = oracle
+            .fault("oracle")
+            .and_then(|()| self.architecture_full(pin, config, check, &|_| {}, &mut oracle));
+        check()?;
         if full.as_ref().is_err_and(|error| !kept(error)) {
-            return built;
+            return full;
         }
+        self.architecture_current_rules(&CoreKey {
+            pin,
+            rules_hash: config.map(|config| config.content_hash.clone()),
+        })?;
+        check()?;
+        let difference = match (&built, &full) {
+            (Ok(candidate), Ok(oracle)) => {
+                let candidate = candidate.canonical()?;
+                #[cfg(feature = "test-support")]
+                let candidate = {
+                    let mut candidate = candidate;
+                    if let Some(pointer) = record.mismatch.lock().unwrap().take() {
+                        *candidate
+                            .pointer_mut(&pointer)
+                            .ok_or_else(|| anyhow::anyhow!("invalid mismatch injection path"))? =
+                            serde_json::json!("injected mismatch");
+                    }
+                    candidate
+                };
+                crate::architecture_core::first_difference(&candidate, &oracle.canonical()?)
+            }
+            (Err(candidate), Err(oracle)) => {
+                (format!("{candidate:#}") != format!("{oracle:#}")).then(|| "/failure".into())
+            }
+            _ => Some("/outcome".into()),
+        };
+        check()?;
+        self.architecture_current_rules(&CoreKey {
+            pin,
+            rules_hash: config.map(|config| config.content_hash.clone()),
+        })?;
+        check()?;
+        #[cfg(feature = "test-support")]
         owner.verified.fetch_add(1, Ordering::AcqRel);
-        match (built, full) {
-            (Ok(built), Ok(full)) => {
-                let (built, full_value) = (
-                    built.canonical().expect("a core has a canonical form"),
-                    full.canonical().expect("a core has a canonical form"),
-                );
-                if let Some(at) = crate::architecture_core::first_difference(&built, &full_value) {
-                    panic!(
-                        "architecture verify: the build of {pin:?} differs from a full build at {at}"
-                    );
-                }
-                Ok(full)
-            }
-            (Err(built), Err(full)) => {
-                assert_eq!(
-                    format!("{built:#}"),
-                    format!("{full:#}"),
-                    "architecture verify: the build of {pin:?} failed unlike a full build"
-                );
-                Err(full)
-            }
-            (built, full) => panic!(
-                "architecture verify: the build of {pin:?} is {:?}, a full build {:?}",
-                built.map(|_| "a core"),
-                full.map(|_| "a core")
-            ),
+        record.compared = true;
+        if let Some(at) = difference {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "architecture verify: pin={pin:?} attempted={:?} first_difference={at}",
+                record.path
+            );
+            #[cfg(feature = "test-support")]
+            owner.differences.lock().unwrap().push(at);
+            full
+        } else {
+            built
         }
     }
 
@@ -967,13 +1423,88 @@ impl DaemonState {
             self.store
                 .evidence_response_daemon_local()
                 .and_then(|fresh| fresh.selected_pin(None))
-                .is_ok_and(|head| head != pin)
+                .is_ok_and(|head| {
+                    if head.index_generation != pin.index_generation {
+                        let rules =
+                            crate::rules::load(std::path::Path::new(self.store.workspace_root()))
+                                .ok()
+                                .flatten()
+                                .map(|config| config.content_hash);
+                        self.architecture
+                            .0
+                            .state
+                            .lock()
+                            .unwrap()
+                            .observe_rules(&CoreKey {
+                                pin: head,
+                                rules_hash: rules,
+                            });
+                    }
+                    head != pin
+                })
         })
     }
 
     #[cfg(feature = "test-support")]
     pub fn set_architecture_hook_for_tests(&self, hook: TestHook) {
         *self.architecture.0.test_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Install one operation's scoped execution hook; retries and its oracle share
+    /// the callback but record their observations independently.
+    #[cfg(feature = "test-support")]
+    pub fn set_architecture_execution_hook_for_tests(&self, hook: ArchitectureExecutionHook) {
+        *self.architecture.0.execution_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn architecture_core_for_tests(
+        &self,
+        pin: IndexPin,
+    ) -> Option<crate::architecture_core::ArchitectureCoreHandle> {
+        self.architecture
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .published
+            .iter()
+            .find(|published| published.key.pin == pin)
+            .and_then(|published| published.outcome.as_ref().ok())
+            .map(|core| ArchitectureCore::test_handle(core.clone()))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn architecture_attempts_for_tests(&self) -> Vec<ArchitectureAttempt> {
+        self.architecture.0.attempts.lock().unwrap().clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn architecture_differences_for_tests(&self) -> Vec<String> {
+        self.architecture.0.differences.lock().unwrap().clone()
+    }
+
+    /// Inject one operation-local ordinary, stopped, or contended stage failure.
+    #[cfg(feature = "test-support")]
+    pub fn set_architecture_fault_for_tests(&self, stage: &'static str, error: String) {
+        *self.architecture.0.fault.lock().unwrap() = Some((stage, error));
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_architecture_admission_fault_for_tests(&self, error: String) {
+        *self.architecture.0.admission_fault.lock().unwrap() = Some(error);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_architecture_mismatch_for_tests(&self, pointer: String) {
+        *self.architecture.0.mismatch.lock().unwrap() = Some(pointer);
+    }
+
+    /// Capture the requesting thread's RAII override before the owner starts its work.
+    #[cfg(feature = "test-support")]
+    pub fn capture_architecture_work_limit_for_tests(&self) {
+        *self.architecture.0.work_limit.lock().unwrap() =
+            Some(crate::references::ReferenceWorkLimitForTests::capture());
     }
 
     /// Admission leases held now.
@@ -1062,6 +1593,22 @@ mod tests {
     use super::*;
     use crate::http::RetireOutcome;
     use std::sync::mpsc;
+
+    #[test]
+    fn architecture_verify_candidate_policy_exact_environment_value() {
+        use std::ffi::OsStr;
+        assert!(verify_value(Some(OsStr::new("1"))));
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("01"),
+            Some("1 "),
+        ] {
+            assert!(!verify_value(value.map(OsStr::new)), "{value:?}");
+        }
+    }
 
     /// Holds the owner's build at the `nth` time it reaches `point` until the sender drops.
     fn hold_at(
@@ -1180,6 +1727,89 @@ mod tests {
         )
     }
 
+    #[test]
+    fn architecture_incremental_worker_rules_observations_cancel_borrowed_base() {
+        let (_tmp, store, state, _roots, _identity) =
+            crate::http::exceptional_recovery_tests::fixture();
+        let root = std::path::Path::new(store.workspace_root());
+        std::fs::remove_file(root.join("a.js")).unwrap();
+        for (path, text) in [
+            ("main.rs", "fn main() { let value = 1; }\n"),
+            ("one.rs", "pub fn one() {}\n"),
+            ("two.rs", "pub fn two() {}\n"),
+            ("three.rs", "pub fn three() {}\n"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let rules_path = root.join(".trellis/rules.toml");
+        std::fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
+        let rules_a = "version=1\n[layers.code]\norder=1\npaths=['**/*.rs']\n";
+        let rules_b = "version=1\n[layers.other]\norder=1\npaths=['**/*.rs']\n";
+        std::fs::write(&rules_path, rules_a).unwrap();
+        state.worker_step().unwrap();
+        state.await_architecture_idle_for_tests();
+        let original = head(&state);
+        let before_paths = state.architecture_build_paths_for_tests().len();
+        let before_compared = state.architecture_verified_for_tests();
+        assert_eq!(before_paths, 1);
+        assert_eq!(before_compared, 1);
+        assert!(state.architecture_differences_for_tests().is_empty());
+
+        let (reached, release) = hold_at(&state, "architecture_read_b", 0);
+        std::fs::write(root.join("main.rs"), "fn main() { let value = 2; }\n").unwrap();
+        store
+            .enqueue_request(&crate::indexer::IndexOptions::new(root.to_owned()), None)
+            .unwrap();
+        state.worker_step().unwrap();
+        reached.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let pin = head(&state);
+        assert_ne!(pin, original);
+        assert_eq!(state.leases(), 0, "read A ended before the owner was held");
+
+        // Drive the real post-step observer at the unchanged selected head, while
+        // the owner already holds a base Arc but no read can hide the rules edits.
+        for rules in [rules_b, rules_a] {
+            std::fs::write(&rules_path, rules).unwrap();
+            state.worker_step().unwrap();
+            assert_eq!(head(&state), pin);
+            let live = crate::rules::load(root).unwrap().unwrap().content_hash;
+            assert_eq!(
+                state.architecture.0.state.lock().unwrap().live_rules,
+                Some((pin.index_generation, Some(live)))
+            );
+        }
+        drop(release);
+        state.await_architecture_idle_for_tests();
+
+        let attempts: Vec<_> = state
+            .architecture_attempts_for_tests()
+            .into_iter()
+            .filter(|attempt| attempt.pin == pin)
+            .collect();
+        let stopped = &attempts[0];
+        assert_eq!(stopped.base, Some(original));
+        assert!(
+            !stopped.compared && !stopped.published,
+            "an observed rules episode cancels the borrowed base: {stopped:?}"
+        );
+        assert_eq!(stopped.full_retries, 0);
+        assert!(matches!(
+            stopped.path,
+            ArchitectureBuildPath::Incremental { .. }
+        ));
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        let next = &attempts[1];
+        assert_eq!(next.base, None);
+        assert_eq!(next.path, ArchitectureBuildPath::Full(FullReason::NoBase));
+        assert!(next.compared && next.published);
+        assert_eq!(
+            state.architecture_build_paths_for_tests().len(),
+            before_paths + 1
+        );
+        assert_eq!(state.architecture_verified_for_tests(), before_compared + 1);
+        assert!(state.architecture_differences_for_tests().is_empty());
+    }
+
     /// #1301: a stop keeps its precedence over a cause that would repeat, as in a turn's own
     /// outcome handling.
     #[test]
@@ -1192,6 +1822,22 @@ mod tests {
         let repeats = anyhow::Error::from(crate::store::SelectedIntegrity("corrupt".into()));
         assert!(kept(&repeats));
         assert!(!kept(&anyhow::anyhow!("storage_busy: index read")));
+    }
+
+    #[test]
+    fn a_boundary_read_cannot_reclassify_a_stopped_build() {
+        for error in [
+            anyhow::anyhow!("cancelled: stopped"),
+            anyhow::Error::from(crate::store::SelectedIntegrity("corrupt".into()))
+                .context("cancelled: read not admitted"),
+            anyhow::Error::from(crate::store::topology::StorageBusy),
+        ] {
+            let expected = format!("{error:#}");
+            let result = recheck_build(Err(error), || {
+                panic!("a stopped build admits no boundary read")
+            });
+            assert_eq!(format!("{:#}", result.err().unwrap()), expected);
+        }
     }
 
     /// #1301: the runtime retires between read A and read B. Read B gets no lease, so the
@@ -1256,16 +1902,17 @@ mod tests {
         assert_eq!(published_state(&state), (1, 1, 1));
     }
 
-    /// #1301: verify mode's full build fails to be admitted with an integrity cause. It
-    /// stopped, so verify compares nothing and the build stands: it is published once.
+    /// A stopped oracle is not a completed full success. The operation publishes nothing;
+    /// the next turn independently builds and verifies the same head.
     #[test]
-    fn a_stopped_verify_build_compares_nothing_and_the_build_stands() {
+    fn a_stopped_verify_build_compares_nothing_and_the_next_turn_builds() {
         let (_tmp, _store, state, _roots, _identity) =
             crate::http::exceptional_recovery_tests::fixture();
         let faulted = Arc::downgrade(&state);
-        // After read B: the next admission is the full build's first.
+        let injected = AtomicBool::new(false);
         state.set_architecture_hook_for_tests(Arc::new(move |at| {
-            if at == "resolving"
+            if at == "architecture_verify_started"
+                && !injected.swap(true, Ordering::AcqRel)
                 && let Some(state) = faulted.upgrade()
             {
                 *state.architecture.0.admission_fault.lock().unwrap() =
@@ -1274,8 +1921,12 @@ mod tests {
         }));
         state.worker_step().unwrap();
         state.await_architecture_idle_for_tests();
-        assert_eq!(state.architecture_builds_for_tests(), 1);
-        assert_eq!(published_state(&state), (1, 1, 0));
+        assert_eq!(state.architecture_builds_for_tests(), 2);
+        assert_eq!(published_state(&state), (1, 1, 1));
+        let attempts = state.architecture_attempts_for_tests();
+        assert!(!attempts[0].compared);
+        assert!(!attempts[0].published);
+        assert_eq!(attempts[0].full_retries, 0);
         let head = head(&state);
         let owner = state.architecture.0.state.lock().unwrap();
         assert!(matches!(
@@ -1381,6 +2032,57 @@ mod owner_state_tests {
             .iter()
             .map(|p| p.key.pin.index_revision)
             .collect()
+    }
+
+    #[test]
+    fn borrowed_base_transition_after_a_check_is_rejected_at_final_admission() {
+        let original = CoreKey {
+            pin: pin(2),
+            rules_hash: Some("A".into()),
+        };
+        let mut other_rules = original.clone();
+        other_rules.rules_hash = Some("B".into());
+        let mut other_generation = original.clone();
+        other_generation.pin.index_generation = uuid::Uuid::from_u128(1);
+        for changed in [other_rules, other_generation] {
+            let mut state = OwnerState::default();
+            state.observe_rules(&original);
+            let base_cancelled = Arc::new(AtomicBool::new(false));
+            state.running = Some(Running {
+                pin: original.pin,
+                rules_hash: original.rules_hash.clone(),
+                progress: None,
+                base_cancelled: Some(base_cancelled.clone()),
+            });
+            let mut same_episode = original.clone();
+            same_episode.pin.index_revision += 1;
+            state.observe_rules(&same_episode);
+            check_base_episode(Some(&base_cancelled)).unwrap();
+
+            // The last sampled compute check passed. Both transitions now take
+            // place before the lock-owned final admission, without another check.
+            state.observe_rules(&changed);
+            state.observe_rules(&original);
+            let error = state.finish_running().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "cancelled: architecture base episode ended"
+            );
+            assert!(state.running.is_none());
+            assert!(base_cancelled.load(Ordering::Acquire));
+
+            // Ending that operation does not cancel a successor in the new episode.
+            let next = Arc::new(AtomicBool::new(false));
+            state.running = Some(Running {
+                pin: original.pin,
+                rules_hash: original.rules_hash.clone(),
+                progress: None,
+                base_cancelled: Some(next.clone()),
+            });
+            state.observe_rules(&original);
+            state.finish_running().unwrap();
+            assert!(!next.load(Ordering::Acquire));
+        }
     }
 
     #[test]

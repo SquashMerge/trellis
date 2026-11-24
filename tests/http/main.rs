@@ -9,8 +9,17 @@ mod child;
 mod common;
 // Only test-support modules use these helpers, which need its hooks.
 #[cfg(feature = "test-support")]
+#[path = "../support/architecture_incremental.rs"]
+mod architecture_incremental_support;
+#[cfg(feature = "test-support")]
 #[path = "../common/graph_fixtures.rs"]
 mod graph_fixtures;
+#[cfg(feature = "test-support")]
+#[path = "../support/semantic_batch.rs"]
+mod semantic_batch_support;
+#[cfg(feature = "test-support")]
+#[path = "../support/producer.rs"]
+mod support;
 
 mod architecture_cache_properties;
 mod architecture_http;

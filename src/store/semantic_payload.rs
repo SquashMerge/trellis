@@ -1323,8 +1323,10 @@ mod tests {
             ("src/store.rs", 11),
             // Navigation call budget (projected SQL) and its sizing arms.
             ("src/graph_read.rs", 9),
-            // Architecture semantic inputs (projected) and counts that read no dispatch.
-            ("src/store/semantic_display.rs", 4),
+            // Architecture semantic inputs (projected), counts, and the dependency-only
+            // alternatives of visited bindings (two, by binding ID); the latter do not consume
+            // dispatch.
+            ("src/store/semantic_display.rs", 6),
             // GC of unnamed payloads, and this module's projection tests.
             ("src/store/semantic_payload.rs", 7),
             // The original import's rows, read at the captured revision.

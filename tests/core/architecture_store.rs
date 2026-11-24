@@ -1,6 +1,7 @@
 #![cfg(feature = "test-support")]
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -90,6 +91,430 @@ fn db_metadata(state: &std::path::Path) -> Vec<(String, u64, std::time::SystemTi
         .collect();
     result.sort();
     result
+}
+
+fn index_path(state: &std::path::Path) -> std::path::PathBuf {
+    fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db")
+}
+
+fn publish_current(store: &Store, root: &std::path::Path) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+}
+
+#[test]
+fn architecture_incremental_scoped_fallback() {
+    use trellis::references::{self, MAX_SAMPLE_LIMIT};
+    let (_state, root, store, pin) = fixture();
+    let base = store.architecture_build_for_tests(None, None).unwrap();
+    let canonical = base.core.canonical().unwrap();
+    let work = canonical["references"]["workUsed"].as_u64().unwrap() as usize;
+    let args = json!({"expectedBasis":pin,"paths":["src/high.rs"],"sampleLimit":MAX_SAMPLE_LIMIT});
+    let before = read(&store, "references", args.clone());
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    let all = references::resolve_all(&snapshot, &mut || Ok(())).unwrap();
+    let selected = all
+        .select(&["src/high.rs".into()], MAX_SAMPLE_LIMIT, &mut || Ok(()))
+        .unwrap();
+    let scoped = references::project(
+        &snapshot,
+        &["src/high.rs".into()],
+        MAX_SAMPLE_LIMIT,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(selected.data, scoped.data);
+    let _work_limit = references::set_reference_work_limit_for_tests(work - 1);
+    let error = references::resolve_all(&snapshot, &mut || Ok(()))
+        .err()
+        .unwrap();
+    assert!(error.to_string().starts_with("bounded_work:"), "{error}");
+    assert_eq!(
+        references::project(
+            &snapshot,
+            &["src/high.rs".into()],
+            MAX_SAMPLE_LIMIT,
+            &mut || Ok(())
+        )
+        .unwrap()
+        .data,
+        selected.data,
+        "scoped Work remains scoped after the all-source bound fails"
+    );
+    fs::write(
+        root.path().join("src/high.rs"),
+        "this live edit was not captured",
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .architecture_scoped_response_for_tests("references", &args)
+            .unwrap(),
+        before,
+        "fallback uses captured inputs, not the live checkout"
+    );
+    let response = store.evidence_response().unwrap();
+    let bounded = response
+        .architecture_response("references", &json!({"expectedBasis":pin}), &mut || Ok(()))
+        .err()
+        .unwrap();
+    assert!(
+        bounded.to_string().starts_with("bounded_work:"),
+        "{bounded}"
+    );
+}
+
+#[test]
+fn architecture_incremental_preparation_failure_retries_full_read_b_first() {
+    use crate::graph_fixtures::{Publisher, Spec, bind};
+    use trellis::{
+        references::set_reference_work_limit_for_tests,
+        store::set_architecture_semantic_rows_for_tests,
+    };
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[
+        ("src/lib.rs", "pub mod caller; pub mod target;\n"),
+        ("src/caller.rs", "pub fn run() { crate::target::f(); }\n"),
+        ("src/target.rs", "pub fn f() {}\n"),
+        ("src/idle.rs", "pub fn idle() {}\n"),
+    ]);
+    spec.bindings = vec![bind("run", 0, "f")];
+    publisher.publish(&spec);
+    let store = &publisher.store;
+    let base = store.architecture_build_for_tests(None, None).unwrap();
+    assert!(
+        base.core.canonical().unwrap()["dependencies"]["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|doc| doc["semantic"]["rows"].as_u64().unwrap() > 0)
+    );
+    let _work_limit = set_reference_work_limit_for_tests(0);
+    struct ResetRows;
+    impl Drop for ResetRows {
+        fn drop(&mut self) {
+            set_architecture_semantic_rows_for_tests(2_000_000);
+        }
+    }
+    let _rows = ResetRows;
+    set_architecture_semantic_rows_for_tests(0);
+    let full = store
+        .architecture_build_for_tests(None, None)
+        .err()
+        .unwrap();
+    assert_eq!(
+        full.to_string(),
+        "bounded_work: architecture semantic evidence"
+    );
+    let incremental = store
+        .architecture_build_for_tests(Some(&base.core), None)
+        .err()
+        .unwrap();
+    assert_eq!(
+        incremental.to_string(),
+        full.to_string(),
+        "ordinary preparation failure retries independent full A/B before full compute"
+    );
+    assert!(incremental.to_string().starts_with("bounded_work:"));
+    assert_eq!(
+        trellis::rules::diagnostic(&incremental),
+        trellis::rules::diagnostic(&full)
+    );
+}
+
+#[test]
+fn architecture_incremental_version_identity() {
+    let (state, root, store, pin) = fixture();
+    let baseline = store
+        .architecture_fingerprints_for_tests(Some(pin))
+        .unwrap();
+    let key = baseline
+        .documents
+        .keys()
+        .find(|key| key.path == "src/high.rs")
+        .unwrap()
+        .clone();
+    let first = baseline.documents[&key].clone();
+    drop(store);
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    let original_vid: i64 = db
+        .query_row(
+            "SELECT vid FROM document_versions WHERE id=?1",
+            [&first.native.version_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    fs::write(
+        root.path().join("src/high.rs"),
+        "pub fn upper() { /* body edit */ }\n",
+    )
+    .unwrap();
+    publish_current(&store, root.path());
+    let edited = store
+        .architecture_fingerprints_for_tests(None)
+        .unwrap()
+        .documents[&key]
+        .clone();
+    assert_ne!(first.native.version_id, edited.native.version_id);
+    assert_eq!(
+        first.sids, edited.sids,
+        "a body comment is not a declaration identity"
+    );
+    drop(store);
+
+    // Remap both versions and every SQL foreign-key column. The changed content now owns
+    // the old surrogate, while every retained revision still names its original content.
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    let edited_vid: i64 = db
+        .query_row(
+            "SELECT vid FROM document_versions WHERE id=?1",
+            [&edited.native.version_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(original_vid, edited_vid);
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let tables: Vec<_> = tables
+        .into_iter()
+        .filter(|table| {
+            db.prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .any(|column| column.unwrap() == "vid")
+        })
+        .collect();
+    db.execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON")
+        .unwrap();
+    for (from, to) in [
+        (original_vid, -1),
+        (edited_vid, original_vid),
+        (-1, edited_vid),
+    ] {
+        for table in &tables {
+            db.execute(
+                &format!("UPDATE \"{table}\" SET vid=?1 WHERE vid=?2"),
+                [to, from],
+            )
+            .unwrap();
+        }
+    }
+    db.execute_batch("COMMIT").unwrap();
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(
+        store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .documents[&key],
+        edited
+    );
+    assert_eq!(
+        store
+            .architecture_fingerprints_for_tests(Some(pin))
+            .unwrap()
+            .documents[&key],
+        first
+    );
+    fs::write(root.path().join("src/high.rs"), "pub fn upper() {}\n").unwrap();
+    publish_current(&store, root.path());
+    assert_eq!(
+        store
+            .architecture_fingerprints_for_tests(None)
+            .unwrap()
+            .documents[&key],
+        first
+    );
+}
+
+#[test]
+fn architecture_incremental_coverage() {
+    let (state, root, store, _) = fixture();
+    let baseline = store.architecture_fingerprints_for_tests(None).unwrap();
+    let key = baseline
+        .documents
+        .keys()
+        .find(|key| key.path == "src/high.rs")
+        .unwrap()
+        .clone();
+    let first = baseline.documents[&key].clone();
+    drop(store);
+    for (assignments, requested, selected, status, diagnostic) in [
+        ("coverage_requested=0", false, true, "complete", None),
+        (
+            "coverage_requested=1,coverage_selected=0",
+            true,
+            false,
+            "complete",
+            None,
+        ),
+        (
+            "coverage_selected=1,coverage_state='partial',coverage_diagnostic='one'",
+            true,
+            true,
+            "partial",
+            Some("one"),
+        ),
+        (
+            "coverage_diagnostic='two'",
+            true,
+            true,
+            "partial",
+            Some("two"),
+        ),
+        (
+            "coverage_state='failed',coverage_diagnostic='two'",
+            true,
+            true,
+            "failed",
+            Some("two"),
+        ),
+        (
+            "coverage_state='unsupported'",
+            true,
+            true,
+            "unsupported",
+            Some("two"),
+        ),
+        (
+            "coverage_state='omitted'",
+            true,
+            true,
+            "omitted",
+            Some("two"),
+        ),
+        (
+            "coverage_state='notRequested'",
+            true,
+            true,
+            "notRequested",
+            Some("two"),
+        ),
+        (
+            "coverage_state='complete',coverage_diagnostic=NULL",
+            true,
+            true,
+            "complete",
+            None,
+        ),
+    ] {
+        let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+        db.execute(
+            &format!("UPDATE revision_documents SET {assignments} WHERE path='src/high.rs'"),
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let current = store.architecture_fingerprints_for_tests(None).unwrap();
+        let mut expected = first.clone();
+        expected.native.coverage_requested = requested;
+        expected.native.coverage_selected = selected;
+        expected.native.coverage_state = status.into();
+        expected.native.coverage_diagnostic = diagnostic.map(str::to_owned);
+        assert_eq!(current.documents[&key], expected, "{assignments}");
+        assert_eq!(current.producers, baseline.producers);
+        assert_eq!(current.selections, baseline.selections);
+        drop(store);
+    }
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute_batch("UPDATE revision_documents SET ordinal=ordinal+100; UPDATE revision_documents SET ordinal=102-ordinal,class_complete=1-class_complete").unwrap();
+    let stat: String = db
+        .query_row(
+            "SELECT capture_stat FROM revision_documents WHERE path='src/high.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut stat: trellis::capture::CaptureStat = serde_json::from_str(&stat).unwrap();
+    stat.mtime_seconds = stat.mtime_seconds.map(|seconds| seconds + 1);
+    db.execute(
+        "UPDATE revision_documents SET capture_stat=?1 WHERE path='src/high.rs'",
+        [serde_json::to_string(&stat).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(
+        store.architecture_fingerprints_for_tests(None).unwrap(),
+        baseline
+    );
+    drop(store);
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute("UPDATE graph_projections SET state='unavailable' WHERE gid IN (SELECT gid FROM revision_documents WHERE path='src/high.rs')", []).unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.architecture_fingerprints_for_tests(None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("incompatible_index:"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn architecture_incremental_captured_root_config_fallback() {
+    let (_state, root, store, _) = fixture();
+    assert!(
+        store
+            .architecture_reference_snapshot_for_tests()
+            .unwrap()
+            .root_tsconfig
+            .is_none()
+    );
+    fs::write(
+        root.path().join("jsconfig.json"),
+        "{\"compilerOptions\":{}}",
+    )
+    .unwrap();
+    publish_current(&store, root.path());
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    let config = snapshot.root_tsconfig.unwrap();
+    assert_eq!(config.path, "jsconfig.json");
+    assert_eq!(config.bytes, b"{\"compilerOptions\":{}}");
+    fs::write(root.path().join("tsconfig.json"), "{}").unwrap();
+    publish_current(&store, root.path());
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    let config = snapshot.root_tsconfig.unwrap();
+    assert_eq!(config.path, "tsconfig.json");
+    assert_eq!(config.bytes, b"{}");
 }
 #[test]
 fn captured_references_keep_stored_roles_and_call_rules_unknown_without_writes() {
@@ -408,6 +833,302 @@ fn published(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, S
         .unwrap();
     drop(leader);
     (state, root, store, pin)
+}
+
+#[test]
+fn architecture_incremental_external_scoped_projection() {
+    use trellis::references;
+    let (_state, root, store, pin) = published(&[
+        (
+            "Cargo.toml",
+            "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nwire={package='serde',version='1'}\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn run() { wire::send(); std::mem::drop(1); }\n",
+        ),
+        (
+            "package.json",
+            r#"{"dependencies":{"shared":"1.0.0"},"devDependencies":{"shared":"1.0.0"}}"#,
+        ),
+        ("root.js", "import one from 'shared';\n"),
+        ("other.js", "import one from 'shared';\n"),
+        ("typed.ts", "import one from 'shared';\n"),
+        (
+            "tools/package.json",
+            r#"{"optionalDependencies":{"shared":"2.0.0"}}"#,
+        ),
+        ("tools/nested.js", "import one from 'shared';\n"),
+    ]);
+    let snapshot = store.architecture_reference_snapshot_for_tests().unwrap();
+    assert_eq!(snapshot.pin, pin);
+    let base = references::resolve_all(&snapshot, &mut || Ok(())).unwrap();
+    let frozen = base.select(&[], 5, &mut || Ok(())).unwrap().data;
+    for path in [
+        "Cargo.toml",
+        "package.json",
+        "tools/package.json",
+        "root.js",
+        "tools/nested.js",
+    ] {
+        fs::write(root.path().join(path), "not the captured input").unwrap();
+    }
+    fs::remove_file(root.path().join("other.js")).unwrap();
+    for paths in [
+        vec![],
+        vec!["root.js".into()],
+        vec!["tools/**".into()],
+        vec!["root.js".into(), "tools/nested.js".into()],
+        vec!["typed.ts".into()],
+        vec!["missing/**".into()],
+    ] {
+        for prefix in [None, Some("tools")] {
+            let selected = base
+                .select_under(&paths, prefix, 5, &mut || Ok(()))
+                .unwrap();
+            let projected =
+                references::project_under(&snapshot, &paths, prefix, 5, &mut || Ok(())).unwrap();
+            assert_eq!(selected.data, projected.data, "{paths:?} {prefix:?}");
+            if prefix.is_none() {
+                assert_eq!(
+                    selected.data,
+                    references::project(&snapshot, &paths, 5, &mut || Ok(()))
+                        .unwrap()
+                        .data
+                );
+                assert_eq!(
+                    selected.data,
+                    base.select(&paths, 5, &mut || Ok(())).unwrap().data
+                );
+            }
+            let files = BTreeSet::from([
+                "root.js".into(),
+                "typed.ts".into(),
+                "tools/nested.js".into(),
+            ]);
+            assert_eq!(
+                base.select_where(&paths, prefix, Some(&files), &[], 5, &mut || Ok(()))
+                    .unwrap()
+                    .data,
+                references::project_where(
+                    &snapshot,
+                    &paths,
+                    prefix,
+                    Some(&files),
+                    &[],
+                    5,
+                    &mut || Ok(())
+                )
+                .unwrap()
+                .data,
+            );
+        }
+    }
+    let only = base
+        .select(&["root.js".into()], 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(
+        only["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|package| package["evidence"].as_array().unwrap())
+            .all(|evidence| evidence["path"] == "package.json")
+    );
+    let nested = base
+        .select_under(&[], Some("tools"), 5, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(
+        nested["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|package| package["evidence"].as_array().unwrap())
+            .all(|evidence| evidence["path"] == "tools/package.json")
+    );
+    assert_eq!(base.select(&[], 5, &mut || Ok(())).unwrap().data, frozen);
+    assert_eq!(
+        read(&store, "references", json!({"expectedBasis":pin}))["externalPackages"],
+        frozen["externalPackages"],
+        "public fallback still uses captured descriptors"
+    );
+}
+
+#[test]
+fn architecture_dependency_endpoints_include_current_alternatives_without_evidence_charges() {
+    use crate::graph_fixtures::{Bind, Publisher, Spec, bind};
+    use trellis::semantic_evidence as s;
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[
+        (
+            "src/lib.rs",
+            "pub mod call; pub mod a; pub mod b; pub mod c; pub mod d;\n",
+        ),
+        (
+            "src/call.rs",
+            "pub struct Source;\npub fn caller() { crate::a::first(); let value: Missing; }\n",
+        ),
+        ("src/a.rs", "pub fn first() {}\n"),
+        ("src/b.rs", "pub fn possible() {}\n"),
+        ("src/c.rs", "pub trait Trait {}\n"),
+        ("src/d.rs", "pub struct Candidate;\n"),
+    ]);
+    spec.bindings = vec![Bind {
+        resolution: s::Resolution::Ambiguous,
+        dispatch: s::Dispatch::Virtual,
+        possible: vec!["possible".into()],
+        ..bind("caller", 0, "first")
+    }];
+    spec.declaration_bindings = vec!["Source".into(), "Trait".into(), "Candidate".into()];
+    publisher.publish(&spec);
+    let use_site = publisher
+        .native()
+        .references
+        .iter()
+        .find(|reference| {
+            reference.document.path == "src/call.rs" && reference.spelling == "Missing"
+        })
+        .unwrap()
+        .clone();
+    publisher.publish_with_semantic(&spec, |semantic, _| {
+        let target = |name: &str| {
+            semantic
+                .symbols
+                .iter()
+                .find(|symbol| symbol.display_name.as_deref() == Some(name))
+                .unwrap()
+                .declarations[0]
+                .clone()
+        };
+        let (source, relationship_target, reference_target) =
+            (target("Source"), target("Trait"), target("Candidate"));
+        let external = semantic.call_bindings[0]
+            .candidates
+            .iter()
+            .find(|target| matches!(target, s::Target::External { .. }))
+            .unwrap()
+            .clone();
+        let base = semantic
+            .provenance
+            .iter()
+            .find(|proof| proof.id == "decl-Source")
+            .unwrap()
+            .clone();
+        let mut proof = base.clone();
+        proof.id = "relationship".into();
+        proof.evidence_kind = s::EvidenceKind::TypeRelationship;
+        semantic.provenance.push(proof);
+        semantic.type_relationships.push(s::TypeRelationship {
+            kind: s::RelationshipKind::Implements,
+            source,
+            target: relationship_target,
+            provenance_id: "relationship".into(),
+        });
+        let mut proof = base;
+        proof.id = "reference".into();
+        proof.evidence_kind = s::EvidenceKind::SemanticReference;
+        let revision_id = proof.revision_id.clone();
+        semantic.provenance.push(proof);
+        let mut candidates = vec![reference_target, external];
+        candidates.sort_by_key(|target| trellis::native_ids::canonical(&json!(target)));
+        semantic.references.push(s::Reference {
+            id: use_site.id.clone(),
+            owner_syntax_id: use_site.owner_syntax_id.clone(),
+            ordinal: use_site.ordinal,
+            document: use_site.document.clone(),
+            revision_id,
+            range: use_site.range.clone(),
+            spelling: use_site.spelling.clone(),
+            lookup_key: use_site.lookup_key.clone(),
+            site: s::ReferenceSite::Use,
+            roles: vec![s::Role::Read],
+            resolution: s::Resolution::Ambiguous,
+            declared_target: None,
+            candidates,
+            provenance_id: "reference".into(),
+        });
+        semantic.provenance.sort_by(|a, b| a.id.cmp(&b.id));
+        for coverage in &mut semantic.coverage {
+            coverage
+                .supported_roles
+                .extend([s::Role::Read, s::Role::Type]);
+            coverage.supported_roles.sort();
+            coverage.supported_roles.dedup();
+            if coverage.document_path == "src/call.rs" {
+                coverage
+                    .observed_roles
+                    .extend([s::Role::Read, s::Role::Type]);
+                coverage.observed_roles.sort();
+                coverage.observed_roles.dedup();
+            }
+        }
+    });
+    trellis::store::set_architecture_semantic_rows_for_tests(2);
+    let snapshot = publisher
+        .store
+        .architecture_reference_snapshot_for_tests()
+        .unwrap();
+    let source = snapshot
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/call.rs")
+        .unwrap();
+    let endpoints: BTreeSet<_> = source
+        .semantic
+        .endpoint_documents
+        .iter()
+        .map(|index| snapshot.documents[*index].key.path.as_str())
+        .collect();
+    assert_eq!(
+        endpoints,
+        BTreeSet::from([
+            "src/call.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/d.rs"
+        ])
+    );
+    assert!(source.semantic.projection.is_none());
+    assert_eq!(
+        source.semantic.anchors.len(),
+        1,
+        "dependency candidates do not become output anchors"
+    );
+    assert_eq!(source.semantic.relationships.len(), 1);
+    assert!(
+        source
+            .semantic
+            .anchors
+            .iter()
+            .all(|anchor| !anchor.metadata.contains_key("historicalTargets"))
+    );
+    publisher.store.architecture_semantic_for_tests(4).unwrap();
+    let error = publisher
+        .store
+        .architecture_semantic_for_tests(3)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("bounded_work: architecture lookup dependencies"),
+        "{error:#}"
+    );
+    trellis::store::set_architecture_semantic_rows_for_tests(1);
+    let error = publisher
+        .store
+        .architecture_reference_snapshot_for_tests()
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "bounded_work: architecture semantic evidence"
+    );
+    trellis::store::set_architecture_semantic_rows_for_tests(2_000_000);
 }
 
 /// `value` without its index pin, its partial files and their limitation, its counts of what

@@ -18,6 +18,135 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod dependencies;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArchitectureExecutionBranch {
+    Candidate,
+    Retry,
+    Oracle,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchitectureExecutionEvent {
+    ReferenceInvocation,
+    MetricWorker,
+    BeforeMetricCommit,
+    MetricCommit,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, Default)]
+pub struct ArchitectureExecutionTrace {
+    pub file_references: Vec<DocumentKey>,
+    pub measured_sources: Vec<DocumentKey>,
+    /// Present once reference computation completed, independently of later metrics.
+    pub references: Option<crate::references::ReferenceReplayTrace>,
+}
+
+#[cfg(feature = "test-support")]
+pub type ArchitectureExecutionHook = Arc<
+    dyn Fn(ArchitectureExecutionBranch, ArchitectureExecutionEvent, &DocumentKey) -> Result<()>
+        + Send
+        + Sync,
+>;
+
+#[cfg(feature = "test-support")]
+pub(crate) struct ArchitectureExecutionObserver {
+    branch: ArchitectureExecutionBranch,
+    hook: Option<ArchitectureExecutionHook>,
+    trace: Mutex<ArchitectureExecutionTrace>,
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    // Reference admission and metric commits run on the computing thread. Full metric
+    // workers receive an explicit observer clone only for the worker admission seam.
+    static EXECUTION_OBSERVER: std::cell::RefCell<Option<Arc<ArchitectureExecutionObserver>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) struct ArchitectureExecutionScope {
+    previous: Option<Arc<ArchitectureExecutionObserver>>,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for ArchitectureExecutionScope {
+    fn drop(&mut self) {
+        EXECUTION_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ArchitectureExecutionObserver {
+    pub(crate) fn new(
+        branch: ArchitectureExecutionBranch,
+        hook: Option<ArchitectureExecutionHook>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            branch,
+            hook,
+            trace: Mutex::default(),
+        })
+    }
+
+    pub(crate) fn enter(self: &Arc<Self>) -> ArchitectureExecutionScope {
+        ArchitectureExecutionScope {
+            previous: EXECUTION_OBSERVER.with(|observer| observer.replace(Some(self.clone()))),
+            thread: std::marker::PhantomData,
+        }
+    }
+
+    fn current() -> Option<Arc<Self>> {
+        EXECUTION_OBSERVER.with(|observer| observer.borrow().clone())
+    }
+
+    pub(crate) fn snapshot(&self) -> ArchitectureExecutionTrace {
+        self.trace.lock().unwrap().clone()
+    }
+
+    fn event(&self, event: ArchitectureExecutionEvent, key: &DocumentKey) -> Result<()> {
+        {
+            let mut trace = self.trace.lock().unwrap();
+            match event {
+                ArchitectureExecutionEvent::ReferenceInvocation => {
+                    trace.file_references.push(key.clone())
+                }
+                ArchitectureExecutionEvent::MetricCommit => {
+                    trace.measured_sources.push(key.clone())
+                }
+                ArchitectureExecutionEvent::MetricWorker
+                | ArchitectureExecutionEvent::BeforeMetricCommit => {}
+            }
+        }
+        // Never run a barrier or test callback while holding the observation lock.
+        self.hook
+            .as_ref()
+            .map_or(Ok(()), |hook| hook(self.branch, event, key))
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn architecture_execution_event(
+    event: ArchitectureExecutionEvent,
+    key: &DocumentKey,
+) -> Result<()> {
+    ArchitectureExecutionObserver::current().map_or(Ok(()), |observer| observer.event(event, key))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn architecture_references_completed(trace: crate::references::ReferenceReplayTrace) {
+    if let Some(observer) = ArchitectureExecutionObserver::current() {
+        observer.trace.lock().unwrap().references = Some(trace);
+    }
+}
+
 /// The checked arguments of one architecture operation.
 pub(crate) struct ArchitectureArguments {
     pub(crate) pin: Option<IndexPin>,
@@ -50,7 +179,7 @@ impl ArchitectureArguments {
 
 /// How far one core build has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct ArchitectureProgress {
+pub struct ArchitectureProgress {
     pub phase: &'static str,
     pub completed: usize,
     pub total: usize,
@@ -155,9 +284,27 @@ pub(crate) struct ArchitectureCore {
     interfaces: Option<Result<crate::interfaces::Extraction, CoreFailure>>,
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
+    dependencies: dependencies::ArchitectureDependencies,
 }
 
 impl ArchitectureCore {
+    pub(crate) fn incremental_base_eligible(&self) -> bool {
+        self.metrics_if_computed().is_some()
+            && self.dependencies.order.len() == self.dependencies.documents.len()
+    }
+
+    pub(crate) fn document_keys(&self) -> Vec<DocumentKey> {
+        self.dependencies.order.to_vec()
+    }
+
+    pub(crate) fn full_reference_trace(
+        &self,
+        limit: usize,
+    ) -> crate::references::ReferenceReplayTrace {
+        self.references
+            .full_trace(limit, crate::parallel::default_workers())
+    }
+
     pub(crate) fn references(
         &self,
         paths: &[String],
@@ -243,9 +390,62 @@ impl ArchitectureCore {
 pub(crate) struct ArchitectureInput {
     snapshot: crate::references::Snapshot,
     regions: Vec<Vec<crate::native_records::ControlRegion>>,
+    fingerprints: crate::architecture_inputs::ArchitectureFingerprints,
+    semantic_counts: crate::store::semantic_display::ArchitectureSemanticCounts,
+}
+
+impl ArchitectureInput {
+    pub(crate) fn document_keys(&self) -> Vec<DocumentKey> {
+        self.fingerprints.documents.keys().cloned().collect()
+    }
+
+    pub(crate) fn reference_limit(&self, check: &mut impl FnMut() -> Result<()>) -> Result<usize> {
+        Ok(crate::references::work::reference_limit(
+            self.snapshot.documents.len(),
+            crate::references::work::snapshot_bytes(&self.snapshot, check)?,
+        ))
+    }
+}
+
+struct CoreCompletion<'a> {
+    store: &'a Store,
+    config: Option<&'a Config>,
+    measure: bool,
+    progress: &'a (dyn Fn(ArchitectureProgress) + Sync),
 }
 
 impl EvidenceResponse {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_snapshot_for_tests(
+        &self,
+        pin: IndexPin,
+    ) -> Result<crate::references::Snapshot> {
+        Ok(self
+            .architecture_input(pin, &mut || Ok(()), &|_| {})?
+            .snapshot)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_full_for_tests(&self, pin: IndexPin) -> Result<serde_json::Value> {
+        let config = crate::rules::load(std::path::Path::new(self.store.workspace_root()))?;
+        self.architecture_core_at(pin, config.as_ref(), true, &mut || Ok(()), &|_| {})?
+            .canonical()
+    }
+
+    /// Expected structural provenance from this same-pin admitted native Read A.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn architecture_manifests_for_tests(
+        &self,
+        pin: IndexPin,
+    ) -> Result<Vec<crate::architecture_inputs::ManifestInput>> {
+        let (snapshot, _, _) =
+            self.architecture_read_a_fingerprinted(Some(pin), &mut || Ok(()), &|_, _| {})?;
+        Ok(snapshot.manifests)
+    }
+
     /// The documents a core computes from: read A, then read B, in this one transaction.
     pub(crate) fn architecture_input(
         &self,
@@ -266,8 +466,8 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<ArchitectureInput> {
-        let (snapshot, regions) = self
-            .architecture_native_regions(Some(pin), check, &|completed, total| {
+        let (snapshot, regions, fingerprints) = self
+            .architecture_read_a_fingerprinted(Some(pin), check, &|completed, total| {
                 progress(ArchitectureProgress {
                     phase: "reading",
                     completed,
@@ -275,7 +475,12 @@ impl EvidenceResponse {
                 });
             })
             .map_err(|error| self.store.report_index_failure(error))?;
-        Ok(ArchitectureInput { snapshot, regions })
+        Ok(ArchitectureInput {
+            snapshot,
+            regions,
+            fingerprints,
+            semantic_counts: Default::default(),
+        })
     }
 
     /// Read B (#1301): the semantic rows of every document of `input`, at its pin. This
@@ -285,8 +490,14 @@ impl EvidenceResponse {
         input: &mut ArchitectureInput,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<()> {
-        self.architecture_semantic_rows(&mut input.snapshot, check)
-            .map_err(|error| self.store.report_index_failure(error))
+        input.semantic_counts = self
+            .architecture_semantic_for_sources(
+                &mut input.snapshot,
+                crate::store::semantic_display::ArchitectureSemanticSources::All,
+                check,
+            )
+            .map_err(|error| self.store.report_index_failure(error))?;
+        Ok(())
     }
 
     /// Read and compute one revision's core for this one read.
@@ -320,7 +531,54 @@ impl ArchitectureCore {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<Self> {
-        let ArchitectureInput { snapshot, regions } = input;
+        progress(ArchitectureProgress {
+            phase: "resolving",
+            completed: 0,
+            total: input.snapshot.documents.len(),
+        });
+        let references = crate::references::resolve_all(&input.snapshot, check)?;
+        #[cfg(feature = "test-support")]
+        if ArchitectureExecutionObserver::current().is_some() {
+            let limit = input.reference_limit(&mut || Ok(()))?;
+            architecture_references_completed(
+                references.full_trace(limit, crate::parallel::default_workers()),
+            );
+        }
+        Self::complete(
+            input,
+            references,
+            CoreCompletion {
+                store,
+                config,
+                measure,
+                progress,
+            },
+            None,
+            check,
+        )
+    }
+
+    /// Rules, apps and interfaces always see the complete current snapshot. Only the
+    /// reference engine and metric selection differ between the two compute paths.
+    fn complete(
+        input: ArchitectureInput,
+        references: ReferenceBase,
+        context: CoreCompletion<'_>,
+        reuse: Option<(&ArchitectureCore, &std::collections::BTreeSet<DocumentKey>)>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<Self> {
+        let CoreCompletion {
+            store,
+            config,
+            measure,
+            progress,
+        } = context;
+        let ArchitectureInput {
+            snapshot,
+            regions,
+            fingerprints,
+            semantic_counts,
+        } = input;
         let total = snapshot.documents.len();
         let report = |phase| {
             progress(ArchitectureProgress {
@@ -329,8 +587,16 @@ impl ArchitectureCore {
                 total,
             });
         };
-        report("resolving");
-        let references = crate::references::resolve_all(&snapshot, check)?;
+        let mut dependencies = dependencies::ArchitectureDependencies::full(
+            &snapshot,
+            fingerprints,
+            &semantic_counts.sources,
+            semantic_counts.global,
+            &references,
+        )?;
+        if let Some((base, _)) = reuse {
+            dependencies.share_unchanged(&base.dependencies);
+        }
         report("evaluating");
         let rules = config
             .map(|config| {
@@ -347,13 +613,23 @@ impl ArchitectureCore {
             .transpose()?;
         let metrics = if measure {
             report("measuring");
-            Some(
-                match measure_documents(store, &snapshot, &regions, check, progress) {
-                    Ok(metrics) => Ok(metrics),
-                    Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
-                    Err(error) => return Err(error),
-                },
-            )
+            let measured = match reuse {
+                Some((base, changed)) => engine::measure_changed_documents(
+                    store,
+                    &snapshot,
+                    &regions,
+                    base.metrics()?,
+                    changed,
+                    check,
+                    progress,
+                ),
+                None => measure_documents(store, &snapshot, &regions, check, progress),
+            };
+            Some(match measured {
+                Ok(metrics) => Ok(metrics),
+                Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
+                Err(error) => return Err(error),
+            })
         } else {
             None
         };
@@ -417,27 +693,641 @@ impl ArchitectureCore {
             app_candidates,
             interfaces,
             summaries: Mutex::default(),
+            dependencies,
         })
     }
 }
 
-/// The path one owner build took (#1301), for tests to prove which work a build did. Every
-/// build is full until incremental builds land.
-#[cfg(feature = "test-support")]
+/// The path a supplied-base plan takes. The runtime owner selects bases separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArchitectureBuildPath {
     Full(FullReason),
+    Incremental {
+        dirty: Vec<DocumentKey>,
+        patched: Vec<DocumentKey>,
+        reused: Vec<DocumentKey>,
+    },
 }
 
 /// Why a build read and computed every document.
-#[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FullReason {
     /// The build had no earlier result to start from.
     NoBase,
+    DocumentSetChanged,
+    ManifestsChanged,
+    RootTsconfigChanged,
+    ProducerSetChanged,
+    RawSelectionsChanged,
+    NonRustChanged,
+    DirtyMajority,
+    RustCatalogChanged,
+    ReferenceWorkMargin,
+    /// An ordinary incremental failure was retried through the independent full path.
+    IncrementalFailure,
 }
 
 #[cfg(feature = "test-support")]
+pub use engine::{
+    ArchitectureBuildForTests, ArchitectureCoreHandle, ArchitectureCoreWeak, ArchitectureSharing,
+};
+pub(crate) use engine::{
+    ArchitectureBuildPlan, ArchitectureReadA, ArchitectureReadB, ReferenceWorkMargin,
+    finish_architecture, prepare_architecture,
+};
+
+#[cfg(feature = "test-support")]
+impl ArchitectureCore {
+    pub(crate) fn test_handle(core: Arc<Self>) -> ArchitectureCoreHandle {
+        engine::ArchitectureCoreHandle(core)
+    }
+}
+
+mod engine {
+    use super::*;
+    use crate::store::semantic_display::{ArchitectureSemanticCounts, ArchitectureSemanticSources};
+    use anyhow::{Context, ensure};
+    #[cfg(feature = "test-support")]
+    use serde::Serialize;
+    use std::collections::BTreeSet;
+
+    /// The caller supplies context and a base, not an eligibility policy. References to the
+    /// store/config/progress are not references into the owned native snapshot.
+    pub(crate) struct ArchitectureReadA<'a> {
+        pub(crate) input: ArchitectureInput,
+        pub(crate) store: &'a Store,
+        pub(crate) config: Option<&'a Config>,
+        pub(crate) measure: bool,
+        pub(crate) progress: &'a (dyn Fn(ArchitectureProgress) + Sync),
+        pub(crate) trace: &'a Mutex<crate::references::ReferenceReplayTrace>,
+        /// Captured by the requester and explicitly applied on each compute worker.
+        #[cfg(feature = "test-support")]
+        pub(crate) work_limit: crate::references::ReferenceWorkLimitForTests,
+    }
+
+    pub(crate) struct ArchitectureBuildPlan<'a> {
+        pub(super) read_a: ArchitectureReadA<'a>,
+        base: Option<Arc<ArchitectureCore>>,
+        pub(super) changed: dependencies::ChangedDocuments,
+        references: Option<crate::references::ReferencePreparation>,
+        pub(crate) path: ArchitectureBuildPath,
+        all_semantic: bool,
+    }
+
+    /// Read B owns its admitted rows, not a lease. The pin prevents mixing two admissions.
+    pub(crate) struct ArchitectureReadB {
+        pub(super) pin: IndexPin,
+        pub(super) documents: Vec<crate::references::DocumentSemantic>,
+        pub(super) counts: ArchitectureSemanticCounts,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ReferenceWorkMargin;
+    impl std::fmt::Display for ReferenceWorkMargin {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("incremental reference work margin")
+        }
+    }
+    impl std::error::Error for ReferenceWorkMargin {}
+
+    pub(crate) fn prepare_architecture<'a>(
+        mut read_a: ArchitectureReadA<'a>,
+        base: Option<Arc<ArchitectureCore>>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<super::ArchitectureBuildPlan<'a>> {
+        #[cfg(feature = "test-support")]
+        let _work_limit = read_a.work_limit.apply();
+        check()?;
+        (read_a.progress)(ArchitectureProgress {
+            phase: "resolving",
+            completed: 0,
+            total: read_a.input.snapshot.documents.len(),
+        });
+        let decision = dependencies::changed_documents(
+            &read_a.input.snapshot,
+            &read_a.input.fingerprints,
+            base.as_ref().map(|base| &base.dependencies),
+        )?;
+        let mut plan = ArchitectureBuildPlan {
+            path: ArchitectureBuildPath::Full(FullReason::NoBase),
+            changed: dependencies::ChangedDocuments::default(),
+            references: None,
+            all_semantic: true,
+            base,
+            read_a: {
+                // Clean payloads will not be read, but producer selection, projection
+                // counts and the complete declaration eligibility index must be current.
+                for doc in &mut read_a.input.snapshot.documents {
+                    let state = read_a
+                        .input
+                        .fingerprints
+                        .semantic_states
+                        .get(&doc.key)
+                        .context("missing architecture semantic state")?;
+                    doc.semantic.producer_id = state.default_producer.clone();
+                    doc.semantic.projection = state.projection.clone();
+                    doc.semantic.boundary = state
+                        .projection
+                        .as_ref()
+                        .is_some_and(|projection| projection.semantic_status.is_pending());
+                }
+                read_a
+            },
+        };
+        let changed = match decision {
+            Ok(changed) => changed,
+            Err(reason) => {
+                plan.path = ArchitectureBuildPath::Full(reason);
+                return Ok(plan);
+            }
+        };
+        let references =
+            crate::references::prepare_incremental(&plan.read_a.input.snapshot, check)?;
+        let base = plan.base.as_ref().expect("incremental decision has a base");
+        if !changed.native.is_empty() && references.digest != base.dependencies.rust_catalog {
+            plan.path = ArchitectureBuildPath::Full(FullReason::RustCatalogChanged);
+            return Ok(plan);
+        }
+        plan.all_semantic = plan.read_a.config.is_some_and(Config::has_rules)
+            && plan
+                .read_a
+                .input
+                .fingerprints
+                .semantic_states
+                .values()
+                .any(|state| {
+                    !state
+                        .projection
+                        .as_ref()
+                        .is_some_and(|projection| projection.semantic_status.is_pending())
+                        && state.tuple.as_ref().is_some_and(|tuple| {
+                            tuple.selected
+                                && matches!(tuple.state.as_str(), "complete" | "partial")
+                                && tuple.payload_id.is_some()
+                        })
+                });
+        plan.path = ArchitectureBuildPath::Incremental {
+            dirty: changed.dirty.iter().cloned().collect(),
+            patched: changed.patched.iter().cloned().collect(),
+            reused: changed.reused.iter().cloned().collect(),
+        };
+        plan.changed = changed;
+        plan.references = Some(references);
+        Ok(plan)
+    }
+
+    impl ArchitectureBuildPlan<'_> {
+        pub(crate) fn semantic_keys(&self) -> Vec<DocumentKey> {
+            if self.all_semantic {
+                self.read_a
+                    .input
+                    .fingerprints
+                    .documents
+                    .keys()
+                    .cloned()
+                    .collect()
+            } else {
+                self.changed.dirty.iter().cloned().collect()
+            }
+        }
+    }
+
+    impl EvidenceResponse {
+        /// This admitted read ends before finish executes any resolver or measurement.
+        pub(crate) fn architecture_plan_read_b(
+            &self,
+            plan: &mut ArchitectureBuildPlan<'_>,
+            check: &mut (impl FnMut() -> Result<()> + Send),
+        ) -> Result<super::ArchitectureReadB> {
+            let total = plan.read_a.input.snapshot.documents.len();
+            (plan.read_a.progress)(ArchitectureProgress {
+                phase: "resolving",
+                completed: 0,
+                total,
+            });
+            let selection = if plan.all_semantic {
+                ArchitectureSemanticSources::All
+            } else {
+                let base = plan.base.as_ref().expect("selective read has a base");
+                ArchitectureSemanticSources::Sources {
+                    keys: plan.changed.dirty.clone(),
+                    retained: base
+                        .dependencies
+                        .order
+                        .iter()
+                        .zip(&base.dependencies.documents)
+                        .filter(|(key, _)| !plan.changed.dirty.contains(*key))
+                        .map(|(key, document)| (key.clone(), document.semantic))
+                        .collect(),
+                }
+            };
+            let counts = self
+                .architecture_semantic_for_sources(
+                    &mut plan.read_a.input.snapshot,
+                    selection,
+                    check,
+                )
+                .map_err(|error| self.store.report_index_failure(error))?;
+            Ok(ArchitectureReadB {
+                pin: plan.read_a.input.snapshot.pin,
+                documents: plan
+                    .read_a
+                    .input
+                    .snapshot
+                    .documents
+                    .iter_mut()
+                    .map(|doc| std::mem::take(&mut doc.semantic))
+                    .collect(),
+                counts,
+            })
+        }
+    }
+
+    pub(crate) fn finish_architecture(
+        mut plan: ArchitectureBuildPlan<'_>,
+        read_b: ArchitectureReadB,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<ArchitectureCore> {
+        #[cfg(feature = "test-support")]
+        let _work_limit = plan.read_a.work_limit.apply();
+        check()?;
+        ensure!(
+            read_b.pin == plan.read_a.input.snapshot.pin,
+            "architecture read B pin"
+        );
+        ensure!(
+            read_b.documents.len() == plan.read_a.input.snapshot.documents.len(),
+            "architecture read B inventory"
+        );
+        for (doc, semantic) in plan
+            .read_a
+            .input
+            .snapshot
+            .documents
+            .iter_mut()
+            .zip(read_b.documents)
+        {
+            doc.semantic = semantic;
+        }
+        plan.read_a.input.semantic_counts = read_b.counts;
+        let ArchitectureReadA {
+            input,
+            store,
+            config,
+            measure,
+            progress,
+            trace,
+            #[cfg(feature = "test-support")]
+                work_limit: _,
+        } = plan.read_a;
+        let Some(prepared) = plan.references else {
+            let limit = crate::references::work::reference_limit(
+                input.snapshot.documents.len(),
+                crate::references::work::snapshot_bytes(&input.snapshot, check)?,
+            );
+            let core = ArchitectureCore::compute(store, input, config, measure, check, progress)?;
+            *trace.lock().unwrap_or_else(|error| error.into_inner()) = core
+                .references
+                .full_trace(limit, crate::parallel::default_workers());
+            return Ok(core);
+        };
+        let limit = prepared.limit;
+        let base = plan.base.as_ref().context("incremental base")?;
+        let completed = crate::references::finish_incremental(
+            &input.snapshot,
+            prepared,
+            &base.references,
+            &plan.changed.dirty,
+            &plan.changed.patched,
+            check,
+        )?;
+        #[cfg(feature = "test-support")]
+        architecture_references_completed(completed.trace.clone());
+        let margin = base
+            .dependencies
+            .order
+            .iter()
+            .zip(&base.dependencies.documents)
+            .filter(|(key, _)| plan.changed.dirty.contains(*key))
+            .try_fold(completed.trace.executed_work, |work, (_, doc)| {
+                work.checked_add(doc.references.work)
+            });
+        *trace.lock().unwrap_or_else(|error| error.into_inner()) = completed.trace;
+        let margin = margin.context("incremental reference work margin overflow")?;
+        if margin > limit {
+            return Err(super::ReferenceWorkMargin.into());
+        }
+        ArchitectureCore::complete(
+            input,
+            completed.references,
+            CoreCompletion {
+                store,
+                config,
+                measure,
+                progress,
+            },
+            Some((base, &plan.changed.native)),
+            check,
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[derive(Clone)]
+    pub struct ArchitectureCoreHandle(pub(super) Arc<ArchitectureCore>);
+
+    #[cfg(feature = "test-support")]
+    pub struct ArchitectureCoreWeak(std::sync::Weak<ArchitectureCore>);
+    #[cfg(feature = "test-support")]
+    impl ArchitectureCoreWeak {
+        pub fn is_alive(&self) -> bool {
+            self.0.strong_count() != 0
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[derive(Debug, Serialize)]
+    pub struct ArchitectureSharing {
+        pub source: bool,
+        pub metric: bool,
+        pub dependency: bool,
+        pub fingerprint: bool,
+        pub references: bool,
+        pub endpoints: bool,
+        pub plan: bool,
+    }
+
+    #[cfg(feature = "test-support")]
+    impl ArchitectureCoreHandle {
+        pub fn canonical(&self) -> Result<serde_json::Value> {
+            self.0.canonical()
+        }
+        pub fn downgrade(&self) -> super::ArchitectureCoreWeak {
+            ArchitectureCoreWeak(Arc::downgrade(&self.0))
+        }
+        pub fn pin(&self) -> IndexPin {
+            self.0.pin
+        }
+        pub fn sharing(&self, other: &Self) -> BTreeMap<DocumentKey, super::ArchitectureSharing> {
+            let old = &other.0;
+            self.0
+                .dependencies
+                .order
+                .iter()
+                .zip(&self.0.dependencies.documents)
+                .enumerate()
+                .filter_map(|(i, (key, document))| {
+                    let j = old.dependencies.order.binary_search(key).ok()?;
+                    let before = &old.dependencies.documents[j];
+                    Some((
+                        key.clone(),
+                        ArchitectureSharing {
+                            source: self.0.references.source_shared(i, &old.references, j),
+                            metric: self
+                                .0
+                                .metrics_if_computed()
+                                .and_then(|metrics| metrics.get(key))
+                                .zip(
+                                    old.metrics_if_computed()
+                                        .and_then(|metrics| metrics.get(key)),
+                                )
+                                .is_some_and(|(a, b)| Arc::ptr_eq(a, b)),
+                            dependency: Arc::ptr_eq(document, before),
+                            fingerprint: Arc::ptr_eq(&document.fingerprint, &before.fingerprint),
+                            references: Arc::ptr_eq(&document.references, &before.references),
+                            endpoints: Arc::ptr_eq(
+                                &document.references.endpoints,
+                                &before.references.endpoints,
+                            ),
+                            plan: document
+                                .references
+                                .plan
+                                .as_ref()
+                                .zip(before.references.plan.as_ref())
+                                .is_some_and(|(a, b)| Arc::ptr_eq(a, b)),
+                        },
+                    ))
+                })
+                .collect()
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub struct ArchitectureBuildForTests {
+        pub core: ArchitectureCoreHandle,
+        pub path: ArchitectureBuildPath,
+        pub semantic_sources: Vec<DocumentKey>,
+        pub measured_sources: Vec<DocumentKey>,
+        pub progress: Vec<ArchitectureProgress>,
+        pub references: crate::references::ReferenceReplayTrace,
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(super) fn retryable_incremental_error(error: &anyhow::Error) -> bool {
+        !error.to_string().starts_with("cancelled")
+            && !crate::store::transient_storage_contention(error)
+    }
+
+    #[cfg(feature = "test-support")]
+    impl Store {
+        /// Direct supplied-base engine adapter. It owns no cache and retains no native input.
+        #[doc(hidden)]
+        pub fn architecture_build_for_tests(
+            &self,
+            base: Option<&super::ArchitectureCoreHandle>,
+            config: Option<&Config>,
+        ) -> Result<super::ArchitectureBuildForTests> {
+            let work_limit = crate::references::ReferenceWorkLimitForTests::capture();
+            let _work_limit = work_limit.apply();
+            let mut observer =
+                ArchitectureExecutionObserver::new(ArchitectureExecutionBranch::Candidate, None);
+            let mut scope = Some(observer.enter());
+            let progress = Mutex::new(Vec::new());
+            let report = |value| {
+                progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(value)
+            };
+            let trace = Mutex::new(Default::default());
+            let response = self.evidence_response()?;
+            let pin = response.selected_pin(None)?;
+            let input = response.architecture_native_input(pin, &mut || Ok(()), &report)?;
+            let input = response.finish(input)?;
+            drop(response);
+            let mut path = None;
+            let mut semantic_sources = Vec::new();
+            let computed = (|| {
+                let mut plan = super::prepare_architecture(
+                    super::ArchitectureReadA {
+                        input,
+                        store: self,
+                        config,
+                        measure: true,
+                        progress: &report,
+                        trace: &trace,
+                        work_limit,
+                    },
+                    base.map(|handle| handle.0.clone()),
+                    &mut || Ok(()),
+                )?;
+                path = Some(plan.path.clone());
+                semantic_sources = plan.semantic_keys();
+                let response = self.evidence_response()?;
+                let read_b = response
+                    .architecture_plan_read_b(&mut plan, &mut || Ok(()))
+                    .and_then(|read_b| response.finish(read_b));
+                drop(response);
+                super::finish_architecture(plan, read_b?, &mut || Ok(()))
+            })();
+            let core = match computed {
+                Ok(core) => core,
+                Err(error)
+                    if base.is_some()
+                        && path.as_ref().is_none_or(|path| {
+                            matches!(path, ArchitectureBuildPath::Incremental { .. })
+                        })
+                        && retryable_incremental_error(&error) =>
+                {
+                    drop(scope.take());
+                    observer = ArchitectureExecutionObserver::new(
+                        ArchitectureExecutionBranch::Retry,
+                        None,
+                    );
+                    scope = Some(observer.enter());
+                    path = Some(ArchitectureBuildPath::Full(
+                        if error.downcast_ref::<ReferenceWorkMargin>().is_some() {
+                            FullReason::ReferenceWorkMargin
+                        } else {
+                            FullReason::IncrementalFailure
+                        },
+                    ));
+                    let response = self.evidence_response()?;
+                    let input = response.architecture_input(pin, &mut || Ok(()), &report)?;
+                    semantic_sources = input.fingerprints.documents.keys().cloned().collect();
+                    let input = response.finish(input)?;
+                    drop(response);
+                    let limit = crate::references::work::reference_limit(
+                        input.snapshot.documents.len(),
+                        crate::references::work::snapshot_bytes(&input.snapshot, &mut || Ok(()))?,
+                    );
+                    let core = ArchitectureCore::compute(
+                        self,
+                        input,
+                        config,
+                        true,
+                        &mut || Ok(()),
+                        &report,
+                    )?;
+                    *trace.lock().unwrap_or_else(|error| error.into_inner()) = core
+                        .references
+                        .full_trace(limit, crate::parallel::default_workers());
+                    core
+                }
+                Err(error) => return Err(error),
+            };
+            let path = path.context("completed architecture build path")?;
+            let execution = observer.snapshot();
+            drop(scope);
+            let mut references = execution.references.unwrap_or_default();
+            references.file_references = execution.file_references;
+            Ok(ArchitectureBuildForTests {
+                core: ArchitectureCore::test_handle(Arc::new(core)),
+                path,
+                semantic_sources,
+                measured_sources: execution.measured_sources,
+                progress: progress.into_inner().unwrap_or_else(|e| e.into_inner()),
+                references,
+            })
+        }
+    }
+
+    pub(super) fn measure_changed_documents(
+        store: &Store,
+        snapshot: &crate::references::Snapshot,
+        regions: &[Vec<crate::native_records::ControlRegion>],
+        base: &ArchitectureMetrics,
+        changed: &BTreeSet<DocumentKey>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        report: &(dyn Fn(ArchitectureProgress) + Sync),
+    ) -> Result<ArchitectureMetrics> {
+        let mut metrics: BTreeMap<_, _> = base
+            .iter()
+            .filter(|(key, _)| !changed.contains(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let total = snapshot.documents.len();
+        report(ArchitectureProgress {
+            phase: "measuring",
+            completed: metrics.len(),
+            total,
+        });
+        let mut order: Vec<_> = snapshot
+            .documents
+            .iter()
+            .enumerate()
+            .filter(|(_, doc)| changed.contains(&doc.key))
+            .collect();
+        order.sort_by_key(|(_, doc)| &doc.key);
+        let cancelled = MetricsReadCheck {
+            check: Mutex::new(check),
+            failure: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+        };
+        for (i, doc) in order {
+            let calls = std::cell::Cell::new(0);
+            let expired = || cancelled.expired_every(&calls, METRICS_WORKER_CHECK_EVERY);
+            let result = store.metrics_document(
+                &doc.key,
+                &doc.file,
+                &doc.declarations,
+                &doc.calls,
+                &regions[i],
+                snapshot.evidence_gaps.contains_key(&doc.key),
+                &expired,
+            );
+            let MetricsComputedDocument {
+                computed,
+                physical_lines,
+                physical_bytes,
+                file_role,
+            } = match result {
+                Ok(result) => result,
+                Err(MetricsDocumentFailure::Read(error)) => {
+                    return cancelled.result(Err(store.report_index_failure(error)));
+                }
+                Err(MetricsDocumentFailure::Other(error)) => return cancelled.result(Err(error)),
+                Err(MetricsDocumentFailure::Stopped) => {
+                    return cancelled.result(Err(anyhow::anyhow!("cancelled")));
+                }
+            };
+            let gap = computed.gap().cloned();
+            #[cfg(feature = "test-support")]
+            architecture_execution_event(ArchitectureExecutionEvent::BeforeMetricCommit, &doc.key)?;
+            let rows = computed
+                .commit(&mut store.metrics_memo.lock().unwrap_or_else(|e| e.into_inner()))?;
+            metrics.insert(
+                doc.key.clone(),
+                Arc::new(MetricsDocument {
+                    rows,
+                    gap,
+                    physical_lines,
+                    physical_bytes,
+                    file_role,
+                }),
+            );
+            #[cfg(feature = "test-support")]
+            architecture_execution_event(ArchitectureExecutionEvent::MetricCommit, &doc.key)?;
+            report(ArchitectureProgress {
+                phase: "measuring",
+                completed: metrics.len(),
+                total,
+            });
+        }
+        cancelled.check()?;
+        Ok(metrics)
+    }
+}
+
 impl ArchitectureCore {
     /// Every part of this core in one canonical value (#1301): two cores are equal when every
     /// read answers the same from them. The summary cache is left out; reads fill it.
@@ -452,6 +1342,7 @@ impl ArchitectureCore {
             app_candidates,
             interfaces,
             summaries: _,
+            dependencies,
         } = self;
         let failure = |failure: &CoreFailure| {
             let CoreFailure {
@@ -512,6 +1403,7 @@ impl ArchitectureCore {
             "metrics": metrics,
             "appCandidates": app_candidates,
             "interfaces": interfaces,
+            "dependencies": dependencies.canonical(),
         }))
     }
 }
@@ -523,6 +1415,48 @@ pub type ArchitectureReadForTests = (Vec<(String, String)>, serde_json::Value);
 
 #[cfg(feature = "test-support")]
 impl Store {
+    /// Exercise the existing scoped fallback without selecting or activating a runtime owner.
+    #[doc(hidden)]
+    pub fn architecture_scoped_response_for_tests(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self.evidence_response()?;
+        let parsed = EvidenceResponse::architecture_arguments(kind, arguments)?;
+        let config = response.architecture_config(kind, &parsed)?;
+        let payload = response.architecture_response_scoped(
+            kind,
+            arguments,
+            &parsed,
+            config.as_ref(),
+            &mut || Ok(()),
+        )?;
+        response.finish(payload)
+    }
+
+    /// Read-A identities from an admitted captured revision; no source text is retained.
+    #[doc(hidden)]
+    pub fn architecture_fingerprints_for_tests(
+        &self,
+        pin: Option<IndexPin>,
+    ) -> Result<crate::architecture_inputs::ArchitectureFingerprints> {
+        let response = self.evidence_response()?;
+        let (_, _, fingerprints) =
+            response.architecture_read_a_fingerprinted(pin, &mut || Ok(()), &|_, _| {})?;
+        response.finish(fingerprints)
+    }
+
+    /// Admitted captured inputs for comparing full and scoped reference construction.
+    /// The transaction ends before either resolver runs.
+    #[doc(hidden)]
+    pub fn architecture_reference_snapshot_for_tests(&self) -> Result<crate::references::Snapshot> {
+        let response = self.evidence_response()?;
+        let pin = response.selected_pin(None)?;
+        let input = response.architecture_input(pin, &mut || Ok(()), &|_| {})?;
+        response.finish(input.snapshot)
+    }
+
     /// The head's Architecture read and core twice (#1301): read A and read B in one
     /// transaction, then each in its own. For each: every document's path and semantic rows,
     /// in debug form, and the canonical core computed from them, with metrics and no rules.
@@ -562,7 +1496,6 @@ impl Store {
 
 /// Every field of one metric row, including `name` and `kind`, which its JSON skips and the
 /// top-cognitive answer reads.
-#[cfg(feature = "test-support")]
 fn canonical_metric_row(row: &DeclarationMetrics) -> serde_json::Value {
     // Exhaustive, so a new field fails to compile until it is compared.
     let DeclarationMetrics {
@@ -590,7 +1523,6 @@ fn canonical_metric_row(row: &DeclarationMetrics) -> serde_json::Value {
 }
 
 /// The JSON pointer of the first place `left` and `right` differ, in key and index order.
-#[cfg(feature = "test-support")]
 pub(crate) fn first_difference(
     left: &serde_json::Value,
     right: &serde_json::Value,
@@ -667,6 +1599,8 @@ fn measure_documents(
         stopped: AtomicBool::new(false),
     };
     let indexes: Vec<usize> = (0..snapshot.documents.len()).collect();
+    #[cfg(feature = "test-support")]
+    let observer = ArchitectureExecutionObserver::current();
     let outcomes = crate::parallel::map_ordered(
         &indexes,
         crate::parallel::default_workers(),
@@ -675,15 +1609,27 @@ fn measure_documents(
             let document = &snapshot.documents[index];
             let calls = std::cell::Cell::new(0);
             let expired = || progress.expired_every(&calls, METRICS_WORKER_CHECK_EVERY);
-            let outcome = store.metrics_document(
-                &document.key,
-                &document.file,
-                &document.declarations,
-                &document.calls,
-                &regions[index],
-                snapshot.evidence_gaps.contains_key(&document.key),
-                &expired,
-            );
+            let measure = || {
+                store.metrics_document(
+                    &document.key,
+                    &document.file,
+                    &document.declarations,
+                    &document.calls,
+                    &regions[index],
+                    snapshot.evidence_gaps.contains_key(&document.key),
+                    &expired,
+                )
+            };
+            #[cfg(feature = "test-support")]
+            let outcome = observer
+                .as_ref()
+                .map_or(Ok(()), |observer| {
+                    observer.event(ArchitectureExecutionEvent::MetricWorker, &document.key)
+                })
+                .map_err(MetricsDocumentFailure::Other)
+                .and_then(|()| measure());
+            #[cfg(not(feature = "test-support"))]
+            let outcome = measure();
             let mut measured = measured.lock().unwrap_or_else(|e| e.into_inner());
             *measured += 1;
             report(ArchitectureProgress {
@@ -714,6 +1660,11 @@ fn measure_documents(
             }
         };
         let gap = computed.gap().cloned();
+        #[cfg(feature = "test-support")]
+        architecture_execution_event(
+            ArchitectureExecutionEvent::BeforeMetricCommit,
+            &document.key,
+        )?;
         let rows =
             computed.commit(&mut store.metrics_memo.lock().unwrap_or_else(|e| e.into_inner()))?;
         documents.insert(
@@ -726,6 +1677,8 @@ fn measure_documents(
                 file_role,
             }),
         );
+        #[cfg(feature = "test-support")]
+        architecture_execution_event(ArchitectureExecutionEvent::MetricCommit, &document.key)?;
     }
     progress.check()?;
     Ok(documents)
