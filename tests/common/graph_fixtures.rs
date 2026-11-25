@@ -155,8 +155,11 @@ fn native_components(
             dir = parent.parent();
         }
     }
+    // Only present ignore files are config inputs (#1327).
     for probe in probes {
-        config.push(entry(&probe.to_string_lossy()));
+        if root.join(&probe).is_file() {
+            config.push(entry(&probe.to_string_lossy()));
+        }
     }
     let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":entry(INPUTS[26]),"rootRustToolchainToml":entry(INPUTS[27])});
     (toolchain, config, dependencies)
