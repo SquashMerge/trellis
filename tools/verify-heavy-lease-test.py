@@ -3,7 +3,11 @@
 
 Each test runs the real tools/verify and the real lease scripts against a lock in
 a temporary directory. Nothing is built: PATH holds only stubs for the tools the
-lanes call (plus /usr/bin and /bin), and each stub records how it was called."""
+lanes call (plus /usr/bin and /bin), and each stub records how it was called.
+
+The lease has two slots (<lock>.lease and <lock>.lease2). Verify asks for the
+medium tier, which holds one slot, unless the caller set MIMIR_HEAVY_TIER."""
+import json
 import os
 import shutil
 import subprocess
@@ -38,7 +42,7 @@ esac
 """
 # Stands in for the interpreter (MIMIR_HEAVY_PYTHON) of one run. It loads the
 # unmodified lease script and wraps its _publish_generation, the atomic mkdir of
-# the lease: when that finds the lease already held, it leaves a marker and
+# a lease directory: when that finds slot 1 already held, it leaves a marker and
 # re-raises. Everything else is the real code. The marker is the signal that a
 # run has reached the lease and been turned away.
 LEASE_OBSERVER = r"""import importlib.util, os, sys
@@ -73,6 +77,7 @@ class VerifyHeavyLease(unittest.TestCase):
         (self.dir / "locks").mkdir()
         self.lock = self.dir / "locks" / "heavy.lock"
         self.lease = Path(str(self.lock) + ".lease")
+        self.lease2 = Path(str(self.lock) + ".lease2")
 
     def stub(self, name, text):
         path = self.bin / name
@@ -138,6 +143,19 @@ class VerifyHeavyLease(unittest.TestCase):
         path = self.dir / "events"
         return path.read_text().splitlines() if path.exists() else []
 
+    def holders(self):
+        """The tier each held slot's owner recorded, by slot."""
+        found = {}
+        for slot in (self.lease, self.lease2):
+            owner = slot / "owner"
+            if owner.exists():
+                found[slot.name.rsplit(".", 1)[1]] = json.loads(owner.read_text())["tier"]
+        return found
+
+    def assert_released(self):
+        self.assertFalse(self.lease.exists())
+        self.assertFalse(self.lease2.exists())
+
     def lane_call(self):
         found = [call for call in self.calls() if call.startswith(LANE + "|")]
         self.assertEqual(len(found), 1, self.calls())
@@ -159,7 +177,7 @@ class VerifyHeavyLease(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(self.lane_call(), LANE + "|held=1|lease=present|mark=two words")
         self.assertIn("==> verify lane semantic (exit 0)", done.stdout)
-        self.assertFalse(self.lease.exists())
+        self.assert_released()
 
     def test_the_default_lanes_run_under_the_lease(self):
         # The stubs make some lanes fail (nothing is built); only where they ran matters.
@@ -169,7 +187,7 @@ class VerifyHeavyLease(unittest.TestCase):
         calls = self.calls()
         self.assertIn(LANE + "|held=1|lease=present|mark=", calls)
         self.assertEqual([c for c in calls if "|held=1|lease=present|" not in c], [])
-        self.assertFalse(self.lease.exists())
+        self.assert_released()
 
     def test_exit_statuses_pass_through_the_lease(self):
         failed = self.verify(self.leased(HEAVY_TEST_EXIT="7"), "--lane", "semantic")
@@ -178,7 +196,7 @@ class VerifyHeavyLease(unittest.TestCase):
         usage = self.verify(self.leased(), "--lane", "nonesuch")
         self.assertEqual(usage.returncode, 2, usage.stdout + usage.stderr)
         self.assertIn("verify: unknown lane: nonesuch", usage.stderr)
-        self.assertFalse(self.lease.exists())
+        self.assert_released()
 
     def test_inside_an_outer_lease_verify_runs_directly(self):
         # As the host wrapper does: the lease scripts run verify, which must not wait
@@ -186,6 +204,18 @@ class VerifyHeavyLease(unittest.TestCase):
         done = self.verify(self.leased(HEAVY_TEST_EXIT="3"), "./tools/verify", "--lane",
                            "semantic", command=("sh", "tools/heavy_run.sh"))
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertEqual(self.lane_call(), LANE + "|held=1|lease=present|mark=")
+
+    def test_inside_an_outer_medium_lease_verify_takes_no_second_slot(self):
+        # As the medium host wrapper does: a nested verify that took the lease again
+        # would get slot 2 beside its own parent instead of waiting.
+        run = self.start(self.leased(MIMIR_HEAVY_TIER="medium", HEAVY_TEST_ID="nested",
+                                     HEAVY_TEST_HOLD="1"),
+                         "./tools/verify", "--lane", "semantic",
+                         command=("sh", "tools/heavy_run.sh"))
+        self.wait_for(lambda: self.events() == ["start nested"], run)
+        self.assertEqual(self.holders(), {"lease": "medium"})
+        self.finish_all(run)
         self.assertEqual(self.lane_call(), LANE + "|held=1|lease=present|mark=")
 
     def test_a_held_marker_alone_skips_the_lease(self):
@@ -203,30 +233,59 @@ class VerifyHeavyLease(unittest.TestCase):
         self.assertIn("heavy_run: cannot use configured lease", done.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_two_runs_on_one_lock_do_not_overlap(self):
-        def start(run, **extra):
-            return self.start(self.leased(HEAVY_TEST_ID=run, **extra), "--lane", "semantic")
+    def held_run(self, run, **extra):
+        """Start a run whose semantic lane pauses until the test releases it."""
+        return self.start(self.leased(HEAVY_TEST_ID=run, HEAVY_TEST_HOLD="1", **extra),
+                          "--lane", "semantic")
 
+    def finish_all(self, *processes):
+        (self.dir / "release").touch()
+        for process in processes:
+            done = self.finish(process)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assert_released()
+
+    def test_verify_takes_one_slot_at_the_medium_tier(self):
+        run = self.held_run("only")
+        self.wait_for(lambda: self.events() == ["start only"], run)
+        self.assertEqual(self.holders(), {"lease": "medium"})
+        self.finish_all(run)
+
+    def test_the_environment_can_ask_for_the_large_tier(self):
+        run = self.held_run("only", MIMIR_HEAVY_TIER="large")
+        self.wait_for(lambda: self.events() == ["start only"], run)
+        self.assertEqual(self.holders(), {"lease": "large", "lease2": "large"})
+        self.finish_all(run)
+
+    def test_two_runs_on_one_lock_share_it_at_the_medium_tier(self):
+        first = self.held_run("first")
+        self.wait_for(lambda: self.events() == ["start first"], first)
+        # The first run is paused inside its lane on slot 1. The second starts
+        # beside it on slot 2 instead of waiting for the release.
+        second = self.held_run("second")
+        self.wait_for(lambda: self.events() == ["start first", "start second"], second)
+        self.assertEqual(self.holders(), {"lease": "medium", "lease2": "medium"})
+        self.finish_all(first, second)
+
+    def test_a_large_run_waits_for_a_medium_one(self):
         observer = self.dir / "lease-observer.py"
         observer.write_text(LEASE_OBSERVER)
         observing = self.stub(
             "observing-python", f'#!/bin/sh\nexec "{sys.executable}" "{observer}" "$@"\n')
 
-        first = start("first", HEAVY_TEST_HOLD="1")
+        first = self.held_run("first")
         self.wait_for(lambda: self.events() == ["start first"], first)
-        # The first run is now paused inside its lane, holding the lease. Wait for
-        # the second to try the lease and find it taken. No sleep: without the
+        # The first run is now paused inside its lane, holding slot 1. Wait for the
+        # large second run to try slot 1 and find it taken. No sleep: without the
         # lease the second never signals, runs to its end, and wait_for fails.
-        second = start("second", MIMIR_HEAVY_PYTHON=str(observing))
+        second = self.start(self.leased(HEAVY_TEST_ID="second", MIMIR_HEAVY_TIER="large",
+                                        MIMIR_HEAVY_PYTHON=str(observing)),
+                            "--lane", "semantic")
         self.wait_for((self.dir / "contended").exists, second)
         self.assertEqual(self.events(), ["start first"])
-        (self.dir / "release").touch()
-        for process in (first, second):
-            done = self.finish(process)
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.finish_all(first, second)
         self.assertEqual(self.events(),
                          ["start first", "end first", "start second", "end second"])
-        self.assertFalse(self.lease.exists())
 
     def wait_for(self, reached, process):
         deadline = time.monotonic() + BACKSTOP
