@@ -844,7 +844,6 @@ impl Store {
                                         &tx,
                                         payload,
                                         producer,
-                                        destination.as_ref().context("copy destination")?,
                                         scope.as_ref().context("copy producer scope")?,
                                     )?,
                                     None => BTreeMap::new(),

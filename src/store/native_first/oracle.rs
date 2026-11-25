@@ -53,7 +53,6 @@ pub(super) fn check(
                     target,
                     selection,
                     producer,
-                    &destination,
                     &scope,
                     store.payload_key_inputs().join_inputs(),
                     document,

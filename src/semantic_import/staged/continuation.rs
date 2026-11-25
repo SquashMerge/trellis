@@ -884,7 +884,6 @@ impl JoinContinuation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic_batch::descriptor::SourceManifestHasher;
 
     #[test]
     fn output_reset_keeps_the_next_page_on_disk() {
@@ -941,6 +940,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn yielded_join_matches_full_and_reopens_every_snapshot() {
+        use crate::semantic_batch::descriptor::SourceManifestHasher;
         use crate::{
             indexer::{IndexOptions, index_workspace_bundle},
             semantic_batch::{StageInput, StageOwner, stage_batch, testing},
