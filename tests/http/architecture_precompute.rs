@@ -593,9 +593,9 @@ async fn architecture_incremental_boundary_rules_observation_ends_episode() {
     assert_eq!(scheduler.architecture_verified_for_tests(), compared + 1);
 }
 
-/// Java has no catalog digest yet (#1314 PR 4c), so an edit to it builds full.
+/// A Java source, and an edit that changes the Java catalog: a genuine full build (#1314).
 const JAVA: &str = "class Example { void run() { int a = 1; } }\n";
-const JAVA_EDITED: &str = "class Example { void run() { int a = 2; } }\n";
+const JAVA_EDITED: &str = "import java.util.List;\nclass Example { void run() { int a = 1; } }\n";
 
 #[tokio::test]
 async fn architecture_execution_full_cancelled_during_measuring() {
@@ -621,7 +621,7 @@ async fn architecture_execution_full_cancelled_during_measuring() {
     let stopped = &attempts[0];
     assert_eq!(
         stopped.path,
-        ArchitectureBuildPath::Full(FullReason::NonRustChanged)
+        ArchitectureBuildPath::Full(FullReason::JavaCatalogChanged)
     );
     assert!(!stopped.published && !stopped.compared);
     assert_eq!(stopped.full_retries, 0);
@@ -650,7 +650,7 @@ async fn architecture_execution_full_cancelled_during_measuring() {
     assert_eq!(next.base, Some(original));
     assert_eq!(
         next.path,
-        ArchitectureBuildPath::Full(FullReason::NonRustChanged)
+        ArchitectureBuildPath::Full(FullReason::JavaCatalogChanged)
     );
     assert_eq!(
         next.measured_sources, keys,
@@ -676,7 +676,7 @@ async fn architecture_execution_full_metric_worker_failures_keep_only_ordered_co
         let attempt = published_attempt(&scheduler, pin);
         assert_eq!(
             attempt.path,
-            ArchitectureBuildPath::Full(FullReason::NonRustChanged)
+            ArchitectureBuildPath::Full(FullReason::JavaCatalogChanged)
         );
         assert_eq!(attempt.full_retries, 0);
         let prefix: Vec<_> = keys
@@ -824,14 +824,14 @@ async fn architecture_execution_interrupted_retry_does_not_retain_candidate_trac
 }
 
 #[tokio::test]
-async fn architecture_incremental_native_non_rust_and_tsconfig_gates() {
+async fn architecture_incremental_catalog_and_tsconfig_gates() {
     let mut sources = NATIVE_SOURCES.to_vec();
     sources.push(("typed.ts", "export function typed() { return 1; }\n"));
     sources.push(("Example.java", JAVA));
     let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
     let scheduler = runtime.browser_scheduler().unwrap();
     for (path, text, reason) in [
-        ("Example.java", JAVA_EDITED, FullReason::NonRustChanged),
+        ("Example.java", JAVA_EDITED, FullReason::JavaCatalogChanged),
         (
             "tsconfig.json",
             "{\"compilerOptions\":{\"baseUrl\":\".\"}}",
@@ -1128,6 +1128,113 @@ async fn architecture_incremental_javascript_catalog_digest() {
         assert_eq!(
             published_attempt(&scheduler, pin).path,
             ArchitectureBuildPath::Full(FullReason::JavascriptCatalogChanged),
+            "{path}: {text}"
+        );
+    }
+}
+
+const JAVA_UTIL: &str = "package com.acme;\n\npublic class Util {\n  public static int run() {\n    return 1;\n  }\n\n  static class Inner {}\n}\n";
+
+/// #1314: Java documents are covered by the Java catalog digest. A body-only edit builds
+/// incrementally and equals a full build; an edit that changes the catalog builds in full with
+/// its own reason.
+#[tokio::test]
+async fn architecture_incremental_java_catalog_digest() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.extend([
+        ("java/com/acme/Util.java", JAVA_UTIL),
+        (
+            "java/com/acme/Clean.java",
+            "package com.acme;\n\npublic class Clean {}\n",
+        ),
+        (
+            "java/com/app/Main.java",
+            "package com.app;\n\nimport com.acme.Util;\n\npublic class Main {\n  int go() {\n    return Util.run();\n  }\n}\n",
+        ),
+    ]);
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    let before = core(&scheduler, first);
+    // A body-only edit that moves the later nested type: its positions keep their ranks.
+    let util = JAVA_UTIL.replace("return 1;", "return Math.max(1, 2) + 3;");
+    let pin = index_edit(&base, &runtime, &[("java/com/acme/Util.java", Some(&util))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(attempt.base, Some(first));
+    // The importer of the edited type is its genuine dependent.
+    assert_incremental(
+        &attempt,
+        &["java/com/acme/Util.java"],
+        &["java/com/app/Main.java"],
+    );
+    assert_eq!(
+        source_paths(&attempt.semantic_sources),
+        ["java/com/acme/Util.java"]
+    );
+    assert_eq!(
+        source_paths(&attempt.measured_sources),
+        ["java/com/acme/Util.java"]
+    );
+    let after = core(&scheduler, pin);
+    assert_eq!(
+        after.canonical().unwrap(),
+        independent_full(&runtime, pin).await
+    );
+    for (key, sharing) in after.sharing(&before) {
+        match key.path.as_str() {
+            "java/com/acme/Util.java" => {
+                assert!(!sharing.source && !sharing.metric && !sharing.dependency)
+            }
+            "java/com/app/Main.java" => assert!(sharing.metric, "{key:?}: {sharing:?}"),
+            _ => assert!(
+                sharing.source
+                    && sharing.metric
+                    && sharing.dependency
+                    && sharing.fingerprint
+                    && sharing.references
+                    && sharing.endpoints
+                    && sharing.plan,
+                "{key:?}: {sharing:?}"
+            ),
+        }
+    }
+    // A comment shifts the nested type's positions, but not their order.
+    let shifted = util.replace(
+        "\n  static class Inner",
+        "\n  // shifted\n  static class Inner",
+    );
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("java/com/acme/Util.java", Some(&shifted))],
+    )
+    .await;
+    assert_incremental(
+        &published_attempt(&scheduler, pin),
+        &["java/com/acme/Util.java"],
+        &["java/com/app/Main.java"],
+    );
+    for (path, text) in [
+        // A new import.
+        (
+            "java/com/app/Main.java",
+            "package com.app;\n\nimport com.acme.Util;\nimport com.acme.Clean;\n\npublic class Main {\n  int go() {\n    return Util.run();\n  }\n}\n".to_owned(),
+        ),
+        // A new nested type.
+        (
+            "java/com/acme/Util.java",
+            shifted.replace("static class Inner {}", "static class Inner {}\n\n  interface Other {}"),
+        ),
+        // A new top-level type in the package.
+        (
+            "java/com/acme/Clean.java",
+            "package com.acme;\n\npublic class Clean {}\n\nclass Hidden {}\n".to_owned(),
+        ),
+    ] {
+        let pin = index_edit(&base, &runtime, &[(path, Some(&text))]).await;
+        assert_eq!(
+            published_attempt(&scheduler, pin).path,
+            ArchitectureBuildPath::Full(FullReason::JavaCatalogChanged),
             "{path}: {text}"
         );
     }

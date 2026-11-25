@@ -35,6 +35,7 @@ pub(crate) struct ReferencePreparation {
     pub(crate) rust_digest: [u8; 32],
     pub(crate) python_digest: [u8; 32],
     pub(crate) javascript_digest: [u8; 32],
+    pub(crate) java_digest: [u8; 32],
     workers: usize,
 }
 
@@ -128,6 +129,7 @@ pub(super) fn prepare_with_workers(
         let rust_digest = catalogs.rust.digest();
         let python_digest = catalogs.python.digest();
         let javascript_digest = javascript::digest(catalogs.javascript.as_ref());
+        let java_digest = catalogs.java.digest();
         let mut order = vec![0; sorted.len()];
         for (original, &position) in sorted.iter().enumerate() {
             order[position] = original;
@@ -146,6 +148,7 @@ pub(super) fn prepare_with_workers(
             rust_digest,
             python_digest,
             javascript_digest,
+            java_digest,
             workers,
         })
     })();
@@ -177,6 +180,7 @@ pub(crate) fn finish_incremental(
             rust_digest,
             python_digest,
             javascript_digest,
+            java_digest,
             workers,
         } = preparation;
         ensure!(
@@ -333,6 +337,7 @@ pub(crate) fn finish_incremental(
                 rust_catalog_digest: rust_digest,
                 python_catalog_digest: python_digest,
                 javascript_catalog_digest: javascript_digest,
+                java_catalog_digest: java_digest,
                 source_facts: facts,
                 producers,
                 document_status: docs
@@ -585,6 +590,10 @@ impl ReferenceBase {
 
     pub(crate) fn javascript_catalog_digest(&self) -> [u8; 32] {
         self.javascript_catalog_digest
+    }
+
+    pub(crate) fn java_catalog_digest(&self) -> [u8; 32] {
+        self.java_catalog_digest
     }
 
     /// Every admitted document has a slot, including absent and scanned zero-site sources.

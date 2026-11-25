@@ -2,6 +2,8 @@
 use super::shared::{DeclarationId, charge};
 use super::*;
 
+mod digest;
+
 type PackageKey = (String, Vec<String>);
 #[derive(Default)]
 struct Bucket {
