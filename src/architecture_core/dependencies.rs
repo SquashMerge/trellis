@@ -127,7 +127,13 @@ mod staged {
                 changed.dirty.insert(key.clone());
             }
         }
-        if changed.native.iter().any(|key| key.language != "rust") {
+        // Rust and Python documents are covered by their catalog digests, which the build plan
+        // compares once the changed sets are known (#1314).
+        if changed
+            .native
+            .iter()
+            .any(|key| !matches!(key.language.as_str(), "rust" | "python"))
+        {
             return Ok(Err(FullReason::NonRustChanged));
         }
         if changed.dirty.len() > order.len() / 2 {
@@ -320,6 +326,7 @@ mod staged {
         pub(crate) order: Arc<[DocumentKey]>,
         pub(crate) documents: Vec<Arc<DocumentDependencies>>,
         pub(crate) rust_catalog: [u8; 32],
+        pub(crate) python_catalog: [u8; 32],
         pub(crate) manifests: [u8; 32],
         pub(crate) root_config: [u8; 32],
         pub(crate) producers: [u8; 32],
@@ -458,6 +465,7 @@ mod staged {
                 order: order.into(),
                 documents,
                 rust_catalog: references.rust_catalog_digest(),
+                python_catalog: references.python_catalog_digest(),
                 manifests: manifest_digest(&snapshot.manifests),
                 root_config: root_config_digest(snapshot.root_tsconfig.as_ref()),
                 producers,
@@ -471,6 +479,7 @@ mod staged {
                 order,
                 documents,
                 rust_catalog,
+                python_catalog,
                 manifests,
                 root_config,
                 producers,
@@ -488,6 +497,7 @@ mod staged {
                     "references": {"work": work, "sites": sites, "endpoints": endpoints.as_ref(), "eligibility": eligibility.as_ref(), "plan": plan.as_deref()}, "semantic": canonical_counts(semantic)})
             }).collect();
             json!({"order": order.as_ref(), "documents": documents, "rustCatalog": rust_catalog,
+                "pythonCatalog": python_catalog,
                 "manifests": manifests, "rootConfig": root_config, "producers": producers,
                 "selections": selections, "globalSemantic": canonical_counts(global_semantic)})
         }

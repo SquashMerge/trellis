@@ -972,6 +972,89 @@ async fn architecture_incremental_catalog_cases() {
     }
 }
 
+const PYTHON_CORE: &str =
+    "import json\n\n\ndef run():\n    return json.dumps(1)\n\n\nclass Runner:\n    pass\n";
+
+/// #1314: Python documents are covered by the Python catalog digest. A body-only or
+/// position-only edit builds incrementally and equals a full build; an edit that changes the
+/// catalog builds in full with its own reason.
+#[tokio::test]
+async fn architecture_incremental_python_catalog_digest() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.extend([
+        ("pkg/__init__.py", "from .core import run\n"),
+        ("pkg/core.py", PYTHON_CORE),
+        ("pkg/clean.py", "def clean():\n    return 1\n"),
+        (
+            "main.py",
+            "from pkg.core import run\n\n\ndef main():\n    return run()\n",
+        ),
+    ]);
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    let before = core(&scheduler, first);
+    // A body-only edit that moves the later class: its positions keep their ranks.
+    let body = PYTHON_CORE.replace("json.dumps(1)", "json.dumps([1, 2, 3])");
+    let pin = index_edit(&base, &runtime, &[("pkg/core.py", Some(&body))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(attempt.base, Some(first));
+    // The two Python importers of the edited module are its genuine dependents.
+    assert_incremental(&attempt, &["pkg/core.py"], &["main.py", "pkg/__init__.py"]);
+    assert_eq!(source_paths(&attempt.semantic_sources), ["pkg/core.py"]);
+    assert_eq!(source_paths(&attempt.measured_sources), ["pkg/core.py"]);
+    let after = core(&scheduler, pin);
+    assert_eq!(
+        after.canonical().unwrap(),
+        independent_full(&runtime, pin).await
+    );
+    for (key, sharing) in after.sharing(&before) {
+        match key.path.as_str() {
+            "pkg/core.py" => assert!(!sharing.source && !sharing.metric && !sharing.dependency),
+            "main.py" | "pkg/__init__.py" => assert!(sharing.metric, "{key:?}: {sharing:?}"),
+            _ => assert!(
+                sharing.source
+                    && sharing.metric
+                    && sharing.dependency
+                    && sharing.fingerprint
+                    && sharing.references
+                    && sharing.endpoints
+                    && sharing.plan,
+                "{key:?}: {sharing:?}"
+            ),
+        }
+    }
+    // A comment shifts every later position of the module, but not their order.
+    let shifted = body.replace("\n\n\nclass", "\n# shifted\n\nclass");
+    let pin = index_edit(&base, &runtime, &[("pkg/core.py", Some(&shifted))]).await;
+    assert_incremental(
+        &published_attempt(&scheduler, pin),
+        &["pkg/core.py"],
+        &["main.py", "pkg/__init__.py"],
+    );
+    // A Python edit leaves the other languages' gates alone, and a Rust body edit leaves
+    // the Python catalog alone.
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    assert_incremental(&published_attempt(&scheduler, pin), &["src/main.rs"], &[]);
+    for edited in [
+        format!("{shifted}\n\ndef added():\n    pass\n"),
+        format!("import os\n{shifted}"),
+        format!("{shifted}__all__ = ['run']\n"),
+    ] {
+        let pin = index_edit(&base, &runtime, &[("pkg/core.py", Some(&edited))]).await;
+        assert_eq!(
+            published_attempt(&scheduler, pin).path,
+            ArchitectureBuildPath::Full(FullReason::PythonCatalogChanged),
+            "{edited}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn architecture_incremental_ordinary_stage_failures_retry_full() {
     for stage in ["prepare", "read_b", "finish"] {

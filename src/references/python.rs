@@ -2,6 +2,8 @@
 use super::shared::{Bucket, Candidate, DeclarationId, add_bucket, charge, unknown_bucket};
 use super::*;
 
+mod digest;
+
 type ModuleKey = (String, Vec<String>);
 type Route = BTreeSet<(usize, String)>;
 #[derive(Clone, Default)]
@@ -69,10 +71,31 @@ pub(super) struct Catalog {
     file_declarations: BTreeMap<usize, DeclarationId>,
     test_modules: BTreeSet<usize>,
     results: BTreeMap<(usize, usize, usize), SiteResolution>,
+}
+
+/// One catalog build's import resolution: the catalog it reads, and the export memo that
+/// resolution alone fills (execution state, never catalog identity). Site resolution after the
+/// build reads only the catalog's results.
+struct Resolver<'c> {
+    catalog: &'c Catalog,
     export_memo: std::cell::RefCell<BTreeMap<(usize, usize, Route), std::sync::Arc<Names>>>,
 }
 
+impl std::ops::Deref for Resolver<'_> {
+    type Target = Catalog;
+    fn deref(&self) -> &Catalog {
+        self.catalog
+    }
+}
+
 impl Catalog {
+    fn resolver(&self) -> Resolver<'_> {
+        Resolver {
+            catalog: self,
+            export_memo: std::cell::RefCell::new(BTreeMap::new()),
+        }
+    }
+
     pub(super) fn new(
         docs: &[&DocumentInput],
         trees: &[Tree],
@@ -96,7 +119,6 @@ impl Catalog {
             file_declarations: BTreeMap::new(),
             test_modules: BTreeSet::new(),
             results: BTreeMap::new(),
-            export_memo: std::cell::RefCell::new(BTreeMap::new()),
         };
         result.index_documents(docs, trees, selected, work, check)?;
         result.prove_membership(docs, work, check)?;
@@ -246,6 +268,20 @@ impl Catalog {
         work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
+        let results = self.resolver().resolve_imports(selected, work, check)?;
+        self.results = results;
+        Ok(())
+    }
+}
+
+impl Resolver<'_> {
+    fn resolve_imports(
+        &self,
+        selected: &[usize],
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<BTreeMap<(usize, usize, usize), SiteResolution>> {
+        let mut results = BTreeMap::new();
         for (&document, unit) in &self.units {
             if !selected.binary_search(&document).is_ok() {
                 continue;
@@ -279,11 +315,10 @@ impl Catalog {
                     resolution.residual = Some("python_external_members_unknown");
                 }
                 owner_step(work, check)?;
-                self.results
-                    .insert((document, import.start, import.end), resolution);
+                results.insert((document, import.start, import.end), resolution);
             }
         }
-        Ok(())
+        Ok(results)
     }
 
     /// What each star import of a unit contributes, in import order: its module's exports, or
@@ -360,7 +395,9 @@ impl Catalog {
         }
         Ok(resolution)
     }
+}
 
+impl Catalog {
     fn check_followed_bodies(
         &mut self,
         docs: &[&DocumentInput],
@@ -589,6 +626,9 @@ impl Catalog {
             unknown: false,
         })
     }
+}
+
+impl Resolver<'_> {
     fn binding(
         &self,
         document: usize,
@@ -1050,6 +1090,9 @@ impl Catalog {
         }
         Ok(result)
     }
+}
+
+impl Catalog {
     fn explicit(
         &self,
         document: usize,
@@ -2013,18 +2056,23 @@ mod tests {
             ("provider.py", "def public_name():\n    pass\n"),
         ])
     }
-    fn documents_with(files: &[(&str, &str)]) -> Vec<DocumentInput> {
-        let root = tempfile::tempdir().unwrap();
+    pub(super) fn documents_with(files: &[(&str, &str)]) -> Vec<DocumentInput> {
+        documents_in(tempfile::tempdir().unwrap().path(), files)
+    }
+    /// The documents of `files` written under `root`, whose identity names their source set.
+    pub(super) fn documents_in(
+        root: &std::path::Path,
+        files: &[(&str, &str)],
+    ) -> Vec<DocumentInput> {
         for (path, text) in files {
-            let path = root.path().join(path);
+            let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
         let identity =
-            crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-                .unwrap();
+            crate::store::topology::WorkspaceIdentity::discover(Some(root), root).unwrap();
         let (graph, native) = crate::indexer::index_workspace_with_native(
-            &crate::indexer::IndexOptions::new(root.path().to_owned()),
+            &crate::indexer::IndexOptions::new(root.to_owned()),
             &identity.record_id,
             &Arc::new(AtomicBool::new(false)),
             |_| {},
@@ -2062,7 +2110,7 @@ mod tests {
             })
             .collect()
     }
-    fn expansion(test: impl FnOnce(&Catalog, usize, &Import, &mut Work)) {
+    fn expansion(test: impl FnOnce(&Resolver<'_>, usize, &Import, &mut Work)) {
         let documents = documents();
         let docs: Vec<_> = documents.iter().collect();
         let trees: Vec<_> = docs
@@ -2076,9 +2124,10 @@ mod tests {
         let mut work = Work::new(work::reference_limit(docs.len(), 0));
         let catalog =
             Catalog::new(&docs, &trees, &[], &[source], &mut work, &mut || Ok(())).unwrap();
-        catalog.export_memo.borrow_mut().clear();
+        // A fresh resolver: the build's export memo was execution state and is gone.
+        let resolver = catalog.resolver();
         test(
-            &catalog,
+            &resolver,
             source,
             &catalog.units[&source].imports[0],
             &mut work,
