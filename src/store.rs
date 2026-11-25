@@ -26,6 +26,15 @@ pub use crate::architecture_inputs::{
     SemanticInputState, SemanticTupleState,
 };
 pub(crate) use crate::architecture_inputs::{KeptNative, NativeIdentity, NativeRead, NativeTable};
+
+/// One Read A: the snapshot, each document's control regions, the Architecture fingerprints
+/// and each document's native table, in snapshot order.
+pub(crate) type ReadA = (
+    crate::architecture_inputs::Snapshot,
+    Vec<Vec<crate::native_records::ControlRegion>>,
+    ArchitectureFingerprints,
+    Vec<NativeTable>,
+);
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -1713,6 +1722,7 @@ impl EvidenceResponse {
     }
 
     /// Read A and its Architecture-only sidecar under this same admitted revision.
+    #[cfg(feature = "test-support")]
     pub(crate) fn architecture_read_a_fingerprinted(
         &self,
         pin: Option<IndexPin>,
@@ -1737,12 +1747,7 @@ impl EvidenceResponse {
         kept: Option<&mut KeptNative>,
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &dyn Fn(usize, usize),
-    ) -> Result<(
-        crate::architecture_inputs::Snapshot,
-        Vec<Vec<crate::native_records::ControlRegion>>,
-        ArchitectureFingerprints,
-        Vec<NativeTable>,
-    )> {
+    ) -> Result<ReadA> {
         let NativeRead {
             mut snapshot,
             regions,

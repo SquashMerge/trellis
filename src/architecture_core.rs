@@ -650,7 +650,7 @@ impl ArchitectureCore {
             });
         };
         let mut dependencies = dependencies::ArchitectureDependencies::full(
-            &snapshot,
+            snapshot,
             fingerprints,
             &semantic_counts.sources,
             semantic_counts.global,
@@ -662,7 +662,7 @@ impl ArchitectureCore {
         report("evaluating");
         let rules = config
             .map(|config| {
-                let base = match crate::rules::prepare(config, &snapshot, check) {
+                let base = match crate::rules::prepare(config, snapshot, check) {
                     Ok(base) => Ok(base),
                     Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
                     Err(error) => return Err(error),
@@ -678,14 +678,14 @@ impl ArchitectureCore {
             let measured = match reuse {
                 Some((base, changed)) => engine::measure_changed_documents(
                     store,
-                    &snapshot,
-                    &regions,
+                    snapshot,
+                    regions,
                     base.metrics()?,
                     changed,
                     check,
                     progress,
                 ),
-                None => measure_documents(store, &snapshot, &regions, check, progress),
+                None => measure_documents(store, snapshot, regions, check, progress),
             };
             Some(match measured {
                 Ok(metrics) => Ok(metrics),
@@ -695,7 +695,7 @@ impl ArchitectureCore {
         } else {
             None
         };
-        let app_candidates = kept(crate::rules::app_candidates(&snapshot, check))?;
+        let app_candidates = kept(crate::rules::app_candidates(snapshot, check))?;
         let interfaces = match (config, &app_candidates) {
             // Authored apps can split one manifest's checkout (#794), so they count too: an
             // upper bound of the effective inventory. Without a rules file every detected
@@ -704,7 +704,7 @@ impl ArchitectureCore {
                 let mut work =
                     crate::references::work::Work::new(crate::references::work::rules_limit(
                         snapshot.documents.len(),
-                        crate::references::work::snapshot_bytes(&snapshot, check)?,
+                        crate::references::work::snapshot_bytes(snapshot, check)?,
                     ));
                 // App-scoped wrappers (#855) need each file's app, as rule evaluation assigns
                 // it; a failed rules part is this part's failure too. Without a rules file
@@ -737,7 +737,7 @@ impl ArchitectureCore {
                 };
                 Some(match apps {
                     Ok(apps) => kept(crate::interfaces::extract(
-                        &snapshot, wrappers, &apps, &mut work, check,
+                        snapshot, wrappers, &apps, &mut work, check,
                     ))?,
                     Err(failure) => Err(failure),
                 })
