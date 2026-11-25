@@ -9492,13 +9492,19 @@ fn catch_up_after_edit(path: &str, text: &str) -> (Value, Value, bool) {
 }
 
 /// #1327 (owner ruling 2026-11-25, freshness rule 2 narrowed to the producer's languages): a head
-/// move that changes only a document of another language (here a Python file in an existing
-/// directory) leaves the JavaScript evidence `fresh` once S has caught up. Describe keeps it available, a same-document call
-/// stays resolved and nothing is due.
+/// move that changes only a document of another language (here a Python file, in an existing
+/// directory and in a new one without an ignore file) leaves the JavaScript evidence `fresh` once
+/// S has caught up. Describe keeps it available, a same-document call stays resolved and nothing
+/// is due.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_edit_in_another_language_keeps_evidence_fresh_after_catch_up() {
-    let (javascript, plain, due) =
-        catch_up_after_edit("src/check.py", "def check():\n    return 1\n");
+    for path in ["src/check.py", "tools/check.py"] {
+        an_edit_in_another_language_keeps_evidence_fresh(path);
+    }
+}
+
+fn an_edit_in_another_language_keeps_evidence_fresh(path: &str) {
+    let (javascript, plain, due) = catch_up_after_edit(path, "def check():\n    return 1\n");
     assert_eq!(javascript["semantic"]["freshness"], "fresh", "{javascript}");
     assert_eq!(javascript["semantic"]["available"], true, "{javascript}");
     assert_eq!(
@@ -9509,7 +9515,7 @@ async fn an_edit_in_another_language_keeps_evidence_fresh_after_catch_up() {
     assert_eq!(plain["disposition"], "resolved", "{plain}");
     assert_eq!(plain["boundaryReason"], "none", "{plain}");
     assert_eq!(plain["freshness"], "fresh", "{plain}");
-    assert!(!due);
+    assert!(!due, "{path}");
 }
 
 /// #1327: an edit in the producer's own language still leaves the evidence S carries forward
