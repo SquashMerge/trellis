@@ -1542,8 +1542,8 @@ impl DaemonState {
     }
 
     /// Wait until the owner has no turn running or due.
-    #[cfg(test)]
-    pub(crate) fn await_architecture_idle_for_tests(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn await_architecture_idle_for_tests(&self) {
         let owner = &self.architecture.0;
         let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         let mut state = owner.state.lock().unwrap();
