@@ -653,6 +653,8 @@ pub(crate) struct NativeRead {
     pub(crate) snapshot: Snapshot,
     pub(crate) regions: Vec<Vec<crate::native_records::ControlRegion>>,
     pub(crate) tables: Vec<NativeTable>,
+    /// The native revision the documents' revision-scoped IDs are at.
+    pub(crate) native_revision: String,
 }
 
 /// One document an earlier Read A read, kept for the next one (#1315).
