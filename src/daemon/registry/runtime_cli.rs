@@ -47,7 +47,20 @@ fn failed_request_error(
     }
 }
 
+/// How long `trellis gc --run` waits for the checkout worker's pass: below the
+/// client's ten-minute reply bound, so a stuck worker is a typed failure.
+const GC_RUN_WAIT: Duration = Duration::from_secs(9 * 60);
+
 impl CheckoutRuntime {
+    /// `trellis gc --run` (#1316): one GC pass, run by this checkout's worker with
+    /// its Ready writer. The reply lists what was collected and what was skipped.
+    pub fn cli_gc_run(&self) -> anyhow::Result<serde_json::Value> {
+        let resources = self.resources()?;
+        resources.store.verify_root()?;
+        let report = resources.scheduler.run_gc_now(GC_RUN_WAIT)?;
+        Ok(serde_json::to_value(report)?)
+    }
+
     /// CLI calls share the activated checkout's Store and scheduler; they never
     /// reopen a second Store or independently elect a leader.
     pub fn cli_status(&self) -> anyhow::Result<serde_json::Value> {

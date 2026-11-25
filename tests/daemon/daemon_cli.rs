@@ -3993,6 +3993,93 @@ fn gc_report_counts_vectors_without_checkout_state_or_cache_mutation() {
     assert_eq!(data_entries, vec![roots.data.join("run")]);
 }
 
+/// #1316: `trellis gc --run` has the named checkout's worker run one pass now. It
+/// collects an eligible index nobody uses and names every skip with its reason,
+/// including an index another active checkout holds in use.
+#[test]
+fn gc_run_collects_an_eligible_index_and_reports_a_busy_one() {
+    use std::os::unix::fs::PermissionsExt;
+    use trellis::store::topology::WorkspaceIdentity;
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let roots = fixture_roots(&home);
+    let current = checkout(temp.path(), "gc-current");
+    let busy = checkout(temp.path(), "gc-busy");
+    run(&home, "index", &current);
+    // Its runtime stays active after the call and holds the index in use.
+    run(&home, "index", &busy);
+    // Only gc --run may collect here: fence the automatic hourly pass.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let stamp = roots.cache.join("gc-last-run");
+    fs::write(&stamp, format!("{now}\n")).unwrap();
+    fs::set_permissions(&stamp, fs::Permissions::from_mode(0o600)).unwrap();
+    // An earlier-schema index that no checkout uses, as an older Trellis left it.
+    let old_root = checkout(temp.path(), "gc-old");
+    let old = WorkspaceIdentity::discover(Some(&old_root), &old_root).unwrap();
+    drop(roots.index_use(&old).unwrap());
+    let old_db = roots.index_db(&old);
+    let db = rusqlite::Connection::open(&old_db).unwrap();
+    db.pragma_update(None, "user_version", 7_i64).unwrap();
+    drop(db);
+    fs::set_permissions(&old_db, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = cli(&home)
+        .args(["gc", "--run", "--workspace"])
+        .arg(&current)
+        .output()
+        .unwrap();
+    crate::child::assert_cli_success(&output, "gc --run");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let key = |root: &Path| {
+        WorkspaceIdentity::discover(Some(root), root)
+            .unwrap()
+            .root_key
+    };
+    assert_eq!(
+        report["collected"],
+        serde_json::json!([{"rootKey": old.root_key, "status": "collected", "reason": "old_schema"}])
+    );
+    let mut skipped: Vec<(String, String)> = report["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["rootKey"].as_str().unwrap().to_owned(),
+                row["reason"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    skipped.sort();
+    let mut expected = vec![
+        (key(&busy), "use_lock_busy".to_owned()),
+        (key(&current), "current_checkout".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(skipped, expected);
+    assert!(
+        !roots.index_dir(&old).exists(),
+        "the old index was collected"
+    );
+    assert!(
+        roots
+            .index_db(&WorkspaceIdentity::discover(Some(&busy), &busy).unwrap())
+            .exists()
+    );
+    assert_eq!(fs::read_to_string(&stamp).unwrap(), format!("{now}\n"));
+    // --workspace belongs to --run only.
+    let refused = cli(&home)
+        .args(["gc", "--report", "--workspace"])
+        .arg(&current)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+}
+
 #[test]
 fn gc_report_refuses_corrupt_vector_cache_without_partial_inventory() {
     let temp = short_temp();

@@ -102,7 +102,7 @@ pub(crate) fn send_daemon(
         Duration::from_secs(timeout_secs + 630)
     } else if matches!(
         request.operation.as_str(),
-        "index" | "semantic_import" | "producer_pickup"
+        "index" | "semantic_import" | "producer_pickup" | "gc_run"
     ) {
         index_bound
     } else if request.operation == "api" {

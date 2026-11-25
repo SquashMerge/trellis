@@ -39,15 +39,14 @@ Saved views, notes and Jev/ACP providers are retired; their existing files remai
 not migrated or deleted. Indexing never runs package scripts, installs source dependencies, or edits source.
 See [local topology](docs/local-topology.md#t02--locations-and-store-responsibilities).
 
-`trellis gc --report` only inventories derived-index candidates. A historical
-index marked `eligible` is **not deleted**. Trellis has no derived-index deletion command or
-automatic deletion path today. Future [#16](https://github.com/SquashMerge/trellis/issues/16)
-automatic GC needs a separate guarded public contract: authenticate the exact historical schema,
-root identity and age; hold a verified exclusive use lock; refuse live, hot-journal, unknown or
-busy data; and never touch durable saved records. Deleting an eligible whole index invalidates
-its generation's pins ([Decision 0006](docs/semantic-evidence/decisions/0006-revision-retention-and-index-gc.md));
-retained revisions are protected only within a live index. Reporting eligibility alone must
-never trigger removal.
+`trellis gc --report` only inventories derived-index candidates; it deletes nothing. The daemon
+collects eligible derived indexes itself, at most hourly, under the guarded rules of
+[local topology T06](docs/local-topology.md#t06--rebuild-and-cleanup): a fresh check of the
+schema, root identity and age, a verified exclusive use lock, and a skip for anything live,
+busy, hot-journalled, unknown or unreadable. Durable state is never touched. `trellis gc --run`
+runs one such pass now and prints what it collected and skipped, and why. Deleting an eligible
+whole index invalidates its generation's pins ([Decision 0006](docs/semantic-evidence/decisions/0006-revision-retention-and-index-gc.md));
+retained revisions are protected only within a live index.
 
 ## Local semantic search
 

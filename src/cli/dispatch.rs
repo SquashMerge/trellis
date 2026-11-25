@@ -114,6 +114,7 @@ pub(crate) fn cli_call(command: &Command) -> Result<CliCall<'_>> {
             call("metrics", &args.workspace, metrics_cli_payload(args)?, true)
         }
         Command::Index(args) => call("index", &args.workspace, index_cli_payload(args), false),
+        Command::Gc(args) => call("gc_run", &args.workspace, serde_json::json!({}), false),
         Command::Producer(ProducerCommand { action }) => match action {
             ProducerAction::Plan(args) => call(
                 "producer_plan",
