@@ -94,46 +94,6 @@ fn unit(encoder: &mut Encoder, document: usize, unit: &Unit) {
     encoder.flag(*dynamic);
 }
 
-fn target(encoder: &mut Encoder, target: &Target) {
-    match target {
-        Target::Native(document) => {
-            encoder.word(0);
-            encoder.word(*document);
-        }
-        Target::External(identity) => {
-            let external::ExternalIdentity {
-                kind,
-                source_set_id,
-                language,
-                package,
-                standard_library,
-            } = identity;
-            encoder.word(1);
-            match kind {
-                external::ExternalKind::ExternalPackage => encoder.word(0),
-            }
-            encoder.text(source_set_id);
-            encoder.text(language);
-            encoder.text(package);
-            encoder.flag(*standard_library);
-        }
-    }
-}
-
-fn resolution(encoder: &mut Encoder, resolution: &SiteResolution) {
-    let SiteResolution {
-        targets,
-        proof,
-        residual,
-    } = resolution;
-    encoder.word(targets.len());
-    for row in targets {
-        target(encoder, row);
-    }
-    encoder.indices(proof);
-    encoder.optional_text(*residual);
-}
-
 fn catalog(encoder: &mut Encoder, catalog: &Catalog) {
     let Catalog {
         units,
@@ -206,11 +166,8 @@ fn catalog(encoder: &mut Encoder, catalog: &Catalog) {
     }
     encoder.indices(test_modules);
     encoder.word(results.len());
-    for ((document, start, end), row) in results {
-        encoder.word(*document);
-        encoder.position(*document, *start);
-        encoder.position(*document, *end);
-        resolution(encoder, row);
+    for (&key, row) in results {
+        encoder.resolution(key, row);
     }
 }
 
@@ -227,26 +184,7 @@ mod tests {
     /// The Python catalog digest of a full reference resolution of exactly `files`, written
     /// under `root`: one root keeps the source set the same across variants.
     fn digest(root: &std::path::Path, files: &[(&str, &str)]) -> [u8; 32] {
-        for entry in std::fs::read_dir(root).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(path).unwrap();
-            } else {
-                std::fs::remove_file(path).unwrap();
-            }
-        }
-        let documents = super::super::tests::documents_in(root, files);
-        let snapshot = Snapshot {
-            pin: IndexPin {
-                index_generation: uuid::Uuid::nil(),
-                index_revision: 1,
-            },
-            documents,
-            manifests: Vec::new(),
-            root_tsconfig: None,
-            evidence_gaps: BTreeMap::new(),
-            unparsed: BTreeSet::new(),
-        };
+        let snapshot = crate::references::catalog_digest::snapshot_in(root, files, &[], None);
         crate::references::resolve_all(&snapshot, &mut || Ok(()))
             .unwrap()
             .python_catalog_digest
@@ -691,11 +629,17 @@ mod tests {
 
     #[test]
     fn the_export_memo_is_execution_state_not_catalog_identity() {
-        let documents = super::super::tests::documents_with(&[
-            ("use.py", "from provider import *\n"),
-            ("provider.py", "def public_name():\n    pass\n"),
-        ]);
-        let docs: Vec<_> = documents.iter().collect();
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = crate::references::catalog_digest::snapshot_in(
+            root.path(),
+            &[
+                ("use.py", "from provider import *\n"),
+                ("provider.py", "def public_name():\n    pass\n"),
+            ],
+            &[],
+            None,
+        );
+        let docs: Vec<_> = snapshot.documents.iter().collect();
         let trees: Vec<_> = docs
             .iter()
             .map(|doc| parse(doc, &mut || Ok(())).unwrap())

@@ -366,7 +366,8 @@ fn architecture_incremental_seeded_mixed_edits() {
             },
         );
 
-        // A TypeScript edit is full; its catch-up keeps N's native revision.
+        // A body-only TypeScript edit is covered by the JavaScript catalog digest (#1314),
+        // like the body-only Rust edit above.
         let ts = if next() % 2 == 0 { "a.ts" } else { "b.ts" };
         let name = if ts == "a.ts" { "alpha" } else { "beta" };
         std::fs::write(
@@ -377,8 +378,30 @@ fn architecture_incremental_seeded_mixed_edits() {
             ),
         )
         .unwrap();
+        fixture.native();
+        let pin = fixture.catch_up();
+        fixture.expect(
+            pin,
+            Expected::Incremental {
+                dirty: &[ts],
+                patched: &[],
+                native: &[ts],
+                all_b: false,
+            },
+        );
+
+        // A TypeScript edit that changes the catalog is full; its catch-up keeps N's native
+        // revision.
+        std::fs::write(
+            fixture.root.join(ts),
+            format!(
+                "import './vendored';\nexport function {name}() {{ return {}; }}\n",
+                3 + next() % 100
+            ),
+        )
+        .unwrap();
         let pin = fixture.native();
-        fixture.expect(pin, Expected::Full(FullReason::NonRustChanged));
+        fixture.expect(pin, Expected::Full(FullReason::JavascriptCatalogChanged));
         let pin = fixture.catch_up();
         fixture.expect(
             pin,

@@ -719,11 +719,12 @@ pub enum FullReason {
     RootTsconfigChanged,
     ProducerSetChanged,
     RawSelectionsChanged,
-    /// A changed native document's language has no catalog digest: not Rust or Python.
+    /// A changed native document's language has no catalog digest: today, Java.
     NonRustChanged,
     DirtyMajority,
     RustCatalogChanged,
     PythonCatalogChanged,
+    JavascriptCatalogChanged,
     ReferenceWorkMargin,
     /// An ordinary incremental failure was retried through the independent full path.
     IncrementalFailure,
@@ -857,6 +858,11 @@ mod engine {
                     references.python_digest,
                     base.dependencies.python_catalog,
                     FullReason::PythonCatalogChanged,
+                ),
+                (
+                    references.javascript_digest,
+                    base.dependencies.javascript_catalog,
+                    FullReason::JavascriptCatalogChanged,
                 ),
             ] {
                 if current != old {
