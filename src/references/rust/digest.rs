@@ -323,7 +323,7 @@ impl Encoder {
 impl Catalog {
     /// Every field with its byte positions as they are, not ranked: equal only for the same
     /// catalog (#1315 tests a kept catalog against a fresh one with it).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(in crate::references) fn exact_digest(&self) -> [u8; 32] {
         let mut encoder = Encoder::default();
         encoder.catalog(self);

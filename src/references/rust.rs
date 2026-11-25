@@ -426,7 +426,7 @@ impl RustResolver<'_> {
             }
             declarations
                 .entry((document, declaration.range.start, declaration.range.end))
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(declaration);
         }
         if let Some(declaration) = doc

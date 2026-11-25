@@ -114,7 +114,7 @@ impl KeptSyntax {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 impl ReferencePreparation {
     pub(super) fn catalogs_for_tests(&self) -> &Catalogs {
         &self.catalogs
