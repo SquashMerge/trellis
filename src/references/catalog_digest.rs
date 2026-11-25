@@ -81,6 +81,18 @@ impl Encoder {
             self.positions.entry(document).or_default().insert(value);
         }
     }
+    pub(super) fn declaration(&mut self, declaration: &super::shared::DeclarationId) {
+        let super::shared::DeclarationId {
+            document,
+            start,
+            end,
+            sid,
+        } = declaration;
+        self.word(*document);
+        self.position(*document, *start);
+        self.position(*document, *end);
+        self.text(sid);
+    }
     pub(super) fn identity(&mut self, identity: &external::ExternalIdentity) {
         let external::ExternalIdentity {
             kind,

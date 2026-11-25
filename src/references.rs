@@ -82,6 +82,7 @@ pub struct ReferenceBase {
     rust_catalog_digest: [u8; 32],
     python_catalog_digest: [u8; 32],
     javascript_catalog_digest: [u8; 32],
+    java_catalog_digest: [u8; 32],
     source_facts: Vec<SourceFacts>,
     /// Language to selected producer.
     producers: BTreeMap<String, String>,
@@ -541,6 +542,7 @@ fn resolve(
     let rust_catalog_digest = catalogs.rust.digest();
     let python_catalog_digest = catalogs.python.digest();
     let javascript_catalog_digest = javascript::digest(catalogs.javascript.as_ref());
+    let java_catalog_digest = catalogs.java.digest();
     let (declared, producers) = declared_targets(&docs, &mut catalogs.rust_execution.work, check)?;
     let locate = |document: usize, sid: &str| {
         sorted
@@ -565,6 +567,7 @@ fn resolve(
         rust_catalog_digest,
         python_catalog_digest,
         javascript_catalog_digest,
+        java_catalog_digest,
         source_facts,
         producers,
         document_status: docs
@@ -1849,11 +1852,6 @@ fn map_all_hooked<T: Sync, R: Send>(
 /// JavaScript and TypeScript share one import-resolution family.
 fn script_family(language: &str) -> bool {
     matches!(language, "javascript" | "typescript")
-}
-/// Whether a language's reference catalog has an isomorphism digest, so an Architecture build
-/// can keep its other sources when one of its documents changes (#1314).
-pub(crate) fn catalog_digested(language: &str) -> bool {
-    matches!(language, "rust" | "python") || script_family(language)
 }
 fn grammar(key: &DocumentKey) -> Result<tree_sitter::Language> {
     Ok(match key.language.as_str() {

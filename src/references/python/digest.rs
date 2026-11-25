@@ -6,19 +6,6 @@
 use super::*;
 use crate::references::catalog_digest::Encoder;
 
-fn declaration(encoder: &mut Encoder, declaration: &DeclarationId) {
-    let DeclarationId {
-        document,
-        start,
-        end,
-        sid,
-    } = declaration;
-    encoder.word(*document);
-    encoder.position(*document, *start);
-    encoder.position(*document, *end);
-    encoder.text(sid);
-}
-
 fn import(encoder: &mut Encoder, document: usize, import: &Import) {
     let Import {
         start,
@@ -50,7 +37,7 @@ fn binding(encoder: &mut Encoder, document: usize, binding: &Binding) {
     match kind {
         BindingKind::Direct(id) => {
             encoder.word(0);
-            declaration(encoder, id);
+            encoder.declaration(id);
         }
         BindingKind::Imported(index) => {
             encoder.word(1);
@@ -162,7 +149,7 @@ fn catalog(encoder: &mut Encoder, catalog: &Catalog) {
     encoder.word(file_declarations.len());
     for (document, id) in file_declarations {
         encoder.word(*document);
-        declaration(encoder, id);
+        encoder.declaration(id);
     }
     encoder.indices(test_modules);
     encoder.word(results.len());

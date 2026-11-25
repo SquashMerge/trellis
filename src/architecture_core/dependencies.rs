@@ -127,15 +127,8 @@ mod staged {
                 changed.dirty.insert(key.clone());
             }
         }
-        // A language with a catalog digest is covered by it: the build plan compares the
-        // digests once the changed sets are known (#1314).
-        if changed
-            .native
-            .iter()
-            .any(|key| !crate::references::catalog_digested(&key.language))
-        {
-            return Ok(Err(FullReason::NonRustChanged));
-        }
+        // Every reference language is covered by its catalog digest, which the build plan
+        // compares once the changed sets are known (#1314).
         if changed.dirty.len() > order.len() / 2 {
             return Ok(Err(FullReason::DirtyMajority));
         }
@@ -328,6 +321,7 @@ mod staged {
         pub(crate) rust_catalog: [u8; 32],
         pub(crate) python_catalog: [u8; 32],
         pub(crate) javascript_catalog: [u8; 32],
+        pub(crate) java_catalog: [u8; 32],
         pub(crate) manifests: [u8; 32],
         pub(crate) root_config: [u8; 32],
         pub(crate) producers: [u8; 32],
@@ -468,6 +462,7 @@ mod staged {
                 rust_catalog: references.rust_catalog_digest(),
                 python_catalog: references.python_catalog_digest(),
                 javascript_catalog: references.javascript_catalog_digest(),
+                java_catalog: references.java_catalog_digest(),
                 manifests: manifest_digest(&snapshot.manifests),
                 root_config: root_config_digest(snapshot.root_tsconfig.as_ref()),
                 producers,
@@ -483,6 +478,7 @@ mod staged {
                 rust_catalog,
                 python_catalog,
                 javascript_catalog,
+                java_catalog,
                 manifests,
                 root_config,
                 producers,
@@ -502,6 +498,7 @@ mod staged {
             json!({"order": order.as_ref(), "documents": documents, "rustCatalog": rust_catalog,
                 "pythonCatalog": python_catalog,
                 "javascriptCatalog": javascript_catalog,
+                "javaCatalog": java_catalog,
                 "manifests": manifests, "rootConfig": root_config, "producers": producers,
                 "selections": selections, "globalSemantic": canonical_counts(global_semantic)})
         }
