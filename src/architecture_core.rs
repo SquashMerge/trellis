@@ -411,6 +411,8 @@ pub(crate) struct Kept {
     /// The syntax-bounds gaps and the Rust catalog's per-file half of the last build that
     /// resolved references.
     pub(crate) syntax: Option<Arc<crate::references::KeptSyntax>>,
+    /// The interface extractors' parts of the last build that extracted interfaces.
+    pub(crate) interfaces: Option<Arc<crate::interfaces::KeptInterfaces>>,
 }
 
 impl Drop for ArchitectureInput {
@@ -767,9 +769,35 @@ impl ArchitectureCore {
                     _ => Ok(Default::default()),
                 };
                 Some(match apps {
-                    Ok(apps) => kept(crate::interfaces::extract(
-                        snapshot, wrappers, &apps, &mut work, check,
-                    ))?,
+                    Ok(apps) => {
+                        // Only an incremental build reuses kept extractor parts: a kept part
+                        // that does not fit its budget is then retried in full (#1315).
+                        let parts = reuse.and(input.kept.as_ref()).and_then(|slot| {
+                            slot.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .interfaces
+                                .clone()
+                        });
+                        let versions = input.kept_versions();
+                        kept(
+                            crate::interfaces::extract_keeping(
+                                snapshot,
+                                wrappers,
+                                &apps,
+                                &mut work,
+                                parts.as_deref(),
+                                versions.as_deref(),
+                                check,
+                            )
+                            .map(|(extraction, parts)| {
+                                if let (Some(slot), Some(parts)) = (&input.kept, parts) {
+                                    slot.lock().unwrap_or_else(|e| e.into_inner()).interfaces =
+                                        Some(Arc::new(parts));
+                                }
+                                extraction
+                            }),
+                        )?
+                    }
                     Err(failure) => Err(failure),
                 })
             }

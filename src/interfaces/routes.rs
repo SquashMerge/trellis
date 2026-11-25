@@ -40,6 +40,16 @@ struct Found {
     route: Route,
 }
 
+/// Whether `extract` reads this document: a production Rust document with evidence that
+/// spells an axum or actix-web registration.
+pub(super) fn reads(snapshot: &Snapshot, doc: &DocumentInput) -> bool {
+    let text = &doc.file.text;
+    doc.key.language == "rust"
+        && !snapshot.evidence_gaps.contains_key(&doc.key)
+        && (text.contains(".route(") || text.contains("Method::") || actix::candidate(text))
+        && !test_file(doc)
+}
+
 /// The server routes of every production Rust document, one per method and template.
 pub(super) fn extract(
     snapshot: &Snapshot,

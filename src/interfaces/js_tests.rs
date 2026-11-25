@@ -6,16 +6,24 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 fn snapshot(files: &[(&str, &str)]) -> Snapshot {
     let root = tempfile::tempdir().unwrap();
+    snapshot_in(root.path(), files, files)
+}
+
+/// The snapshot of `root` once `files` are written there; `manifests` are its captured
+/// `package.json` files.
+fn snapshot_in(
+    root: &std::path::Path,
+    files: &[(&str, &str)],
+    manifests: &[(&str, &str)],
+) -> Snapshot {
     for (path, text) in files {
-        let path = root.path().join(path);
+        let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
-    let identity =
-        crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-            .unwrap();
+    let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root).unwrap();
     let (graph, native) = crate::indexer::index_workspace_with_native(
-        &crate::indexer::IndexOptions::new(root.path().to_owned()),
+        &crate::indexer::IndexOptions::new(root.to_owned()),
         &identity.record_id,
         &Arc::new(AtomicBool::new(false)),
         |_| {},
@@ -52,7 +60,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
             }
         })
         .collect();
-    let manifests = files
+    let manifests = manifests
         .iter()
         .filter(|(path, _)| path.ends_with("package.json"))
         .map(|(path, text)| ManifestInput {
@@ -808,4 +816,116 @@ function h() {}
         unassigned,
         ["/unscoped/x", "/unscoped/x", "/unscoped/x", "/root/x"]
     );
+}
+
+/// #1315: an extractor's kept part is reused while the documents it reads are unchanged, with
+/// the same Work; an edit it reads extracts that part again, and the result is a full
+/// extraction's either way.
+#[test]
+fn kept_extractor_parts_are_reused_only_while_their_inputs_hold() {
+    const FILES: &[(&str, &str)] = &[
+        ("srv/app.js", EXPRESS_APP),
+        ("srv/users.js", EXPRESS_USERS),
+        ("web/client.js", "fetch(\"/api/users\");\n"),
+        (
+            "src/server.rs",
+            "fn router() -> Router { Router::new().route(\"/health\", get(health)) }\nasync fn health() {}\n",
+        ),
+        (
+            "src/client.rs",
+            "async fn ping() { reqwest::get(\"http://x/health\").await; }\n",
+        ),
+        ("src/plain.rs", "pub fn plain() { let _ = 1; }\n"),
+    ];
+    let versions = |shot: &Snapshot| -> Vec<String> {
+        shot.documents
+            .iter()
+            .map(|doc| doc.file.hash.clone())
+            .collect()
+    };
+    let fresh = |shot: &Snapshot| {
+        let mut work = Work::new(usize::MAX);
+        let found = extract(shot, &[], &Default::default(), &mut work, &mut || Ok(())).unwrap();
+        (format!("{found:?}"), work.used)
+    };
+    for (path, text, again) in [
+        ("src/plain.rs", "pub fn plain() { let _ = 2; }\n", ""),
+        (
+            "src/server.rs",
+            "fn router() -> Router { Router::new().route(\"/ready\", get(health)) }\nasync fn health() {}\n",
+            "rust_routes",
+        ),
+        (
+            "src/client.rs",
+            "async fn ping() { reqwest::get(\"http://x/ready\").await; }\n",
+            "rust_calls",
+        ),
+        ("web/client.js", "fetch(\"/api/other\");\n", "script"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let before = snapshot_in(root.path(), FILES, FILES);
+        let mut work = Work::new(usize::MAX);
+        let (_, kept) = super::extract_keeping(
+            &before,
+            &[],
+            &Default::default(),
+            &mut work,
+            None,
+            Some(&versions(&before)),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let kept = kept.unwrap();
+        let after = snapshot_in(root.path(), &[(path, text)], FILES);
+        let mut work = Work::new(usize::MAX);
+        let (found, again_kept) = super::extract_keeping(
+            &after,
+            &[],
+            &Default::default(),
+            &mut work,
+            Some(&kept),
+            Some(&versions(&after)),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!((format!("{found:?}"), work.used), fresh(&after), "{path}");
+        let again_kept = again_kept.unwrap();
+        let inputs = |kept: &super::KeptInterfaces| {
+            [
+                ("rust_routes", kept.rust_routes.as_ref().map(|p| p.inputs)),
+                ("script", kept.script.as_ref().map(|p| p.inputs)),
+                ("rust_calls", kept.rust_calls.as_ref().map(|p| p.inputs)),
+                ("python", kept.python.as_ref().map(|p| p.inputs)),
+                ("java", kept.java.as_ref().map(|p| p.inputs)),
+            ]
+        };
+        let extracted: Vec<_> = inputs(&kept)
+            .into_iter()
+            .zip(inputs(&again_kept))
+            .filter(|((_, a), (_, b))| a != b)
+            .map(|((name, _), _)| name)
+            .collect();
+        let expected: Vec<&str> = [again]
+            .into_iter()
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert_eq!(extracted, expected, "{path}");
+        // A kept part's Work that does not fit is not the revision's failure: the build is
+        // redone in full.
+        if again.is_empty() {
+            let error = super::extract_keeping(
+                &after,
+                &[],
+                &Default::default(),
+                &mut Work::new(1),
+                Some(&kept),
+                Some(&versions(&after)),
+                &mut || Ok(()),
+            )
+            .err()
+            .unwrap();
+            assert!(error.downcast_ref::<super::KeptWorkDoesNotFit>().is_some());
+            assert!(!error.to_string().starts_with("bounded_work"));
+        }
+    }
 }
