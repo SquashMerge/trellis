@@ -221,6 +221,7 @@ impl CheckoutRegistry {
         for key in self.entries.keys().cloned().collect::<Vec<_>>() {
             busy |= self.refresh_pending_work(&key)?;
         }
+        self.forget_dead_roots();
         let exit = self.idle_exit_at.is_some_and(|at| now >= at)
             && !busy
             // Release may defer on startup reconciliation, a watcher, or an active read just before
@@ -231,6 +232,34 @@ impl CheckoutRegistry {
                 .values()
                 .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none());
         Ok(LifecycleTick { released, exit })
+    }
+
+    /// Forget each entry whose root no longer exists once nothing uses it (#1316):
+    /// released, with no runtime, sessions, browser grace, pending or external
+    /// work, or in-flight read of the lost root. These are the conditions that
+    /// already let a replacement retire an entry. A root that returns attaches
+    /// as a new entry; its index, if any, is GC's to collect.
+    fn forget_dead_roots(&mut self) {
+        let dead: Vec<String> =
+            self.entries
+                .iter()
+                .filter(|(key, entry)| {
+                    entry.released
+                        && !self.runtimes.contains_key(*key)
+                        && entry.sessions.is_empty()
+                        && entry.browser_until.is_none()
+                        && !entry.pending_work
+                        && !entry.external_work
+                        && entry.lost_reads.as_ref().is_none_or(|reads| {
+                            reads.load(std::sync::atomic::Ordering::Acquire) == 0
+                        })
+                        && super::root_missing(&entry.identity.root)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+        for key in dead {
+            self.entries.remove(&key);
+        }
     }
 
     fn expire_browsers(&mut self, now: Instant) -> Option<Instant> {

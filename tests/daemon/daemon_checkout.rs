@@ -4207,3 +4207,137 @@ async fn a_background_read_of_a_damaged_selected_source_schedules_the_reindex_be
     // The owner read the damaged head once, then built the rebuilt one.
     assert!(scheduler.architecture_builds_for_tests() > builds);
 }
+
+/// #1316: the registry forgets an entry whose root was deleted once nothing
+/// uses it, at the lifecycle tick after its release grace. Until then each
+/// blocker (a session, browser grace, pending work) keeps it.
+#[test]
+fn registry_forgets_an_idle_entry_whose_root_is_gone() {
+    use std::time::Instant;
+    use trellis::daemon::registry::{BROWSER_IDLE_DELAY, CHECKOUT_RELEASE_DELAY};
+    let base = tempfile::tempdir().unwrap();
+    let now = Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots(base.path()), now);
+    let mut checkout = |name: &str| {
+        let root = base.path().join(name);
+        fs::create_dir(&root).unwrap();
+        let id = identity(&root);
+        registry
+            .register(&id, CheckoutOptions(serde_json::json!({})))
+            .unwrap();
+        (root, id.root_key)
+    };
+    let (idle_root, idle) = checkout("idle");
+    let (session_root, session) = checkout("session");
+    let (browser_root, browser) = checkout("browser");
+    let (pending_root, pending) = checkout("pending");
+    let (live_root, live) = checkout("live");
+    let replaced_root = base.path().join("replaced");
+    fs::create_dir(&replaced_root).unwrap();
+    let replaced_id = identity(&replaced_root);
+    registry
+        .register(&replaced_id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    registry.attach_launch(7, &identity(&session_root)).unwrap();
+    registry
+        .browser_request_at(&identity(&browser_root), now)
+        .unwrap();
+    registry.set_pending_work(&pending, true).unwrap();
+    for root in [&idle_root, &session_root, &browser_root, &pending_root] {
+        fs::remove_dir_all(root).unwrap();
+    }
+    // A root that exists again (replaced) is not gone.
+    fs::remove_dir_all(&replaced_root).unwrap();
+    fs::create_dir(&replaced_root).unwrap();
+    let known = |registry: &CheckoutRegistry| -> Vec<String> {
+        registry
+            .known_roots()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    };
+    registry.advance(now).unwrap();
+    let after = known(&registry);
+    assert!(
+        !after.contains(&idle),
+        "an idle dead-root entry is forgotten"
+    );
+    for (key, why) in [
+        (&session, "an attached session"),
+        (&browser, "browser grace"),
+        (&pending, "pending work"),
+        (&live, "a live root"),
+        (&replaced_id.root_key, "a replaced root"),
+    ] {
+        assert!(after.contains(key), "{why} keeps the entry");
+    }
+    // The session leaves; after its release grace the entry is released and
+    // forgotten in the same tick.
+    registry.disconnect_at(7, now);
+    registry.advance(now + CHECKOUT_RELEASE_DELAY).unwrap();
+    assert!(!known(&registry).contains(&session));
+    registry
+        .advance(now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY)
+        .unwrap();
+    assert!(!known(&registry).contains(&browser));
+    assert!(
+        known(&registry).contains(&pending),
+        "pending work still holds it"
+    );
+    registry.set_pending_work(&pending, false).unwrap();
+    registry
+        .advance(now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY)
+        .unwrap();
+    assert!(!known(&registry).contains(&pending));
+    assert!(known(&registry).contains(&live));
+}
+
+/// #1316 (and #1330): the browser listing leaves out checkouts whose root is
+/// gone, registered or only left in the cache, and lists the rest active first,
+/// then by name.
+#[tokio::test]
+async fn browser_listing_leaves_out_dead_roots_and_sorts_active_first_then_by_name() {
+    let base = tempfile::tempdir().unwrap();
+    let topology = roots(base.path());
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    let mut keys = std::collections::HashMap::new();
+    for name in ["zeta", "alpha", "middle", "gone"] {
+        let root = base.path().join(name);
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), format!("function {name}() {{}}\n")).unwrap();
+        let id = identity(&root);
+        registry
+            .register(&id, CheckoutOptions(serde_json::json!({})))
+            .unwrap();
+        keys.insert(name, id.root_key);
+    }
+    // A deleted checkout whose index is still in the cache, not in the registry.
+    let orphan = base.path().join("orphan");
+    fs::create_dir(&orphan).unwrap();
+    let orphan_key = identity(&orphan).root_key;
+    drop(trellis::testing::retry_admission(|| {
+        Store::open(topology.clone(), identity(&orphan))
+    }));
+    assert!(topology.index_db(&identity(&orphan)).exists());
+    fs::remove_dir_all(&orphan).unwrap();
+    fs::remove_dir_all(base.path().join("gone")).unwrap();
+    let middle = identity(&base.path().join("middle"));
+    registry.attach_launch(1, &middle).unwrap();
+    let active = registry.activate(&middle.root_key).unwrap();
+    ready(&active).await;
+    let listed: Vec<String> = registry
+        .browser_checkouts()
+        .iter()
+        .map(|row| row["rootKey"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            keys["middle"].clone(),
+            keys["alpha"].clone(),
+            keys["zeta"].clone()
+        ],
+        "active first, then by name; no dead root (gone {}, orphan {orphan_key})",
+        keys["gone"]
+    );
+}
