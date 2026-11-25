@@ -780,13 +780,30 @@ fn native_revision_id(captured: &CapturedComponents) -> String {
     )
 }
 
-fn requested_manifest_hash(revision: &native::Revision) -> String {
-    let rows = revision
-        .documents
+/// Whether each requested producer's languages have the same documents at the captured and the
+/// requested revision: freshness rule 2 compares only those (owner ruling 2026-11-25, #1327),
+/// never the revision identity or the source-set-wide manifest.
+fn producer_documents_unchanged<'a>(
+    captured: &native::Revision,
+    revision: &native::Revision,
+    producers: &BTreeMap<&'a str, &'a Producer>,
+) -> BTreeMap<&'a str, bool> {
+    let manifest = |revision: &native::Revision, producer: &Producer| {
+        crate::batch_descriptor::ProducerManifestHasher::of(
+            &revision.source_set_id,
+            &producer.languages,
+            &revision.documents,
+        )
+    };
+    producers
         .iter()
-        .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
-        .collect();
-    native_ids::digest(b"", &native_ids::canonical(&serde_json::Value::Array(rows)))
+        .map(|(id, producer)| {
+            (
+                *id,
+                manifest(captured, producer) == manifest(revision, producer),
+            )
+        })
+        .collect()
 }
 
 /// Validate one fully normalized synthetic semantic artifact against the measured native input.
@@ -1731,7 +1748,11 @@ fn validate_evidence_inner(
             requested_producers: &requested_producers,
             artifact_hashes: &artifact_hashes,
             manifest_hash: &manifest_hash,
-            requested_manifest_hash: &requested_manifest_hash(revision),
+            producer_documents_unchanged: &producer_documents_unchanged(
+                &captured.captured_revision,
+                revision,
+                &requested_producers,
+            ),
             raw: identity
                 .as_ref()
                 .map(|identity| (identity, &lookup as &ClaimLookup<'_>)),
@@ -1844,7 +1865,9 @@ struct ProofEnv<'a> {
     requested_producers: &'a BTreeMap<&'a str, &'a Producer>,
     artifact_hashes: &'a BTreeMap<&'a String, BTreeSet<String>>,
     manifest_hash: &'a str,
-    requested_manifest_hash: &'a str,
+    /// Per requested producer, whether its languages' documents are the same at the captured
+    /// and the requested revision (freshness rule 2 as amended, #1327).
+    producer_documents_unchanged: &'a BTreeMap<&'a str, bool>,
     raw: Option<(&'a RawCaptureIdentity<'a>, &'a ClaimLookup<'a>)>,
     raw_manifest_hash: Option<&'a str>,
 }
@@ -1905,8 +1928,11 @@ fn validate_provenance_rows<'a>(
         let revision = env.revision;
         let freshness = if requested.is_none_or(|d| d.content_hash != p.content_hash) {
             Freshness::Stale
-        } else if basis.revision_id != revision.id
-            || basis.source_manifest_hash != env.requested_manifest_hash
+        } else if !env
+            .producer_documents_unchanged
+            .get(p.producer_id.as_str())
+            .copied()
+            .unwrap_or(false)
             || basis.toolchain_hash != revision.toolchain_hash
             || basis.config_hash != revision.config_hash
             || basis.dependency_hash != revision.dependency_hash

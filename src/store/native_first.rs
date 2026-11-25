@@ -789,7 +789,7 @@ impl Store {
                         .iter()
                         .for_each(crate::semantic_import::note_published_copy);
                     if !copied.is_empty() && destination.is_none() {
-                        destination = Some(copy::CopyDestination::read(self, &tx, target)?);
+                        destination = Some(copy::CopyDestination::read(&tx, target)?);
                     }
                     let producer = &output.producer;
                     let selection = target
@@ -797,6 +797,12 @@ impl Store {
                         .iter()
                         .find(|selection| selection.producer_id == producer.id)
                         .context("selected semantic batch missing")?;
+                    let scope = match destination.as_ref() {
+                        Some(destination) if !copied.is_empty() => Some(
+                            destination.producer_scope(&tx, selection.captured_pin, producer)?,
+                        ),
+                        _ => None,
+                    };
                     let inputs = self.payload_key_inputs();
                     let captured_key = semantic_pin_key(selection.captured_pin);
                     // Copied and staged documents are written in canonical key order, as one
@@ -839,6 +845,7 @@ impl Store {
                                         payload,
                                         producer,
                                         destination.as_ref().context("copy destination")?,
+                                        scope.as_ref().context("copy producer scope")?,
                                     )?,
                                     None => BTreeMap::new(),
                                 };

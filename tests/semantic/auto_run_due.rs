@@ -189,6 +189,18 @@ fn a_change_in_another_language_is_not_due() {
     assert!(world.due(&["python"]));
 }
 
+/// #1327 (owner ruling 2026-11-25): a change only to a dependency manifest changes an input
+/// freshness compares, so the producer's evidence is possibly stale and it is due.
+#[test]
+fn a_manifest_only_change_is_due() {
+    let world = World::new(FILES);
+    world.import_javascript();
+    assert!(!world.due(JAVASCRIPT));
+    world.write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    world.reindex();
+    assert!(world.due(JAVASCRIPT));
+}
+
 #[test]
 fn a_deleted_document_is_due() {
     let world = World::new(FILES);

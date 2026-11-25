@@ -45,7 +45,8 @@ pub(super) fn check(
         let source_set_id = admitted.descriptor().source_set.id.clone();
         let copied = super::copy::copied_documents(admitted.join_parts()?.conn, &source_set_id)?;
         if !copied.is_empty() {
-            let destination = super::copy::CopyDestination::read(store, db, target)?;
+            let destination = super::copy::CopyDestination::read(db, target)?;
+            let scope = destination.producer_scope(db, selection.captured_pin, producer)?;
             for document in &copied {
                 let copy = super::copy::copied_document(
                     db,
@@ -53,6 +54,7 @@ pub(super) fn check(
                     selection,
                     producer,
                     &destination,
+                    &scope,
                     store.payload_key_inputs().join_inputs(),
                     document,
                 )?;

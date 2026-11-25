@@ -28,7 +28,7 @@ use crate::{
     scip_raw::{CapturedClaim, ScipCaptureError},
     semantic_batch::{
         AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
-        descriptor::{Descriptor, SourceManifestHasher, basis_artifact_ordinal},
+        descriptor::{Descriptor, ProducerManifestHasher, basis_artifact_ordinal},
     },
     semantic_evidence::{self as semantic, EmissionHeader, EmissionValidator, RawClaimDocument},
     store::{
@@ -1927,7 +1927,7 @@ impl StagedJoin<'_> {
         if exists(self.conn(), UNLISTED_CLAIM_DOCUMENT_SQL, &[])? {
             anyhow::bail!("missing admitted claim document");
         }
-        let manifest_hash = self.destination_manifest_hash()?;
+        let unchanged = self.producer_documents_unchanged()?;
         let mut tallies = BTreeMap::new();
         let mut settling = true;
         self.identical_joins.set(true);
@@ -1944,7 +1944,7 @@ impl StagedJoin<'_> {
                 continue;
             }
             let outcome = if settled {
-                self.settle_document(&document, global, global, &manifest_hash, joined)?
+                self.settle_document(&document, global, global, unchanged, joined)?
             } else {
                 settle::DocumentOutcome::default()
             };
@@ -2220,14 +2220,14 @@ impl StagedJoin<'_> {
         captured: &streaming::CompletedGlobal<'_>,
         destination: &streaming::CompletedGlobal<'_>,
     ) -> Result<BTreeMap<semantic::Language, LanguageTally>> {
-        let manifest_hash = self.destination_manifest_hash()?;
+        let unchanged = self.producer_documents_unchanged()?;
         let mut tallies = BTreeMap::new();
         for document in self.destination.documents() {
             let document = document?;
             self.ctx.check_cancel()?;
             let (flags, excluded) = self.document_flags(&document)?;
             let outcome = if flags.eligible && !flags.failed {
-                self.settle_document(&document, captured, destination, &manifest_hash, None)?
+                self.settle_document(&document, captured, destination, unchanged, None)?
             } else {
                 settle::DocumentOutcome::default()
             };
@@ -2258,12 +2258,25 @@ impl StagedJoin<'_> {
         Ok(())
     }
 
-    fn destination_manifest_hash(&self) -> Result<String> {
-        let mut hasher = SourceManifestHasher::new(&self.destination_header.source_set.id);
+    /// Whether the producer's languages have the same documents at the captured and the
+    /// destination revision, which freshness rule 2 compares in place of the revision identity
+    /// and the source-set-wide manifest (owner ruling 2026-11-25, #1327). A shared pin is one
+    /// inventory.
+    fn producer_documents_unchanged(&self) -> Result<bool> {
+        if self.captured.rev == self.destination.rev {
+            return Ok(true);
+        }
+        Ok(self.producer_manifest(&self.captured)? == self.producer_manifest(&self.destination)?)
+    }
+
+    /// The producer manifest of one side's streamed inventory.
+    fn producer_manifest(&self, side: &StagedSide<'_>) -> Result<String> {
+        let mut hasher =
+            ProducerManifestHasher::new(side.source_set_id(), &self.producer.languages);
         let mut statement = self.conn().prepare_cached(
             "SELECT language, path, content_hash FROM nat_docs WHERE rev=?1 ORDER BY ord",
         )?;
-        let mut rows = statement.query([self.destination.rev])?;
+        let mut rows = statement.query([side.rev])?;
         while let Some(row) = rows.next()? {
             hasher.push(
                 &row.get::<_, String>(0)?,
