@@ -2016,7 +2016,14 @@ fn architecture_kept_read_a_that_stops_late_keeps_every_document() {
         })
         .unwrap(),
     );
-    let documents = kept.lock().unwrap().as_ref().unwrap().documents.len();
+    let documents = kept
+        .lock()
+        .unwrap()
+        .native
+        .as_ref()
+        .unwrap()
+        .documents
+        .len();
     write(
         root.path(),
         "crates/alpha/src/util.rs",
@@ -2039,7 +2046,7 @@ fn architecture_kept_read_a_that_stops_late_keeps_every_document() {
         };
         assert!(error.to_string().starts_with("cancelled"), "{error:#}");
         let kept = kept.lock().unwrap();
-        let native = kept.as_ref().expect("the kept documents stay");
+        let native = kept.native.as_ref().expect("the kept documents stay");
         assert_eq!(native.documents.len(), documents, "stopped at check {stop}");
         stopped.push(stop);
     }
