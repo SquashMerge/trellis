@@ -958,8 +958,8 @@ the same build, and each rechecks the pin and rules hash, so a new revision or a
 file is never served from an older result. A daemon restart or an idle checkout's retirement
 drops the result, and the next activation builds it again.
 
-A build reads every document's native rows and Architecture input fingerprints in one admitted
-read transaction. It parses the admitted documents and builds fresh catalogs, then reads semantic
+A build reads every document's Architecture input fingerprints, and the native rows of every
+document the owner does not keep (below), in one admitted read transaction. It parses the admitted documents and builds fresh catalogs, then reads semantic
 rows in a second admitted read at the same pin (#1301, #1308). With an eligible prior core, this
 second read queries only Dirty sources; it still builds the complete document and endpoint
 eligibility index. Without a base, on a full-build gate, or with nonempty `[[rules]]` and selected
@@ -980,6 +980,17 @@ ID sets, complete endpoint documents, per-source Work and pre-sampling site coun
 admission counts, and bounded ordered resolver charge plans. Global fingerprints cover manifests,
 root configuration, producers, raw selections and the Rust, Python, JavaScript/TypeScript and Java
 catalogs.
+
+Beside its results, the owner keeps the native documents of its last Read A as auxiliary state
+(#1315): source text, declarations, calls and control regions, with each document's stored
+identity (its content-addressed version, graph and class projections and producer) and the
+byte sizes its read charged. The next Read A lists every document's identity and reads only the
+documents whose identity changed; a kept document gets the native revision and native proof IDs
+a read at the build's own revision decodes, and the byte budgets charge the sizes it was read
+with. So a body edit reads one document, at any build path. Kept documents never change an
+answer: the snapshot equals a full Read A's. A stopped or failed build returns them for the
+next one, a Read A that stops leaves them untouched, and they are dropped on a new index
+generation. The verify oracle and the full retry read every document.
 
 A checkout keeps at most two results: the head's, and the one it replaced or an older retained
 revision a page is showing. The base is its newest eligible earlier successful core in the same

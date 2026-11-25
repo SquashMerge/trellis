@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Architecture-only identities read beside the snapshot, never required of native fixtures.
-#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, serde::Serialize, PartialEq, Eq)]
 pub struct ArchitectureFingerprints {
     pub documents: BTreeMap<DocumentKey, DocumentFingerprint>,
     /// Admission metadata used to assemble current global state without reading clean payloads.
@@ -622,6 +622,117 @@ mod tests {
             row.insert("evidenceKind".into(), json!("semanticCall"));
             flat.insert("evidenceKind".into(), json!("semanticCall"));
             same(&row, &flat);
+        }
+    }
+}
+
+/// The stored identity of one document's native rows at a revision: its content-addressed
+/// version, graph projection and class projection, and the producer that wrote it. Two reads
+/// of the same identity decode the same rows but for their revision-scoped IDs (#1315).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeIdentity {
+    pub(crate) version_id: String,
+    pub(crate) graph_hash: String,
+    pub(crate) class_hash: Option<String>,
+    pub(crate) producer_id: String,
+}
+
+/// What Read A learned of one document beside its rows: its identity, its fingerprint, the
+/// sizes its byte budgets charged, and whether it was read or taken from kept documents.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeTable {
+    pub(crate) identity: NativeIdentity,
+    pub(crate) fingerprint: NativeFingerprint,
+    pub(crate) bytes: i64,
+    pub(crate) stored_bytes: u64,
+    pub(crate) read: bool,
+}
+
+/// One Read A's native documents, in snapshot order, with their tables.
+pub(crate) struct NativeRead {
+    pub(crate) snapshot: Snapshot,
+    pub(crate) regions: Vec<Vec<crate::native_records::ControlRegion>>,
+    pub(crate) tables: Vec<NativeTable>,
+}
+
+/// One document an earlier Read A read, kept for the next one (#1315).
+pub(crate) struct KeptNativeDocument {
+    pub(crate) table: NativeTable,
+    pub(crate) input: DocumentInput,
+    pub(crate) regions: Vec<crate::native_records::ControlRegion>,
+}
+
+/// The native documents of the owner's last Read A, by key, within one index generation.
+/// They are owner-level auxiliary state: no result depends on which build kept them.
+pub(crate) struct KeptNative {
+    pub(crate) generation: uuid::Uuid,
+    /// The native revision every kept row's revision-scoped IDs were decoded or rebased at.
+    pub(crate) native_revision: String,
+    pub(crate) documents: BTreeMap<DocumentKey, KeptNativeDocument>,
+}
+
+impl KeptNative {
+    /// The documents of a finished Read A, without the semantic rows Read B added.
+    pub(crate) fn of(
+        generation: uuid::Uuid,
+        native_revision: String,
+        documents: Vec<DocumentInput>,
+        regions: Vec<Vec<crate::native_records::ControlRegion>>,
+        tables: Vec<NativeTable>,
+    ) -> Option<Self> {
+        if documents.len() != regions.len() || documents.len() != tables.len() {
+            return None;
+        }
+        Some(Self {
+            generation,
+            native_revision,
+            documents: documents
+                .into_iter()
+                .zip(regions)
+                .zip(tables)
+                .map(|((mut input, regions), table)| {
+                    input.semantic = DocumentSemantic::default();
+                    (
+                        input.key.clone(),
+                        KeptNativeDocument {
+                            table,
+                            input,
+                            regions,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+}
+
+impl KeptNativeDocument {
+    /// Gives a kept document read at native revision `from` the revision-scoped IDs a read at
+    /// `native_revision` decodes: every row's native revision ID and the document's native
+    /// proof ID.
+    pub(crate) fn rebase(&mut self, from: &str, native_revision: &str, producer_id: &str) {
+        if from == native_revision {
+            return;
+        }
+        let proof = crate::store::native_proof_id(producer_id, &self.input.key, native_revision);
+        let DocumentInput {
+            key: _,
+            file: _,
+            declarations,
+            calls,
+            semantic: _,
+        } = &mut self.input;
+        for declaration in declarations {
+            declaration.revision_id = native_revision.to_owned();
+            declaration.provenance_id.clone_from(&proof);
+        }
+        for call in calls {
+            call.revision_id = native_revision.to_owned();
+            call.provenance_id.clone_from(&proof);
+        }
+        for region in &mut self.regions {
+            region.revision_id = native_revision.to_owned();
+            region.provenance_id.clone_from(&proof);
         }
     }
 }

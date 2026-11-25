@@ -310,6 +310,8 @@ pub struct ArchitectureAttempt {
     pub executions:
         std::collections::BTreeMap<ArchitectureExecutionBranch, ArchitectureExecutionTrace>,
     pub progress: Vec<ArchitectureProgress>,
+    /// The documents the candidate's Read A read rather than took from kept documents.
+    pub native_reads: Vec<crate::native_records::DocumentKey>,
     pub full_retries: usize,
     pub compared: bool,
     pub published: bool,
@@ -317,6 +319,9 @@ pub struct ArchitectureAttempt {
 
 pub(crate) struct ArchitectureOwner {
     state: Mutex<OwnerState>,
+    /// The native documents of the last build's Read A, for the next one (#1315). Only the
+    /// owner's own builds use it; an oracle or a full retry reads every document.
+    kept: crate::architecture_core::KeptSlot,
     changed: Condvar,
     /// The runtime closed: stop the running build.
     stop: AtomicBool,
@@ -361,6 +366,7 @@ impl ArchitectureOwner {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
+            kept: Arc::default(),
             changed: Condvar::new(),
             stop: AtomicBool::new(false),
             head_may_have_moved: AtomicBool::new(false),
@@ -545,6 +551,7 @@ fn verify_value(value: Option<&std::ffi::OsStr>) -> bool {
 struct BuildRecord {
     path: ArchitectureBuildPath,
     semantic_sources: Vec<crate::native_records::DocumentKey>,
+    native_reads: Vec<crate::native_records::DocumentKey>,
     references: Mutex<crate::references::ReferenceReplayTrace>,
     full_retries: usize,
     compared: bool,
@@ -563,6 +570,7 @@ impl Default for BuildRecord {
         Self {
             path: ArchitectureBuildPath::Full(FullReason::NoBase),
             semantic_sources: Vec::new(),
+            native_reads: Vec::new(),
             references: Mutex::default(),
             full_retries: 0,
             compared: false,
@@ -1055,6 +1063,7 @@ impl DaemonState {
             path: record.path.clone(),
             semantic_sources: record.semantic_sources.clone(),
             measured_sources: execution.measured_sources,
+            native_reads: record.native_reads.clone(),
             references,
             executions,
             progress: progress_trace.into_inner().unwrap(),
@@ -1143,11 +1152,17 @@ impl DaemonState {
             };
             hook("architecture_read_a");
             let input = response
-                .architecture_native_input(pin, &mut read_check, progress)
+                .architecture_native_input_kept(
+                    pin,
+                    Some(&self.architecture.0.kept),
+                    &mut read_check,
+                    progress,
+                )
                 .and_then(|input| response.finish(input));
             drop(response);
             drop(lease);
             let input = input?;
+            record.native_reads = input.read_documents();
             read_check()?;
             record.fault("prepare")?;
             let mut plan = prepare_architecture(
