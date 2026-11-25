@@ -30,6 +30,9 @@ pub(crate) struct SemanticCharge {
 pub(crate) struct ChargeSite {
     pub(super) structural: StructuralCharge,
     pub(super) semantic: Option<SemanticCharge>,
+    /// What the site's Rust resolution read in its source's syntax tree, so a later build
+    /// can resolve it again without the tree (#1315). `None` when it read nothing there.
+    pub(super) glob: Option<super::rust::GlobUse>,
 }
 
 impl SemanticCharge {
@@ -68,6 +71,7 @@ pub(super) fn structural_charge(
 pub(super) struct ChargedSite {
     pub(super) structural: Option<SiteResolution>,
     pub(super) semantic: Option<SiteResolution>,
+    pub(super) glob: Option<super::rust::GlobUse>,
 }
 
 impl ChargedSite {
@@ -100,22 +104,34 @@ pub(super) fn resolve_charge_site(
         java,
         python,
         javascript,
+        parsed,
     } = catalogs;
+    // A clean source a kept catalog spares from parsing reads what it read before (#1315).
+    let syntax = if parsed.as_ref().is_some_and(|parsed| !parsed[source]) {
+        super::rust::SiteSyntax::Recorded(site.glob.as_ref())
+    } else {
+        super::rust::SiteSyntax::Tree(&read.trees[source])
+    };
+    let mut glob = None;
     let structural = match &site.structural {
         StructuralCharge::None => None,
         StructuralCharge::OwnerAmbiguous => {
             Some(SiteResolution::unknown("reference_owner_ambiguous"))
         }
         StructuralCharge::Resolve(raw) => Some(match read.docs[source].key.language.as_str() {
-            "rust" => rust.resolver(rust_execution).resolve(
-                source,
-                raw,
-                rust_packages,
-                packages,
-                read.docs,
-                &read.trees[source],
-                check,
-            )?,
+            "rust" => {
+                let resolution = rust.resolver(rust_execution).resolve(
+                    source,
+                    raw,
+                    rust_packages,
+                    packages,
+                    read.docs,
+                    syntax,
+                    check,
+                )?;
+                glob = rust_execution.take_glob();
+                resolution
+            }
             "java" => java.resolve(source, raw, packages, &mut rust_execution.work, check)?,
             "python" => python.resolve(source, raw, packages, &mut rust_execution.work, check)?,
             language if super::script_family(language) => javascript
@@ -132,6 +148,7 @@ pub(super) fn resolve_charge_site(
     Ok(ChargedSite {
         structural,
         semantic,
+        glob,
     })
 }
 

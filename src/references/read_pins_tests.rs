@@ -352,7 +352,13 @@ fn catalog_budget(snapshot: &Snapshot, limit: usize) -> Result<Work> {
         workers: 1,
         request: &request,
     };
-    Ok(build_catalogs(read, limit, check)?.rust_execution.work)
+    Ok(
+        build_catalogs(read, limit, RustSource::Fresh { keep: false }, check)?
+            .context("fresh catalogs")?
+            .0
+            .rust_execution
+            .work,
+    )
 }
 
 /// docs/rules.md, "Work bounds and located failures": "Reference work has one

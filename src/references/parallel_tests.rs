@@ -25,16 +25,20 @@ fn snapshot() -> Snapshot {
 
 pub(super) fn snapshot_of(files: &[(&str, &str)]) -> Snapshot {
     let root = tempfile::tempdir().unwrap();
+    snapshot_in(root.path(), files)
+}
+
+/// The snapshot of `root` once `files` are written there: the same root keeps the same
+/// source set across snapshots.
+pub(super) fn snapshot_in(root: &std::path::Path, files: &[(&str, &str)]) -> Snapshot {
     for (path, text) in files.iter().copied() {
-        let file = root.path().join(path);
+        let file = root.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, text).unwrap();
     }
-    let identity =
-        crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-            .unwrap();
+    let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root).unwrap();
     let (graph, native) = crate::indexer::index_workspace_with_native(
-        &crate::indexer::IndexOptions::new(root.path().to_owned()),
+        &crate::indexer::IndexOptions::new(root.to_owned()),
         &identity.record_id,
         &Arc::new(AtomicBool::new(false)),
         |_| {},
@@ -291,7 +295,7 @@ fn independent_catalog_jobs_overlap() {
                 work,
                 &mut check,
             )?;
-            Ok(CatalogJob::Rust(Box::new((catalog, packages))))
+            Ok(CatalogJob::Rust(Box::new((catalog, packages, None))))
         } else {
             let catalog = java::Catalog::new(&docs, &trees, &selected, &mut work, &mut check)?;
             tx.send(()).unwrap();
