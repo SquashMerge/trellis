@@ -2000,3 +2000,63 @@ fn architecture_kept_read_a_that_stops_keeps_every_document() {
     assert_eq!(paths(delta.read_documents()), ["crates/alpha/src/util.rs"]);
     assert_same_read_a(&delta, &native_input(&store));
 }
+
+/// A Read A that stops at any of its checks, before or after it took the kept documents
+/// (the manifest, config and fingerprint stages come after), leaves every document kept
+/// (#1315 review): the next read reads at most what changed, and equals a full Read A.
+#[test]
+fn architecture_kept_read_a_that_stops_late_keeps_every_document() {
+    let (_state, root, store) = incremental_checkout();
+    let kept = KeptSlot::default();
+    let mut checks = 0;
+    drop(
+        kept_read(&store, &kept, &mut || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap(),
+    );
+    let documents = kept
+        .lock()
+        .unwrap()
+        .native
+        .as_ref()
+        .unwrap()
+        .documents
+        .len();
+    write(
+        root.path(),
+        "crates/alpha/src/util.rs",
+        "pub fn u() { let _ = 4; }\n",
+    );
+    publish(&store, root.path());
+    // Each read stops at its `stop`th check, until one makes fewer checks and succeeds. The
+    // last read that stops does so at its own last check, the fingerprint stage's, after
+    // it took the kept documents and read the edited one.
+    let mut stopped = Vec::new();
+    for stop in 1..=checks {
+        let mut calls = 0;
+        let read = kept_read(&store, &kept, &mut || {
+            calls += 1;
+            anyhow::ensure!(calls < stop, "cancelled: injected give-way");
+            Ok(())
+        });
+        let Err(error) = read else {
+            continue;
+        };
+        assert!(error.to_string().starts_with("cancelled"), "{error:#}");
+        let kept = kept.lock().unwrap();
+        let native = kept.native.as_ref().expect("the kept documents stay");
+        assert_eq!(native.documents.len(), documents, "stopped at check {stop}");
+        stopped.push(stop);
+    }
+    assert!(stopped.len() > 1);
+    assert_eq!(stopped, (1..=stopped.len() as i32).collect::<Vec<_>>());
+    let delta = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    let read = paths(delta.read_documents());
+    assert!(
+        read.is_empty() || read == ["crates/alpha/src/util.rs"],
+        "{read:?}"
+    );
+    assert_same_read_a(&delta, &native_input(&store));
+}

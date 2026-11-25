@@ -38,6 +38,20 @@ pub(in crate::references) struct Prepared {
     parts: BTreeMap<usize, Part>,
 }
 
+/// An unchanged file's recorded steps, charged as a full build charges them one by one.
+fn charge(
+    execution: &mut RustExecution,
+    steps: usize,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    check()?;
+    ensure!(
+        execution.work.charge(steps),
+        "bounded_work: reference Rust resolution"
+    );
+    Ok(())
+}
+
 impl Prepared {
     /// Every Rust file's own phases, in the order a full build runs them.
     pub(in crate::references) fn build(
@@ -168,15 +182,27 @@ impl Prepared {
             variants: self.catalog.variants.clone(),
             ..Catalog::empty()
         };
+        // Every step charges the supplied budget in the order a full build charges it: the
+        // macro-rules names, then each file's indexing, then each file's scan. A changed
+        // file's phases run on that same budget, so an over-budget catalog stops where a full
+        // build stops, with its typed `bounded_work` (#1315 review).
+        let mut execution = RustExecution::new(work);
+        catalog
+            .resolver(&mut execution)
+            .read_macro_rules(docs, &has_error, check)?;
         // Every file scope precedes every block scope: a changed file's starts afresh.
         let file_scopes = files.len();
         catalog
             .scopes
             .extend_from_slice(&self.catalog.scopes[..file_scopes]);
         let mut fresh = BTreeMap::new();
-        for &document in changed {
+        for (&document, part) in &self.parts {
+            if !changed.contains(&document) {
+                charge(&mut execution, part.index_steps, check)?;
+                continue;
+            }
             let mut scratch = Catalog::empty();
-            let mut scratch_execution = RustExecution::new(Work::new(usize::MAX));
+            let mut scratch_execution = RustExecution::new(execution.work);
             let mut declarations = BTreeMap::new();
             scratch.resolver(&mut scratch_execution).index_file(
                 document,
@@ -197,7 +223,9 @@ impl Prepared {
             catalog
                 .variants
                 .retain(|&(variant_document, _, _), _| variant_document != document);
-            fresh.insert(document, (scratch_execution.work.used, declarations));
+            let index_steps = scratch_execution.work.used - execution.work.used;
+            execution.work = scratch_execution.work;
+            fresh.insert(document, (index_steps, declarations));
         }
         let mut edges = Vec::with_capacity(self.edges.len());
         let mut parts = BTreeMap::new();
@@ -210,6 +238,7 @@ impl Prepared {
             );
             next = part.blocks.end;
             let Some((index_steps, declarations)) = fresh.remove(&document) else {
+                charge(&mut execution, part.scan_steps, check)?;
                 let proofs = catalog.proofs.len();
                 catalog
                     .proofs
@@ -246,7 +275,7 @@ impl Prepared {
                 },
                 ..Catalog::empty()
             };
-            let mut scratch_execution = RustExecution::new(Work::new(usize::MAX));
+            let mut scratch_execution = RustExecution::new(execution.work);
             let mut scanned = Vec::new();
             scratch.resolver(&mut scratch_execution).scan(
                 docs,
@@ -257,6 +286,8 @@ impl Prepared {
                 0,
                 check,
             )?;
+            let scan_steps = scratch_execution.work.used - execution.work.used;
+            execution.work = scratch_execution.work;
             let blocks = part.blocks.start..scratch.scopes.len();
             if blocks.len() != part.blocks.len()
                 || scratch.shadows.macro_use != part.macro_use
@@ -283,7 +314,7 @@ impl Prepared {
                 document,
                 Part {
                     index_steps,
-                    scan_steps: scratch_execution.work.used,
+                    scan_steps,
                     blocks,
                     proofs: proofs..catalog.proofs.len(),
                     statement_macros: statement_macros..catalog.statement_macros.len(),
@@ -300,22 +331,6 @@ impl Prepared {
         );
         catalog.shadows.macro_use = macro_use;
         catalog.shadows.decl_macro = decl_macro;
-        let mut execution = RustExecution::new(work);
-        // A full build reads the macro-rules names first; the order of charges changes no
-        // outcome but which over-budget message a failed incremental attempt carries, and
-        // that attempt is redone in full.
-        catalog
-            .resolver(&mut execution)
-            .read_macro_rules(docs, &has_error, check)?;
-        let own: usize = parts
-            .values()
-            .map(|part| part.index_steps + part.scan_steps)
-            .sum();
-        check()?;
-        ensure!(
-            execution.work.charge(own),
-            "bounded_work: reference Rust resolution"
-        );
         Ok(Some((
             Self {
                 catalog,
@@ -363,5 +378,140 @@ impl Prepared {
             docs, &has_error, documents, workspace, packages, &mut edges, check,
         )?;
         Ok((catalog, execution))
+    }
+}
+
+/// #1315 review: a kept catalog's changed files are indexed and scanned on the supplied
+/// budget, so an over-budget catalog stops where a full build stops, with its typed error.
+#[cfg(all(test, feature = "test-support"))]
+mod budget_tests {
+    use super::*;
+    use crate::references::{Snapshot, parallel_tests::snapshot_in};
+
+    fn inputs(
+        snapshot: &Snapshot,
+    ) -> (
+        Vec<&DocumentInput>,
+        Vec<Tree>,
+        super::super::super::cargo_workspace::Workspace,
+        usize,
+    ) {
+        let mut check = || Ok(());
+        let docs: Vec<&DocumentInput> = snapshot.documents.iter().collect();
+        let trees = docs
+            .iter()
+            .map(|doc| super::super::super::parse(doc, &mut check).unwrap())
+            .collect();
+        let mut work = Work::new(usize::MAX);
+        let workspace = super::super::super::cargo_workspace::Workspace::new(
+            &snapshot.manifests,
+            &mut work,
+            &mut check,
+        )
+        .unwrap();
+        (docs, trees, workspace, work.used)
+    }
+
+    fn sorted(mut snapshot: Snapshot) -> Snapshot {
+        snapshot.documents.sort_by(|a, b| a.key.cmp(&b.key));
+        snapshot
+    }
+
+    #[test]
+    fn a_changed_file_is_indexed_and_scanned_within_the_supplied_budget() {
+        let blocks: String = (0..400)
+            .map(|i| format!("    {{ let _ = {i}; }}\n"))
+            .collect();
+        let before_text = format!("pub fn f() {{\n{blocks}}}\n");
+        let after_text = before_text.replacen("let _ = 0;", "let _ = 9;", 1);
+        let root = tempfile::tempdir().unwrap();
+        let files = [
+            ("src/lib.rs", "pub mod a;\n"),
+            ("src/a.rs", before_text.as_str()),
+        ];
+        let before = sorted(snapshot_in(root.path(), &files));
+        let after = sorted(snapshot_in(
+            root.path(),
+            &[("src/a.rs", after_text.as_str())],
+        ));
+        let (docs, trees, workspace, _) = inputs(&before);
+        let (kept, _) = Prepared::build(
+            &docs,
+            &trees,
+            &workspace,
+            Work::new(usize::MAX),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let (docs, trees, workspace, manifests) = inputs(&after);
+        let changed = BTreeSet::from([docs
+            .iter()
+            .position(|doc| doc.key.path == "src/a.rs")
+            .unwrap()]);
+        let budget = |limit: usize| Work {
+            used: manifests,
+            limit,
+        };
+        let (_, fresh) = Prepared::build(
+            &docs,
+            &trees,
+            &workspace,
+            budget(usize::MAX),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let (_, spliced) = kept
+            .replace(
+                &docs,
+                &trees,
+                &changed,
+                &workspace,
+                budget(usize::MAX),
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .expect("a body edit keeps the catalog");
+        let total = fresh.work.used;
+        assert_eq!(spliced.work.used, total, "the same Work as a full build");
+        // The changed file's scan is most of the catalog's Work.
+        assert!(total > 4 * (manifests + 400), "{total}");
+        for limit in [total, total - 1, total / 2, total / 4] {
+            let full = Prepared::build(&docs, &trees, &workspace, budget(limit), &mut || Ok(()));
+            let mut checks = 0;
+            let replaced = kept.replace(
+                &docs,
+                &trees,
+                &changed,
+                &workspace,
+                budget(limit),
+                &mut || {
+                    checks += 1;
+                    Ok(())
+                },
+            );
+            match (full, replaced) {
+                (Ok((_, full)), Ok(Some((_, replaced)))) => {
+                    assert_eq!(replaced.work.used, full.work.used, "{limit}");
+                }
+                (Err(full), Err(replaced)) => {
+                    assert_eq!(replaced.to_string(), full.to_string(), "{limit}");
+                    assert!(
+                        replaced.to_string().starts_with("bounded_work"),
+                        "{replaced}"
+                    );
+                    // It stopped at the budget: at most one check per step it could charge,
+                    // and one per file whose recorded steps it charged at once.
+                    assert!(
+                        checks <= limit - manifests + 2 * kept.parts.len() + 2,
+                        "{checks} checks under a limit of {limit}"
+                    );
+                }
+                (full, replaced) => panic!(
+                    "{limit}: full {:?}, replaced {:?}",
+                    full.map(|_| ()),
+                    replaced.map(|r| r.is_some())
+                ),
+            }
+        }
     }
 }
