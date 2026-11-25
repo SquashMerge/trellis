@@ -593,10 +593,14 @@ async fn architecture_incremental_boundary_rules_observation_ends_episode() {
     assert_eq!(scheduler.architecture_verified_for_tests(), compared + 1);
 }
 
+/// Java has no catalog digest yet (#1314 PR 4c), so an edit to it builds full.
+const JAVA: &str = "class Example { void run() { int a = 1; } }\n";
+const JAVA_EDITED: &str = "class Example { void run() { int a = 2; } }\n";
+
 #[tokio::test]
 async fn architecture_execution_full_cancelled_during_measuring() {
     let mut sources = NATIVE_SOURCES.to_vec();
-    sources.push(("typed.ts", "export function typed() { return 1; }\n"));
+    sources.push(("Example.java", JAVA));
     let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
     let scheduler = runtime.browser_scheduler().unwrap();
     let original = current_pin(&scheduler);
@@ -607,12 +611,7 @@ async fn architecture_execution_full_cancelled_during_measuring() {
         }
         Ok(())
     }));
-    let pin = index_edit(
-        &base,
-        &runtime,
-        &[("typed.ts", Some("export function typed() { return 2; }\n"))],
-    )
-    .await;
+    let pin = index_edit(&base, &runtime, &[("Example.java", Some(JAVA_EDITED))]).await;
     let attempts: Vec<_> = scheduler
         .architecture_attempts_for_tests()
         .into_iter()
@@ -663,7 +662,7 @@ async fn architecture_execution_full_cancelled_during_measuring() {
 async fn architecture_execution_full_metric_worker_failures_keep_only_ordered_commits() {
     for failed in ["src/clean.rs", "src/lib.rs"] {
         let mut sources = NATIVE_SOURCES.to_vec();
-        sources.push(("typed.ts", "export function typed() { return 1; }\n"));
+        sources.push(("Example.java", JAVA));
         let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
         let scheduler = runtime.browser_scheduler().unwrap();
         let keys = document_keys(&scheduler, current_pin(&scheduler));
@@ -673,12 +672,7 @@ async fn architecture_execution_full_metric_worker_failures_keep_only_ordered_co
             }
             Ok(())
         }));
-        let pin = index_edit(
-            &base,
-            &runtime,
-            &[("typed.ts", Some("export function typed() { return 2; }\n"))],
-        )
-        .await;
+        let pin = index_edit(&base, &runtime, &[("Example.java", Some(JAVA_EDITED))]).await;
         let attempt = published_attempt(&scheduler, pin);
         assert_eq!(
             attempt.path,
@@ -690,7 +684,8 @@ async fn architecture_execution_full_metric_worker_failures_keep_only_ordered_co
             .take_while(|key| key.path != failed)
             .cloned()
             .collect();
-        assert_eq!(prefix.len(), usize::from(failed == "src/lib.rs"));
+        // `Example.java` sorts before every Rust source.
+        assert_eq!(prefix.len(), 1 + usize::from(failed == "src/lib.rs"));
         assert_eq!(attempt.measured_sources, prefix);
         assert_eq!(attempt.references.file_references, keys);
         for branch in [ExecutionBranch::Candidate, ExecutionBranch::Oracle] {
@@ -832,14 +827,11 @@ async fn architecture_execution_interrupted_retry_does_not_retain_candidate_trac
 async fn architecture_incremental_native_non_rust_and_tsconfig_gates() {
     let mut sources = NATIVE_SOURCES.to_vec();
     sources.push(("typed.ts", "export function typed() { return 1; }\n"));
+    sources.push(("Example.java", JAVA));
     let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
     let scheduler = runtime.browser_scheduler().unwrap();
     for (path, text, reason) in [
-        (
-            "typed.ts",
-            "export function typed() { return 2; }\n",
-            FullReason::NonRustChanged,
-        ),
+        ("Example.java", JAVA_EDITED, FullReason::NonRustChanged),
         (
             "tsconfig.json",
             "{\"compilerOptions\":{\"baseUrl\":\".\"}}",
@@ -1051,6 +1043,92 @@ async fn architecture_incremental_python_catalog_digest() {
             published_attempt(&scheduler, pin).path,
             ArchitectureBuildPath::Full(FullReason::PythonCatalogChanged),
             "{edited}"
+        );
+    }
+}
+
+const SCRIPT_UTIL: &str = "export function util() {\n  return 1;\n}\n\nexport class Box {}\n";
+const SCRIPT_PLAIN: &str = "export const plain = () => 1;\n\nexport default plain;\n";
+
+/// #1314: JavaScript and TypeScript documents are covered by the JavaScript catalog digest.
+/// A body-only TS or JS edit builds incrementally and equals a full build; an edit that
+/// changes what an import or re-export resolves to builds in full with its own reason.
+#[tokio::test]
+async fn architecture_incremental_javascript_catalog_digest() {
+    let mut sources = NATIVE_SOURCES.to_vec();
+    sources.extend([
+        ("web/util.ts", SCRIPT_UTIL),
+        (
+            "web/app.ts",
+            "import { util } from './util';\n\nexport function app() {\n  return util();\n}\n",
+        ),
+        ("web/index.ts", "export * from './util';\n"),
+        ("web/plain.js", SCRIPT_PLAIN),
+        (
+            "web/main.js",
+            "import plain from './plain.js';\n\nplain();\n",
+        ),
+    ]);
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&sources).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let first = current_pin(&scheduler);
+    let before = core(&scheduler, first);
+    // A TypeScript body-only edit that moves the later class: its positions keep their ranks.
+    let util = SCRIPT_UTIL.replace("return 1;", "return [1, 2, 3].length;");
+    let pin = index_edit(&base, &runtime, &[("web/util.ts", Some(&util))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_eq!(attempt.base, Some(first));
+    // The importer and the star re-exporter of the edited module are its genuine dependents.
+    assert_incremental(&attempt, &["web/util.ts"], &["web/app.ts", "web/index.ts"]);
+    assert_eq!(source_paths(&attempt.semantic_sources), ["web/util.ts"]);
+    assert_eq!(source_paths(&attempt.measured_sources), ["web/util.ts"]);
+    let after = core(&scheduler, pin);
+    assert_eq!(
+        after.canonical().unwrap(),
+        independent_full(&runtime, pin).await
+    );
+    for (key, sharing) in after.sharing(&before) {
+        match key.path.as_str() {
+            "web/util.ts" => assert!(!sharing.source && !sharing.metric && !sharing.dependency),
+            "web/app.ts" | "web/index.ts" => assert!(sharing.metric, "{key:?}: {sharing:?}"),
+            _ => assert!(
+                sharing.source
+                    && sharing.metric
+                    && sharing.dependency
+                    && sharing.fingerprint
+                    && sharing.references
+                    && sharing.endpoints
+                    && sharing.plan,
+                "{key:?}: {sharing:?}"
+            ),
+        }
+    }
+    // A JavaScript body-only edit, with a comment that shifts later positions.
+    let plain = SCRIPT_PLAIN.replace("() => 1;\n", "() => [1, 2].length;\n// shifted\n");
+    let pin = index_edit(&base, &runtime, &[("web/plain.js", Some(&plain))]).await;
+    let attempt = published_attempt(&scheduler, pin);
+    assert_incremental(&attempt, &["web/plain.js"], &["web/main.js"]);
+    assert_eq!(
+        core(&scheduler, pin).canonical().unwrap(),
+        independent_full(&runtime, pin).await
+    );
+    for (path, text) in [
+        // The import now reaches another module.
+        (
+            "web/main.js",
+            "import plain from './util';\n\nplain();\n".to_owned(),
+        ),
+        // The star re-export now also forwards another module's export.
+        (
+            "web/util.ts",
+            format!("{util}export {{ plain }} from './plain.js';\n"),
+        ),
+    ] {
+        let pin = index_edit(&base, &runtime, &[(path, Some(&text))]).await;
+        assert_eq!(
+            published_attempt(&scheduler, pin).path,
+            ArchitectureBuildPath::Full(FullReason::JavascriptCatalogChanged),
+            "{path}: {text}"
         );
     }
 }

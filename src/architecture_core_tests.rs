@@ -92,6 +92,10 @@ fn architecture_incremental_canonical_index() {
         hex::encode(index.python_catalog),
         before["references"]["pythonCatalogDigest"]
     );
+    assert_eq!(
+        hex::encode(index.javascript_catalog),
+        before["references"]["javascriptCatalogDigest"]
+    );
     let mut scanned_zero = false;
     for ((key, dependency), facts) in index
         .order
@@ -143,14 +147,15 @@ fn architecture_incremental_canonical_index() {
     changed!(index, {
         Arc::make_mut(&mut index.order)[0].path.push('2');
     });
-    for member in 0..6 {
+    for member in 0..7 {
         changed!(index, {
             let digest = match member {
                 0 => &mut index.rust_catalog,
                 1 => &mut index.python_catalog,
-                2 => &mut index.manifests,
-                3 => &mut index.root_config,
-                4 => &mut index.producers,
+                2 => &mut index.javascript_catalog,
+                3 => &mut index.manifests,
+                4 => &mut index.root_config,
+                5 => &mut index.producers,
                 _ => &mut index.selections,
             };
             digest[0] ^= 1;
@@ -458,6 +463,13 @@ fn full_reference_canonical_includes_aligned_source_facts_and_descriptor_slots()
         references["pythonCatalogDigest"].as_str().unwrap().len(),
         64
     );
+    assert_eq!(
+        references["javascriptCatalogDigest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert!(
         facts
             .iter()
@@ -737,6 +749,8 @@ fn architecture_incremental_changed_sets_and_ordered_gates() {
             .err(),
         Some(FullReason::DirtyMajority)
     );
+    // A script document is covered by the JavaScript catalog digest (#1314), so its native
+    // change is not a gate here: the plan compares the digests. Java is not covered yet.
     fingerprints
         .documents
         .get_mut(&script)
@@ -747,8 +761,26 @@ fn architecture_incremental_changed_sets_and_ordered_gates() {
         dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
             .unwrap()
             .err(),
-        Some(FullReason::NonRustChanged)
+        Some(FullReason::DirtyMajority)
     );
+    fingerprints = input.fingerprints.clone();
+    fingerprints
+        .documents
+        .get_mut(&script)
+        .unwrap()
+        .native
+        .coverage_diagnostic = Some("changed".into());
+    let changed = dependencies::changed_documents(&input.snapshot, &fingerprints, Some(&old))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        changed.native,
+        std::collections::BTreeSet::from([script.clone()])
+    );
+    for language in ["rust", "python", "javascript", "typescript"] {
+        assert!(crate::references::catalog_digested(language), "{language}");
+    }
+    assert!(!crate::references::catalog_digested("java"));
 
     fingerprints = input.fingerprints.clone();
     fingerprints.documents.get_mut(&script).unwrap().semantic[0] ^= 1;

@@ -3,6 +3,9 @@ use super::shared::{Bucket, Candidate, DeclarationId, add_bucket, charge, unknow
 use super::*;
 use std::sync::Arc;
 
+mod digest;
+pub(super) use digest::digest;
+
 type Route = BTreeSet<(usize, String)>;
 #[derive(Default)]
 struct Names {
