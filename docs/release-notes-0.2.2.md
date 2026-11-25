@@ -6,8 +6,8 @@ after the [0.2.1 release](release-notes-0.2.1.md) (tag `v0.2.1`) through
 release. Against 0.2.1, a first index takes 37–53% less time, a semantic edit settles
 69–88% sooner, the Architecture snapshot is rebuilt incrementally after an ordinary edit,
 `storage_busy` no longer shows up during semantic catch-up, peak memory on a real checkout
-with semantic evidence falls by up to 90%, and `index.db` after a semantic import is
-41–49% smaller. Some memory figures rose; they are listed under
+with semantic evidence falls by up to 90%, and `index.db` is 43–44% smaller after a
+semantic import and 41–49% smaller after the edit series that follows. Some memory figures rose; they are listed under
 [Memory regressions](#memory-regressions). The MCP `toolVersion` stays **34**, the native
 extractor stays `native-v20` and `metricsVersion` stays `metrics:v1`. The index schema
 goes from **43 to 49**, so every checkout is re-indexed on first use. See
@@ -24,8 +24,9 @@ workloads were Trellis's own checkout (952 files; rust-analyzer and scip-typescr
 evidence), a third-party Rust checkout (441 files; rust-analyzer evidence), synthetic
 cohorts (small, medium and large: 100, 1,000 and 10,000 files) and mimir, a public
 repository (1,135 files, Python and TypeScript, native only). Figures are medians over 3
-to 6 runs per version, and edit figures pool 15 timed edits; the search embedding ran
-once per version.
+to 6 runs per version. Edit refresh figures pool 15 timed edits (3 runs of 5); Architecture
+edit builds take each run's median of 5 edits, then the median over 3 runs. The search
+embedding ran once per version.
 
 ### Results
 
