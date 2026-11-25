@@ -501,6 +501,7 @@ impl CapturedArchitecture {
                 let full = read.architecture_full_for_tests(pin).unwrap();
                 read.finish(()).unwrap();
                 assert_eq!(core.canonical().unwrap(), full);
+                self.settle();
                 return (attempt, core);
             }
             assert!(
@@ -511,6 +512,15 @@ impl CapturedArchitecture {
             self.owner
                 .wait_state_change(seen, deadline.saturating_duration_since(Instant::now()));
         }
+    }
+
+    /// After a publication the owner takes one more turn to look at the head again. Let it
+    /// end before the fixture publishes anything else: a turn that read the head only after
+    /// the next native publication would build that intermediate revision unasked, and its
+    /// core, published before the catch-up, would become the catch-up's base instead of the
+    /// core a step names. Both bases are valid; only the expected path differs.
+    fn settle(&self) {
+        self.owner.await_architecture_idle_for_tests();
     }
 
     pub fn canonical(&self, pin: IndexPin) -> Value {
@@ -670,6 +680,7 @@ impl CapturedArchitecture {
                 let error = read.architecture_full_for_tests(pin).unwrap_err();
                 read.finish(()).unwrap();
                 assert_eq!(error.to_string(), message);
+                self.settle();
                 return;
             }
             assert!(
