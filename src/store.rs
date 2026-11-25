@@ -1744,7 +1744,7 @@ impl EvidenceResponse {
     pub(crate) fn architecture_read_a_kept(
         &self,
         pin: Option<IndexPin>,
-        kept: Option<&mut KeptNative>,
+        mut kept: Option<&mut KeptNative>,
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &dyn Fn(usize, usize),
     ) -> Result<ReadA> {
@@ -1752,7 +1752,37 @@ impl EvidenceResponse {
             mut snapshot,
             regions,
             tables,
-        } = self.architecture_native_read(pin, kept, check, progress)?;
+            native_revision,
+        } = self.architecture_native_read(pin, kept.as_deref_mut(), check, progress)?;
+        match self.architecture_fingerprints(&mut snapshot, &tables, check) {
+            Ok(fingerprints) => Ok((snapshot, regions, fingerprints, tables)),
+            Err(error) => {
+                // The kept documents were taken: a Read A that stops or fails after that hands
+                // back every document it holds, as a dropped input does (#1315).
+                if let Some(kept) = kept
+                    && let Some(back) = KeptNative::of(
+                        snapshot.pin.index_generation,
+                        native_revision,
+                        std::mem::take(&mut snapshot.documents),
+                        regions,
+                        tables,
+                    )
+                {
+                    *kept = back;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Read A's Architecture-only sidecar for `snapshot`'s documents, which it gives their
+    /// Read A semantic state.
+    fn architecture_fingerprints(
+        &self,
+        snapshot: &mut crate::architecture_inputs::Snapshot,
+        tables: &[NativeTable],
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<ArchitectureFingerprints> {
         let key = semantic_pin_key(snapshot.pin);
         let defaults = semantic_display::default_producers(&self.db, &key)?;
         let (producers, selections) =
@@ -1774,7 +1804,7 @@ impl EvidenceResponse {
             .collect::<rusqlite::Result<_>>()?;
         let mut documents = BTreeMap::new();
         let mut semantic_states = BTreeMap::new();
-        for (document, table) in snapshot.documents.iter_mut().zip(&tables) {
+        for (document, table) in snapshot.documents.iter_mut().zip(tables) {
             check()?;
             // Native read above already applied selected-header, graph and class validation,
             // and its listing carried each document's fingerprint.
@@ -1838,18 +1868,13 @@ impl EvidenceResponse {
             semantic_states.insert(document.key.clone(), state);
         }
         check()?;
-        Ok((
-            snapshot,
-            regions,
-            ArchitectureFingerprints {
-                documents,
-                semantic_states,
-                producers,
-                selections,
-                native_revision,
-            },
-            tables,
-        ))
+        Ok(ArchitectureFingerprints {
+            documents,
+            semantic_states,
+            producers,
+            selections,
+            native_revision,
+        })
     }
 
     /// Read A of an Architecture build (#1301): each selected native document once with its
@@ -2051,6 +2076,7 @@ impl EvidenceResponse {
         }
         // SQLite reads stay on this connection; decoding needs no connection, so
         // it runs in parallel. The first decode failure in document order is reported.
+        let mut fetched_documents = Vec::new();
         {
             let stopped = std::sync::atomic::AtomicBool::new(false);
             let progress_failure = Mutex::new(None);
@@ -2100,7 +2126,7 @@ impl EvidenceResponse {
                 return Err(error);
             }
             let mut decoded = decoded.into_iter();
-            let mut fetched_documents = Vec::with_capacity(fresh.len());
+            fetched_documents.reserve(fresh.len());
             for (key, decode) in &pending {
                 if decode.is_none() {
                     continue;
@@ -2114,43 +2140,6 @@ impl EvidenceResponse {
                     "incompatible_index: architecture language mismatch"
                 );
                 fetched_documents.push(fetched);
-            }
-            // Every read succeeded: only now are kept documents taken, and the rest of the
-            // kept set is superseded by this read.
-            let (kept_revision, mut kept_documents) = kept
-                .map(|kept| {
-                    (
-                        std::mem::take(&mut kept.native_revision),
-                        std::mem::take(&mut kept.documents),
-                    )
-                })
-                .unwrap_or_default();
-            let mut fetched_documents = fetched_documents.into_iter();
-            for ((key, decode), table) in pending.into_iter().zip(&tables) {
-                if decode.is_some() {
-                    let fetched = fetched_documents
-                        .next()
-                        .context("store_unavailable: architecture decode inventory")?;
-                    regions.push(fetched.regions);
-                    documents.push(crate::architecture_inputs::DocumentInput {
-                        key,
-                        file: fetched.file,
-                        declarations: fetched.declarations,
-                        calls: fetched.calls,
-                        semantic: Default::default(),
-                    });
-                    continue;
-                }
-                let mut document = kept_documents
-                    .remove(&key)
-                    .context("store_unavailable: kept architecture document")?;
-                document.rebase(
-                    &kept_revision,
-                    &native_revision,
-                    &table.identity.producer_id,
-                );
-                regions.push(document.regions);
-                documents.push(document.input);
             }
         }
         // Retained manifests belong to this selected row and this admitted transaction.
@@ -2390,6 +2379,59 @@ impl EvidenceResponse {
                 bytes,
             });
         }
+        // Every fallible step is done: only now are kept documents taken, so a read that
+        // stops or fails anywhere leaves them where they were (#1315). The rest of the kept
+        // set is superseded by this read.
+        ensure!(
+            fetched_documents.len()
+                == pending
+                    .iter()
+                    .filter(|(_, decode)| decode.is_some())
+                    .count()
+                && pending.iter().all(|(key, decode)| {
+                    decode.is_some()
+                        || kept
+                            .as_ref()
+                            .is_some_and(|kept| kept.documents.contains_key(key))
+                }),
+            "store_unavailable: architecture decode inventory"
+        );
+        let (kept_revision, mut kept_documents) = kept
+            .map(|kept| {
+                (
+                    std::mem::take(&mut kept.native_revision),
+                    std::mem::take(&mut kept.documents),
+                )
+            })
+            .unwrap_or_default();
+        let mut fetched_documents = fetched_documents.into_iter();
+        for ((key, decode), table) in pending.into_iter().zip(&tables) {
+            let Some(mut document) = decode
+                .is_none()
+                .then(|| kept_documents.remove(&key))
+                .flatten()
+            else {
+                let fetched = fetched_documents
+                    .next()
+                    .expect("one decoded document per read row");
+                regions.push(fetched.regions);
+                documents.push(crate::architecture_inputs::DocumentInput {
+                    key,
+                    file: fetched.file,
+                    declarations: fetched.declarations,
+                    calls: fetched.calls,
+                    semantic: Default::default(),
+                });
+                continue;
+            };
+            document.rebase(
+                &kept_revision,
+                &native_revision,
+                &table.identity.producer_id,
+            );
+            regions.push(document.regions);
+            documents.push(document.input);
+        }
         Ok(NativeRead {
             snapshot: crate::architecture_inputs::Snapshot {
                 pin: selected.pin,
@@ -2401,6 +2443,7 @@ impl EvidenceResponse {
             },
             regions,
             tables,
+            native_revision,
         })
     }
 
