@@ -13,11 +13,15 @@
 set -eu
 
 # When MIMIR_HEAVY_LOCK_FILE is set, the whole run (any lanes) takes the shared
-# heavy-run lease, so heavy runs on one machine go one at a time; see
-# tools/README.md. tools/heavy_run.py sets MIMIR_HEAVY_LOCK_HELD for the command
-# it runs, so a verify that is already inside a lease runs directly: no nesting,
-# no deadlock. With the variable unset this does nothing.
+# heavy-run lease; see tools/README.md. Verify is a medium job: it holds one of
+# the lease's two slots, so it may share the machine with one other medium job.
+# A caller that sets MIMIR_HEAVY_TIER (for example to large) keeps its choice.
+# tools/heavy_run.py sets MIMIR_HEAVY_LOCK_HELD for the command it runs, so a
+# verify that is already inside a lease runs directly: no nesting, no deadlock.
+# With the variable unset this does nothing.
 if [ -n "${MIMIR_HEAVY_LOCK_FILE:-}" ] && [ -z "${MIMIR_HEAVY_LOCK_HELD:-}" ]; then
+  MIMIR_HEAVY_TIER=${MIMIR_HEAVY_TIER:-medium}
+  export MIMIR_HEAVY_TIER
   exec sh "$(dirname "$0")/heavy_run.sh" sh "$0" "$@"
 fi
 
