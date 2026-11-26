@@ -133,6 +133,12 @@ impl CheckoutMetadata {
     }
 }
 
+/// The recorded root path no longer exists (#1316). Any other answer, such as a
+/// replaced root or an unreadable parent, is not proof that it is gone.
+fn root_missing(root: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(root).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 struct BrowserCheckoutEntry {
     identity: CheckoutMetadata,
     active: bool,

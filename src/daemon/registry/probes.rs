@@ -39,12 +39,25 @@ impl BrowserCheckoutsProbe {
     pub fn check(self) -> Vec<serde_json::Value> {
         let mut rows = std::collections::BTreeMap::new();
         let mut replacements = HashSet::new();
+        let mut dead = HashSet::new();
         let roots = self
             .roots
             .clone()
             .map(Ok)
             .unwrap_or_else(TopologyRoots::production);
         for (key, entry) in &self.entries {
+            // An idle entry whose root is gone is not offered (#1316); the
+            // registry forgets it at its next lifecycle tick.
+            if entry.replacement_idle
+                && entry
+                    .lost_reads
+                    .as_ref()
+                    .is_none_or(|reads| reads.load(std::sync::atomic::Ordering::Acquire) == 0)
+                && super::root_missing(&entry.identity.root)
+            {
+                dead.insert(key.clone());
+                continue;
+            }
             let index = roots
                 .as_ref()
                 .ok()
@@ -107,6 +120,7 @@ impl BrowserCheckoutsProbe {
             for candidate in indexes.flatten() {
                 let key = candidate.file_name().to_string_lossy().to_string();
                 if rows.contains_key(&key)
+                    || dead.contains(&key)
                     || key.len() != 64
                     || !key
                         .bytes()
@@ -125,6 +139,9 @@ impl BrowserCheckoutsProbe {
                     {
                         serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"available", "active":false})
                     }
+                    // A derived index of a deleted checkout waits for GC; it is
+                    // not a checkout to offer (#1316).
+                    Ok(spelling) if super::root_missing(Path::new(&spelling)) => continue,
                     Ok(spelling) => {
                         serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"unavailable", "active":false})
                     }
@@ -201,8 +218,29 @@ impl BrowserCheckoutsProbe {
                 }
             }
         }
-        rows.into_values().collect()
+        let mut rows: Vec<_> = rows.into_values().collect();
+        rows.sort_by_cached_key(checkout_order);
+        rows
     }
+}
+
+/// The picker's order (#1316): active checkouts first, then the ones a browser
+/// can choose, then by root name, full root and key.
+fn checkout_order(row: &serde_json::Value) -> (bool, bool, String, String, String) {
+    let root = row["workspaceRoot"].as_str().unwrap_or_default();
+    let name = Path::new(root)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let choosable =
+        matches!(row["state"].as_str(), Some("available" | "storage_busy")) && !root.is_empty();
+    (
+        row["active"] != true,
+        !choosable,
+        name,
+        root.to_owned(),
+        row["rootKey"].as_str().unwrap_or_default().to_owned(),
+    )
 }
 
 fn browser_index_error(error: &anyhow::Error) -> &'static str {
