@@ -310,3 +310,55 @@ fn rust_lookup_keys_reuse_the_checked_source_for_sid_answers() {
         Some("store.rs::Store::save")
     );
 }
+
+#[test]
+fn architecture_read_a_checks_the_byte_bounds_before_it_reads_any_document() {
+    // #1313: a Read A the byte bounds stop fails before it fetches a document's rows, so a
+    // checkout past the bounds does not decode nearly everything first.
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for n in 0..3 {
+        fs::write(
+            root.path().join(format!("f{n}.js")),
+            format!("function f{n}(x) {{ return x; }}\n"),
+        )
+        .unwrap();
+    }
+    // Sorted last, and past Read A's per-document bound. Indexing admits it.
+    let mut large = String::from("// ");
+    large.push_str(&"x".repeat(2 * 1024 * 1024));
+    fs::write(root.path().join("z.js"), large).unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut options = IndexOptions::new(root.path().into());
+    options.max_file_bytes = 4 * 1024 * 1024;
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.writer().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let progress = std::sync::Mutex::new(Vec::new());
+    let response = store.evidence_response().unwrap();
+    let (read, counts) = whole_request(|| {
+        response
+            .architecture_native_regions(None, &mut || Ok(()), &|done, total| {
+                progress.lock().unwrap().push((done, total))
+            })
+            .map(|_| ())
+    });
+    let error = read.unwrap_err();
+    assert_eq!(error.to_string(), "bounded_work: architecture source");
+    assert_eq!(counts.document_reads, 4, "every header is read");
+    assert_eq!(counts.source_reads, 0, "no document's rows are fetched");
+    assert!(
+        progress.lock().unwrap().is_empty(),
+        "no document counts as read"
+    );
+}

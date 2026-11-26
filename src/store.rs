@@ -1945,12 +1945,17 @@ impl EvidenceResponse {
         let mut pending = Vec::new();
         let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
+        // Every row's sizes are charged first, from the kept identity or the header, so a
+        // read the byte bounds stop fails before it fetches any document's rows (#1313).
+        // The bounds and their error are unchanged.
+        enum Source {
+            Kept { bytes: i64, stored: u64 },
+            Fetch(Box<SelectedHeader>),
+        }
+        let mut rows = Vec::new();
         while let Some(row) = cursor.next()? {
             check()?;
-            ensure!(
-                pending.len() < 100_000,
-                "bounded_work: architecture documents"
-            );
+            ensure!(rows.len() < 100_000, "bounded_work: architecture documents");
             let key = DocumentKey {
                 source_set_id: row.get(0)?,
                 language: row.get(1)?,
@@ -1988,37 +1993,10 @@ impl EvidenceResponse {
                 .and_then(|kept| kept.documents.get(&key))
                 .filter(|document| Some(&document.table.identity) == identity.as_ref())
                 .map(|document| (document.table.bytes, document.table.stored_bytes));
-            if let Some((bytes, stored)) = reused {
+            let source = if let Some((bytes, stored)) = reused {
                 // The same budgets as a read, from the sizes this identity was read with.
-                source_bytes = source_bytes.saturating_add(bytes.max(0) as u64);
-                stored_bytes = stored_bytes.saturating_add(stored);
-                ensure!(
-                    bytes <= 2 * 1024 * 1024
-                        && source_bytes <= 256 * 1024 * 1024
-                        && stored_bytes <= 512 * 1024 * 1024,
-                    "bounded_work: architecture source"
-                );
-                if let Some(reason) =
-                    crate::syntax_bounds::module_only_reason(diagnostic.as_deref())
-                {
-                    evidence_gaps.insert(key.clone(), reason);
-                }
-                if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
-                    unparsed.insert(key.clone());
-                }
-                tables.push(NativeTable {
-                    identity: identity.expect("a kept document matched its identity"),
-                    fingerprint,
-                    bytes,
-                    stored_bytes: stored,
-                    read: false,
-                });
-                pending.push((key, None));
-                progress(pending.len(), total);
-                continue;
-            }
-            let header_sizes;
-            let fetched = {
+                Source::Kept { bytes, stored }
+            } else {
                 let progress_failure = Mutex::new(None);
                 let check = Mutex::new(&mut *check);
                 let expired = || match (*check.lock().unwrap())() {
@@ -2037,16 +2015,57 @@ impl EvidenceResponse {
                 if let Some(error) = progress_failure.lock().unwrap().take() {
                     return Err(error);
                 }
-                let header = header?;
-                header_sizes = (header.bytes, header.stored_bytes);
-                source_bytes = source_bytes.saturating_add(header.bytes.max(0) as u64);
-                stored_bytes = stored_bytes.saturating_add(header.stored_bytes);
-                ensure!(
-                    header.bytes <= 2 * 1024 * 1024
-                        && source_bytes <= 256 * 1024 * 1024
-                        && stored_bytes <= 512 * 1024 * 1024,
-                    "bounded_work: architecture source"
-                );
+                Source::Fetch(Box::new(header?))
+            };
+            let (bytes, stored) = match &source {
+                Source::Kept { bytes, stored } => (*bytes, *stored),
+                Source::Fetch(header) => (header.bytes, header.stored_bytes),
+            };
+            source_bytes = source_bytes.saturating_add(bytes.max(0) as u64);
+            stored_bytes = stored_bytes.saturating_add(stored);
+            ensure!(
+                bytes <= 2 * 1024 * 1024
+                    && source_bytes <= 256 * 1024 * 1024
+                    && stored_bytes <= 512 * 1024 * 1024,
+                "bounded_work: architecture source"
+            );
+            rows.push((key, diagnostic, identity, fingerprint, source));
+        }
+        drop(cursor);
+        for (key, diagnostic, identity, fingerprint, source) in rows {
+            if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
+                evidence_gaps.insert(key.clone(), reason);
+            }
+            if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
+                unparsed.insert(key.clone());
+            }
+            let header = match source {
+                Source::Kept { bytes, stored } => {
+                    tables.push(NativeTable {
+                        identity: identity.expect("a kept document matched its identity"),
+                        fingerprint,
+                        bytes,
+                        stored_bytes: stored,
+                        read: false,
+                    });
+                    pending.push((key, None));
+                    progress(pending.len(), total);
+                    continue;
+                }
+                Source::Fetch(header) => *header,
+            };
+            check()?;
+            let header_sizes = (header.bytes, header.stored_bytes);
+            let fetched = {
+                let progress_failure = Mutex::new(None);
+                let check = Mutex::new(&mut *check);
+                let expired = || match (*check.lock().unwrap())() {
+                    Ok(()) => false,
+                    Err(error) => {
+                        *progress_failure.lock().unwrap() = Some(error);
+                        true
+                    }
+                };
                 let fetched =
                     self.store
                         .fetch_selected_raw(&self.db, header, &selected, Some(&expired));
@@ -2055,12 +2074,6 @@ impl EvidenceResponse {
                 }
                 fetched?
             };
-            if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
-                evidence_gaps.insert(key.clone(), reason);
-            }
-            if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
-                unparsed.insert(key.clone());
-            }
             // A row whose identity is incomplete failed its header above.
             tables.push(NativeTable {
                 identity: identity.context(SelectedIntegrity(
