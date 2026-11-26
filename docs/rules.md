@@ -1381,6 +1381,19 @@ Reference samples accept at most 50 sites per edge. Snapshot admission also caps
 inventory at 100,000 documents and 512 MiB of aggregate stored input. These bounds
 refuse the entire result rather than silently dropping evidence.
 
+A refusal is `bounded_work` and names the bound it hit (#1321). The snapshot's byte
+bounds also report the observed value: `architecture document source: <path> is <N> bytes,
+over the 2 MiB limit` for the first such document in key order, `architecture source total:
+<N> bytes, over the 256 MiB limit`, `architecture stored total: <N> bytes, over the 512 MiB
+limit`, and `architecture retained input: <path> is <N> bytes, over the 16 MiB limit` for a
+present retained manifest or config input. The stored total and the documents' source total
+are the whole revision's, charged from every document's header and the retained inputs'
+stored lengths before any document's rows are read; a document over its bound is reported
+first, then the source total, then the stored total. A source total that retained
+manifests or the root TypeScript config carry over the bound reports the total counted
+when that input was charged. MCP and the browser answer the same text after `Architecture
+projection work bound exceeded: `, and the CLI the error itself.
+
 Syntax walks are bounded per document, to 128 levels and 1,000,000 visits, but one
 pathological file doesn't refuse the result (#554), and neither does a file with a syntax
 error (owner ruling 2026-10-31, #563). Walks skip what lies past the bounds and what lies

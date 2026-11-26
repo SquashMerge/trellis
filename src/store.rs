@@ -969,6 +969,100 @@ impl std::io::Write for EncodedSourceBudget {
         Ok(())
     }
 }
+/// Architecture Read A's byte limits ([rules](../docs/rules.md#work-bounds-and-located-failures)).
+/// Each refusal is `bounded_work` and names its limit and the observed value (#1321).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArchitectureByteLimits {
+    /// One document's captured source.
+    pub(crate) document: u64,
+    /// All admitted captured source, plus present retained-manifest and root-config bytes.
+    pub(crate) source: u64,
+    /// All stored bytes the read charges: each document's header charge, plus the retained
+    /// dependency and config inputs.
+    pub(crate) stored: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ARCHITECTURE_BYTE_LIMITS: std::cell::Cell<Option<ArchitectureByteLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
+impl ArchitectureByteLimits {
+    pub(crate) const READ_A: Self = Self {
+        document: 2 * 1024 * 1024,
+        source: 256 * 1024 * 1024,
+        stored: 512 * 1024 * 1024,
+    };
+
+    /// The limits a read on this thread applies: [`Self::READ_A`], or a test's own.
+    fn current() -> Self {
+        #[cfg(test)]
+        if let Some(limits) = TEST_ARCHITECTURE_BYTE_LIMITS.get() {
+            return limits;
+        }
+        Self::READ_A
+    }
+
+    /// Lowers this thread's limits until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn set_for_tests(limits: Self) -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_ARCHITECTURE_BYTE_LIMITS.set(None);
+            }
+        }
+        TEST_ARCHITECTURE_BYTE_LIMITS.set(Some(limits));
+        Reset
+    }
+
+    fn document_refusal(self, path: &str, bytes: u64) -> anyhow::Error {
+        anyhow::anyhow!(
+            "bounded_work: architecture document source: {path} is {bytes} bytes, over the {} limit",
+            limit_text(self.document)
+        )
+    }
+
+    fn check_source(self, total: u64) -> Result<()> {
+        ensure!(
+            total <= self.source,
+            "bounded_work: architecture source total: {total} bytes, over the {} limit",
+            limit_text(self.source)
+        );
+        Ok(())
+    }
+
+    fn check_stored(self, total: u64) -> Result<()> {
+        ensure!(
+            total <= self.stored,
+            "bounded_work: architecture stored total: {total} bytes, over the {} limit",
+            limit_text(self.stored)
+        );
+        Ok(())
+    }
+
+    /// A present retained manifest or config input stays within capture's own input bound.
+    fn check_retained(path: &str, bytes: u64) -> Result<()> {
+        ensure!(
+            bytes <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES,
+            "bounded_work: architecture retained input: {path} is {bytes} bytes, over the {} limit",
+            limit_text(crate::skipped_config::CONFIG_INPUT_MAX_BYTES)
+        );
+        Ok(())
+    }
+}
+
+/// `512 MiB` for a whole number of MiB, else `100-byte`.
+fn limit_text(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes}-byte")
+    }
+}
+
 const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(CASE WHEN NOT class THEN row_bytes END),0),COALESCE(sum(CASE WHEN class THEN row_bytes END),0) FROM (
 SELECT ?3+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_coverage_roles x WHERE x.vid=?1
 UNION ALL
@@ -1947,7 +2041,9 @@ impl EvidenceResponse {
         let mut stored_bytes = 0u64;
         // Every row's sizes are charged first, from the kept identity or the header, so a
         // read the byte bounds stop fails before it fetches any document's rows (#1313).
-        // The bounds and their error are unchanged.
+        // A refusal names the limit it hit and the whole revision's total (#1321).
+        let limits = ArchitectureByteLimits::current();
+        let mut oversized: Option<(String, u64)> = None;
         enum Source {
             Kept { bytes: i64, stored: u64 },
             Fetch(Box<SelectedHeader>),
@@ -2021,17 +2117,40 @@ impl EvidenceResponse {
                 Source::Kept { bytes, stored } => (*bytes, *stored),
                 Source::Fetch(header) => (header.bytes, header.stored_bytes),
             };
-            source_bytes = source_bytes.saturating_add(bytes.max(0) as u64);
+            let bytes = bytes.max(0) as u64;
+            source_bytes = source_bytes.saturating_add(bytes);
             stored_bytes = stored_bytes.saturating_add(stored);
-            ensure!(
-                bytes <= 2 * 1024 * 1024
-                    && source_bytes <= 256 * 1024 * 1024
-                    && stored_bytes <= 512 * 1024 * 1024,
-                "bounded_work: architecture source"
-            );
+            if oversized.is_none() && bytes > limits.document {
+                oversized = Some((key.path.clone(), bytes));
+            }
             rows.push((key, diagnostic, identity, fingerprint, source));
         }
         drop(cursor);
+        // The retained dependency and config inputs are charged by their stored length with
+        // the documents, so a refusal reports the whole stored total before any row is read.
+        for (column, corrupt) in [
+            (
+                "retained_dependencies",
+                "incompatible_index: invalid retained dependencies length",
+            ),
+            (
+                "retained_config",
+                "incompatible_index: invalid retained config length",
+            ),
+        ] {
+            let length: i64 = self.db.query_row(
+                &format!("SELECT length(CAST({column} AS BLOB)) FROM native_revisions WHERE id=?1"),
+                [&selected.key],
+                |row| row.get(0),
+            )?;
+            let length = u64::try_from(length).context(SelectedIntegrity(corrupt.into()))?;
+            stored_bytes = stored_bytes.saturating_add(length);
+        }
+        if let Some((path, bytes)) = oversized {
+            return Err(limits.document_refusal(&path, bytes));
+        }
+        limits.check_source(source_bytes)?;
+        limits.check_stored(stored_bytes)?;
         for (key, diagnostic, identity, fingerprint, source) in rows {
             // Each document's step checks first, kept or read, as the single pass did: a
             // read held at one document's progress gives way before the next one's.
@@ -2158,20 +2277,8 @@ impl EvidenceResponse {
             }
         }
         // Retained manifests belong to this selected row and this admitted transaction.
-        // Charge stored bytes before fetching JSON, and source bytes before hex decoding.
-        let dependency_bytes: i64 = self.db.query_row(
-            "SELECT length(CAST(retained_dependencies AS BLOB)) FROM native_revisions WHERE id=?1",
-            [&selected.key],
-            |row| row.get(0),
-        )?;
-        let dependency_bytes = u64::try_from(dependency_bytes).context(SelectedIntegrity(
-            "incompatible_index: invalid retained dependencies length".into(),
-        ))?;
-        stored_bytes = stored_bytes.saturating_add(dependency_bytes);
-        ensure!(
-            stored_bytes <= 512 * 1024 * 1024,
-            "bounded_work: architecture source"
-        );
+        // Their stored bytes were charged with the documents; source bytes are charged
+        // before hex decoding.
         check()?;
         let (source_set_id, native_revision_id, dependency_hash, retained): (String, String, String, String) = self.db.query_row(
             "SELECT source_set_id,native_revision_id,dependency_hash,retained_dependencies FROM native_revisions WHERE id=?1",
@@ -2229,11 +2336,8 @@ impl EvidenceResponse {
                     bytes, byte_length, ..
                 } => {
                     source_bytes = source_bytes.saturating_add(byte_length);
-                    ensure!(
-                        byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
-                            && source_bytes <= 256 * 1024 * 1024,
-                        "bounded_work: architecture source"
-                    );
+                    ArchitectureByteLimits::check_retained(path, byte_length)?;
+                    limits.check_source(source_bytes)?;
                     selected_ensure!(
                         byte_length.checked_mul(2) == Some(bytes.len() as u64),
                         "incompatible_index: corrupt retained {} length",
@@ -2274,19 +2378,6 @@ impl EvidenceResponse {
         }
         // The root TypeScript config rides the retained native config: a present
         // `tsconfig.json`, else a present `jsconfig.json`.
-        let config_bytes: i64 = self.db.query_row(
-            "SELECT length(CAST(retained_config AS BLOB)) FROM native_revisions WHERE id=?1",
-            [&selected.key],
-            |row| row.get(0),
-        )?;
-        let config_bytes = u64::try_from(config_bytes).context(SelectedIntegrity(
-            "incompatible_index: invalid retained config length".into(),
-        ))?;
-        stored_bytes = stored_bytes.saturating_add(config_bytes);
-        ensure!(
-            stored_bytes <= 512 * 1024 * 1024,
-            "bounded_work: architecture source"
-        );
         check()?;
         let retained_config: String = self.db.query_row(
             "SELECT retained_config FROM native_revisions WHERE id=?1",
@@ -2353,11 +2444,8 @@ impl EvidenceResponse {
                 continue;
             }
             source_bytes = source_bytes.saturating_add(byte_length);
-            ensure!(
-                byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
-                    && source_bytes <= 256 * 1024 * 1024,
-                "bounded_work: architecture source"
-            );
+            ArchitectureByteLimits::check_retained(path, byte_length)?;
+            limits.check_source(source_bytes)?;
             selected_ensure!(
                 byte_length.checked_mul(2) == Some(bytes.len() as u64),
                 "incompatible_index: corrupt retained {} length",

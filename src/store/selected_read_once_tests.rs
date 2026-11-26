@@ -354,11 +354,90 @@ fn architecture_read_a_checks_the_byte_bounds_before_it_reads_any_document() {
             .map(|_| ())
     });
     let error = read.unwrap_err();
-    assert_eq!(error.to_string(), "bounded_work: architecture source");
+    // #1321: the refusal names the limit, the document and its size.
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "bounded_work: architecture document source: z.js is {} bytes, over the 2 MiB limit",
+            2 * 1024 * 1024 + 3
+        )
+    );
     assert_eq!(counts.document_reads, 4, "every header is read");
     assert_eq!(counts.source_reads, 0, "no document's rows are fetched");
     assert!(
         progress.lock().unwrap().is_empty(),
         "no document counts as read"
     );
+}
+
+/// Read A of `store`'s head under `limits`, with the counts of the whole request.
+fn read_a_under(store: &Store, limits: ArchitectureByteLimits) -> (Result<()>, SelectedReadCounts) {
+    let _limits = ArchitectureByteLimits::set_for_tests(limits);
+    let response = store.evidence_response().unwrap();
+    whole_request(|| {
+        response
+            .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
+            .map(|_| ())
+    })
+}
+
+#[test]
+fn architecture_read_a_names_the_source_total_it_exceeds() {
+    // #1321: the total is the whole revision's, not the sum where the limit was crossed.
+    let (_state, root, store) = published_store(3);
+    let total: u64 = (0..3)
+        .map(|n| {
+            fs::metadata(root.path().join(format!("f{n}.js")))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    let limits = ArchitectureByteLimits {
+        source: total - 1,
+        ..ArchitectureByteLimits::READ_A
+    };
+    let (read, counts) = read_a_under(&store, limits);
+    assert_eq!(
+        read.unwrap_err().to_string(),
+        format!(
+            "bounded_work: architecture source total: {total} bytes, over the {}-byte limit",
+            total - 1
+        )
+    );
+    assert_eq!(counts.document_reads, 3, "every header is read");
+    assert_eq!(counts.source_reads, 0, "no document's rows are fetched");
+    let limits = ArchitectureByteLimits {
+        source: total,
+        ..ArchitectureByteLimits::READ_A
+    };
+    read_a_under(&store, limits).0.unwrap();
+}
+
+#[test]
+fn architecture_read_a_names_the_stored_total_it_exceeds() {
+    // #1321: the whole revision's stored total, whichever document crossed the limit.
+    let (_state, _root, store) = published_store(3);
+    let stored_limit = |stored| ArchitectureByteLimits {
+        stored,
+        ..ArchitectureByteLimits::READ_A
+    };
+    let (read, counts) = read_a_under(&store, stored_limit(1));
+    let message = read.unwrap_err().to_string();
+    let total: u64 = message
+        .strip_prefix("bounded_work: architecture stored total: ")
+        .and_then(|rest| rest.strip_suffix(" bytes, over the 1-byte limit"))
+        .unwrap_or_else(|| panic!("{message}"))
+        .parse()
+        .unwrap();
+    assert_eq!(counts.document_reads, 3, "every header is read");
+    assert_eq!(counts.source_reads, 0, "no document's rows are fetched");
+    let (read, _) = read_a_under(&store, stored_limit(total - 1));
+    assert_eq!(
+        read.unwrap_err().to_string(),
+        format!(
+            "bounded_work: architecture stored total: {total} bytes, over the {}-byte limit",
+            total - 1
+        )
+    );
+    read_a_under(&store, stored_limit(total)).0.unwrap();
 }

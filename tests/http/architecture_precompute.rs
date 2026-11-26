@@ -1784,6 +1784,45 @@ async fn architecture_incremental_work_limits() {
 }
 
 #[tokio::test]
+async fn architecture_http_names_the_work_bound_a_revision_exceeds() {
+    // #1321: the page's answer names the bound and observed value, as MCP does, not a
+    // generic storage message.
+    let (base, runtime, browser, key) =
+        super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    // The summary reads the core only with a rules file.
+    write_rules(&base, RULES);
+    let _limit = trellis::references::set_reference_work_limit_for_tests(1);
+    scheduler.capture_architecture_work_limit_for_tests();
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[("src/main.rs", Some("fn main() { let _value = 2; }\n"))],
+    )
+    .await;
+    let (response, _) = runtime.evidence_response().unwrap();
+    let internal = response
+        .architecture_full_for_tests(pin)
+        .unwrap_err()
+        .to_string();
+    drop(response);
+    let bound = internal
+        .strip_prefix("bounded_work: ")
+        .unwrap_or_else(|| panic!("{internal}"));
+    let query = format!(
+        "?indexGeneration={}&indexRevision={}",
+        pin.index_generation, pin.index_revision
+    );
+    let (status, answer) = summary(browser.router(), &key, &query).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(answer["error"]["code"], "bounded_work", "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        format!("Architecture projection work bound exceeded: {bound}")
+    );
+}
+
+#[tokio::test]
 async fn architecture_incremental_byte_scale_and_extraction() {
     let mut sources = NATIVE_SOURCES.to_vec();
     sources[0].1 = "fn main() { std::mem::drop(1); }\n";
