@@ -1790,8 +1790,13 @@ async fn architecture_http_names_the_work_bound_a_revision_exceeds() {
     let (base, runtime, browser, key) =
         super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    // The summary reads the core only with a rules file.
+    // The summary reads the core only with a rules file. Its build finishes first: the owner
+    // takes a captured limit at the next build it starts, which must be the edit's.
     write_rules(&base, RULES);
+    let (status, answer) = summary(browser.clone().router(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let head = current_pin(&scheduler);
+    runtime.settled_for_tests(Some(head)).await.unwrap();
     let _limit = trellis::references::set_reference_work_limit_for_tests(1);
     scheduler.capture_architecture_work_limit_for_tests();
     let pin = index_edit(
