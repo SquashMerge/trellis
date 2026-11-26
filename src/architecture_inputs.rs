@@ -734,7 +734,7 @@ fn strip_rows(input: &mut DocumentInput, regions: &mut [crate::native_records::C
 impl KeptNativeDocument {
     /// Whether any kept row still holds a copy of its document's key, native revision ID or
     /// proof ID.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn holds_row_copies(&self) -> bool {
         let empty = |document: &DocumentKey, revision: &str, proof: &str| {
             document.source_set_id.is_empty()
