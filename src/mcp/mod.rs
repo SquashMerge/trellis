@@ -756,22 +756,35 @@ fn evidence_read(
             Some(ArchitectureWait::AnswersBuilding) => ARCHITECTURE_ANSWER_TIME,
             _ => std::time::Duration::ZERO,
         };
-        let wait = deadline
-            .saturating_duration_since(runtime.mcp_clock_now())
-            .saturating_sub(reserve);
-        let still = runtime.architecture_still_building(&building, wait, &mut || {
-            anyhow::ensure!(!cancelled(), "cancelled");
-            Ok(())
-        });
+        let left = || {
+            deadline
+                .saturating_duration_since(runtime.mcp_clock_now())
+                .saturating_sub(reserve)
+        };
+        let basis = building.pin;
+        let mut waiting = building;
+        let still = loop {
+            let still = runtime.architecture_still_building(&waiting, left(), &mut || {
+                anyhow::ensure!(!cancelled(), "cancelled");
+                Ok(())
+            });
+            match still {
+                // #1329: the owner passed the pin (the head moved) and builds the new head.
+                // Wait for that one while time remains: a read admitted now would only find
+                // it building too.
+                Some(moved) if moved.pin != waiting.pin && !left().is_zero() => waiting = moved,
+                still => break still,
+            }
+        };
         match (still, architecture) {
-            // #1252: answered from the owner's state. Another admitted read could outlast the
-            // deadline on a loaded host or behind a publication's COMMIT.
+            // #1252: answered from the owner's state, with the admitted read's basis. Another
+            // admitted read could outlast the deadline on a loaded host or behind a
+            // publication's COMMIT, also once the head moved during the wait (#1329).
             (Some(still), Some(ArchitectureWait::AnswersBuilding)) => {
-                let pin = still.pin;
                 let mut envelope = architecture::failure(id, &anyhow::Error::new(still));
                 envelope["error"]["currentBasis"] = serde_json::json!({
-                    "indexGeneration": pin.index_generation.to_string(),
-                    "indexRevision": pin.index_revision
+                    "indexGeneration": basis.index_generation.to_string(),
+                    "indexRevision": basis.index_revision
                 });
                 return Ok((envelope, last_sampled));
             }
