@@ -257,6 +257,22 @@ impl CheckoutRuntime {
         *self.mcp_admitted_gate.lock().unwrap() = Some(gate);
     }
 
+    /// Run `gate` after every MCP read on this checkout that found its Architecture core
+    /// building and ended, before the call waits on the owner. It holds no read.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_mcp_building_gate_for_tests(&self, gate: Arc<dyn Fn() + Send + Sync>) {
+        *self.mcp_building_gate.lock().unwrap() = Some(gate);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn run_mcp_building_gate_for_tests(&self) {
+        let gate = self.mcp_building_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate();
+        }
+    }
+
     /// Run `hook` once, in the next evidence admission on this checkout, after it
     /// sampled `catchingUp` and before it opens the selected snapshot.
     #[cfg(feature = "test-support")]

@@ -752,6 +752,8 @@ fn evidence_read(
         };
         // The core is still building. The read has ended, so this wait holds nothing; the
         // next attempt answers from what the owner published.
+        #[cfg(feature = "test-support")]
+        runtime.run_mcp_building_gate_for_tests();
         let reserve = match architecture {
             Some(ArchitectureWait::AnswersBuilding) => ARCHITECTURE_ANSWER_TIME,
             _ => std::time::Duration::ZERO,
