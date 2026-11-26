@@ -25,6 +25,9 @@ REF = f"refs/heads/qualify/factory-{SHA}"
 REQUIRED = [f"{job} ({os_})" for os_ in ("ubuntu-latest", "macos-latest")
             for job in ("browser", "tests", "checks")]
 JQ = shutil.which("jq")
+REAL_AWK = shutil.which("awk")
+REAL_MV = shutil.which("mv")
+REAL_DATE = shutil.which("date")
 BACKSTOP = 60  # seconds; a hang backstop, not a speed bound
 TOKEN = "fake-token-never-printed"
 
@@ -41,6 +44,29 @@ case "$1 $2" in
 esac
 """
 
+# awk and mv stand-ins: transparent unless the test asks one to misbehave. The
+# script's two awk programs are told apart by the verdict's `-v base=`.
+FAKE_AWK = r"""#!/bin/sh
+case "$*" in *base=*) role=verdict ;; *) role=baseline ;; esac
+if [ "$role" = "${{FAKE_AWK_ROLE:-verdict}}" ]; then
+  case ${{FAKE_AWK:-}} in
+    fail) echo "awk: write error" >&2; exit 2 ;;
+    silent) exit 0 ;;
+    truncated) {awk} "$@" | head -n 3; exit 0 ;;
+    forged) echo "VERDICT pass 6"; exit 0 ;;
+  esac
+fi
+exec {awk} "$@"
+"""
+FAKE_MV = r"""#!/bin/sh
+if [ -n "${{FAKE_MV_FAIL:-}}" ]; then echo "mv: cannot move" >&2; exit 1; fi
+exec {mv} "$@"
+"""
+FAKE_DATE = r"""#!/bin/sh
+if [ -n "${{FAKE_DATE_GARBAGE:-}}" ]; then echo "not-a-time"; exit 0; fi
+exec {date} "$@"
+"""
+
 FAKE_GH = r"""#!{python}
 import json, os, subprocess, sys
 d = os.environ["FAKE_DIR"]
@@ -51,10 +77,18 @@ with open(os.path.join(d, "gh-calls")) as f:
 with open(os.path.join(d, "gh-responses.json")) as f:
     responses = json.load(f)
 r = responses[min(n, len(responses)) - 1]
+args = sys.argv[1:]
+# Like real gh, a GH_HOST without --hostname sends the request to that host.
+host = args[args.index("--hostname") + 1] if "--hostname" in args else os.environ.get("GH_HOST", "github.com")
+if host != "github.com":
+    sys.stderr.write("could not resolve host " + host + "\n")
+    sys.exit(1)
+if isinstance(r, dict):  # raw output, as if the filter's output were cut or mangled
+    sys.stdout.write(r["raw"])
+    sys.exit(0)
 if r == "down":
     sys.stderr.write("error connecting to api.github.com\n")
     sys.exit(1)
-args = sys.argv[1:]
 body = {{"total_count": len(r), "check_runs": r}}
 out = subprocess.run([{jq!r}, "-r", args[args.index("--jq") + 1]], input=json.dumps(body),
                      capture_output=True, text=True, check=True)
@@ -92,7 +126,10 @@ class CiVerify(unittest.TestCase):
         bin_.mkdir()
         (bin_ / "git").write_text(FAKE_GIT)
         (bin_ / "gh").write_text(FAKE_GH.format(python=sys.executable, jq=JQ or "jq"))
-        for name in ("git", "gh"):
+        (bin_ / "awk").write_text(FAKE_AWK.format(awk=REAL_AWK))
+        (bin_ / "mv").write_text(FAKE_MV.format(mv=REAL_MV))
+        (bin_ / "date").write_text(FAKE_DATE.format(date=REAL_DATE))
+        for name in ("git", "gh", "awk", "mv", "date"):
             (bin_ / name).chmod(0o755)
         self.env = {
             "PATH": f"{bin_}:/usr/bin:/bin",
@@ -137,7 +174,7 @@ class CiVerify(unittest.TestCase):
                                          f"push origin --delete {REF}"])
         # The repository comes from the push URL and is named in every call.
         for call in self.calls("gh"):
-            self.assertEqual(call[:3], ["api", "--paginate",
+            self.assertEqual(call[:5], ["api", "--hostname", "github.com", "--paginate",
                                         f"repos/SquashMerge/trellis/commits/{SHA}/check-runs?filter=all&per_page=100"])
             self.assertFalse({"-R", "--repo"} & set(call))
 
@@ -214,6 +251,59 @@ class CiVerify(unittest.TestCase):
         self.assertIn("GitHub unreachable for 1 s", err)
         self.assertEqual(self.pushes()[-1], f"push origin --delete {REF}")
 
+    def test_a_broken_evaluator_never_passes(self):
+        # Every check failed, or every check passed: an evaluator that fails, says
+        # nothing, is cut short or forges a pass is an internal error, never a pass.
+        for runs in (six("failure"), six()):
+            for mode in ("fail", "silent", "truncated", "forged"):
+                with self.subTest(conclusion=runs[0]["conclusion"], awk=mode):
+                    (self.dir / "gh-calls").unlink(missing_ok=True)
+                    code, err = self.run_script([[], runs], FAKE_AWK=mode)
+                    self.assertEqual(code, 75, err)
+                    self.assertIn("internal error", err)
+
+    def test_a_failed_baseline_never_lets_earlier_runs_pass(self):
+        earlier = six(start=10)
+        code, err = self.run_script([earlier, earlier], FAKE_AWK="fail", FAKE_AWK_ROLE="baseline")
+        self.assertEqual(code, 75, err)
+        self.assertIn("internal error", err)
+        self.assertEqual(self.pushes(), [])
+
+    def test_a_failed_pipeline_stage_never_passes(self):
+        code, err = self.run_script([[], six("failure")], FAKE_MV_FAIL="1")
+        self.assertEqual(code, 75, err)
+        self.assertIn("internal error", err)
+
+    def test_a_shell_error_is_never_an_answer(self):
+        # The clock reads garbage, so the script's arithmetic fails mid-run.
+        pending = six(**{"tests (ubuntu-latest)": "in_progress"})
+        code, err = self.run_script([[], pending], FAKE_DATE_GARBAGE="1")
+        self.assertEqual(code, 75, err)
+        self.assertIn("without a verdict", err)
+
+    def test_empty_or_mangled_api_output_never_passes(self):
+        line = "\t".join
+        cases = {
+            "empty": "",
+            "cut mid-line": "".join(line([str(100 + i), n, "completed", "success"]) + "\n" for i, n in enumerate(REQUIRED[:5]))
+                            + line(["105", REQUIRED[5], "compl"]),
+            "extra field": "".join(line([str(100 + i), n, "completed", "success", "x"]) + "\n" for i, n in enumerate(REQUIRED)),
+            "bad id": "".join(line([f"1{i}x", n, "completed", "success"]) + "\n" for i, n in enumerate(REQUIRED)),
+        }
+        for label, raw in cases.items():
+            with self.subTest(label):
+                (self.dir / "gh-calls").unlink(missing_ok=True)
+                code, err = self.run_script([[], {"raw": raw}], CI_VERIFY_START_WAIT_S="1")
+                self.assertEqual(code, 75, err)
+
+    def test_gh_always_asks_github_com(self):
+        # GH_HOST names another host: the script must still ask github.com.
+        code, err = self.run_script([[], six()], GH_HOST="ci.example.invalid",
+                                    GH_REPO="someone/else")
+        self.assertEqual(code, 0, err)
+        for call in self.calls("gh"):
+            self.assertEqual(call[call.index("--hostname") + 1], "github.com")
+
     def test_the_deadline_is_unavailable(self):
         code, err = self.run_script([[], six(**{"tests (ubuntu-latest)": "in_progress"})],
                                     CI_VERIFY_DEADLINE_S="1")
@@ -232,7 +322,7 @@ class CiVerify(unittest.TestCase):
                 (self.dir / "gh-calls").unlink(missing_ok=True)
                 code, err = self.run_script([[], six()], FAKE_PUSH_URL=url)
                 self.assertEqual(code, 0, err)
-                self.assertTrue(self.calls("gh")[0][2].startswith(f"repos/{repo}/commits/{SHA}/"))
+                self.assertTrue(self.calls("gh")[0][4].startswith(f"repos/{repo}/commits/{SHA}/"))
         rejected = [
             "/Users/someone/trellis",
             "file:///srv/trellis.git",

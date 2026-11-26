@@ -25,7 +25,14 @@
 #
 # GH_TOKEN, when set, comes from the factory's environment. Nothing here prints
 # it or the push URL (which may carry credentials).
+#
+# It fails closed: it exits 0 only through the one path that has read an exact,
+# complete pass from the evaluator, and 1 only through the failure path. Any
+# other exit, including a shell error, becomes 75 (see cleanup).
 set -u
+# The repository is github.com/O/R from the push URL; nothing in the
+# environment may send gh to another host or repository.
+unset GH_HOST GH_REPO
 
 deadline_s=${CI_VERIFY_DEADLINE_S:-5100}         # 85 min; verify_timeout_ms is 90 min
 start_wait_s=${CI_VERIFY_START_WAIT_S:-1200}     # 20 min for every required check to appear
@@ -46,10 +53,12 @@ checks (macos-latest)"
 
 say() { printf 'ci-verify: %s\n' "$*" >&2; }
 unavailable() { say "unavailable: $*"; exit 75; }
+internal() { say "internal error: $*"; exit 75; }
 
 started=$(date +%s)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/trellis-ci-verify.XXXXXX") || unavailable "cannot create a temporary directory"
 ref=""
+result=""
 pushed=""
 child=""
 dog=""
@@ -79,6 +88,11 @@ bounded() {
 cleanup() {
   code=$?
   trap - EXIT INT TERM HUP
+  # 0 and 1 are answers only when the pass or failure path chose them.
+  case $code:$result in
+    0:pass | 1:fail) ;;
+    *) [ "$code" = 75 ] || say "internal error: exit $code without a verdict"; code=75 ;;
+  esac
   [ -z "$child" ] || kill "$child" 2>/dev/null
   [ -z "$dog" ] || kill "$dog" 2>/dev/null
   # Delete only the branch this run pushed.
@@ -101,6 +115,7 @@ sha=$(cat "$tmp/out")
 case $sha in
   *[!0-9a-f]* | "") unavailable "HEAD is not a commit id" ;;
 esac
+[ "${#sha}" = 40 ] || [ "${#sha}" = 64 ] || unavailable "HEAD is not a commit id"
 ref="refs/heads/qualify/factory-$sha"
 
 # The factory sandbox's origin fetches from a local path, so gh must never infer
@@ -126,9 +141,9 @@ esac
 # API error; the caller retries until the outage window closes.
 last_ok=$started
 fetch() {
-  if bounded gh api --paginate "repos/$repo/commits/$sha/check-runs?filter=all&per_page=100" \
+  if bounded gh api --hostname github.com --paginate "repos/$repo/commits/$sha/check-runs?filter=all&per_page=100" \
     --jq '.check_runs[] | select(.app.slug == "github-actions") | [.id, .name, .status, (.conclusion // "")] | @tsv'; then
-    mv "$tmp/out" "$tmp/runs"
+    mv "$tmp/out" "$tmp/runs" || internal "cannot keep the API's answer"
     last_ok=$(date +%s)
     return 0
   fi
@@ -141,13 +156,22 @@ past_deadline() {
   [ $(($(date +%s) - started)) -ge "$deadline_s" ]
 }
 
+# Both awk programs refuse (exit 3) a line that is not "id<TAB>name<TAB>status
+# <TAB>conclusion" with a numeric id, a status, and a conclusion when completed.
+well_formed='NF != 4 || $1 !~ /^[0-9]+$/ || $3 == "" || ($3 == "completed" && $4 == "") { bad = 1; exit 3 }'
+
 # Check runs that already exist for this commit belong to earlier pushes; only
 # runs created after this push (higher ids) answer it.
 until fetch; do
   past_deadline && unavailable "deadline of ${deadline_s} s reached"
   sleep "$poll_s"
 done
-baseline=$(awk -F '\t' 'BEGIN { m = 0 } $1 + 0 > m { m = $1 + 0 } END { print m }' "$tmp/runs")
+baseline=$(awk -F '\t' "$well_formed"'
+  $1 + 0 > m { m = $1 + 0 }
+  END { if (bad) exit 3; print m + 0 }' "$tmp/runs") || internal "cannot read the commit's earlier check runs"
+case $baseline in
+  "" | *[!0-9]*) internal "cannot read the commit's earlier check runs" ;;
+esac
 
 bounded git push --porcelain origin "$sha:$ref" || unavailable "git push of $ref failed: $(head -c 300 "$tmp/err" | tr '\n' ' ')"
 pushed=1
@@ -158,41 +182,64 @@ if grep -q '^=' "$tmp/out"; then
   baseline=0
 fi
 say "pushed $sha to qualify/factory-$sha in $repo; waiting for its six rust.yml checks"
+printf '%s\n' "$required" >"$tmp/required" || internal "cannot write the required check list"
 
 while :; do
   if fetch; then
     # Newest run (highest id) per name among this push's runs, then one line
-    # per required check: "<state> <conclusion-or-status> <name>".
-    printf '%s\n' "$required" >"$tmp/required"
+    # per required check, "<state> <conclusion-or-status> <name>", and last a
+    # verdict line. A pass is the exact line "VERDICT pass 6" after exactly six
+    # success lines; anything else the evaluator says or fails to say is an
+    # internal error.
     awk -F '\t' -v base="$baseline" '
       NR == FNR { want[$0] = 1; order[++n] = $0; next }
+      '"$well_formed"'
       ($2 in want) && $1 + 0 > base && $1 + 0 > id[$2] + 0 { id[$2] = $1; st[$2] = $3; co[$2] = $4 }
       END {
+        if (bad) exit 3
         for (i = 1; i <= n; i++) {
           k = order[i]
-          if (!(k in id)) { print "missing - " k; continue }
-          if (st[k] != "completed") { print "pending " st[k] " " k; continue }
-          if (co[k] == "success") print "success success " k
-          else if (co[k] == "failure" || co[k] == "timed_out") print "failed " co[k] " " k
-          else print "unavailable " co[k] " " k
+          if (!(k in id)) { print "missing - " k; missing++ }
+          else if (st[k] != "completed") { print "pending " st[k] " " k }
+          else if (co[k] == "success") { print "success success " k; ok++ }
+          else if (co[k] == "failure" || co[k] == "timed_out") { print "failed " co[k] " " k; failed++ }
+          else { print "unavailable " co[k] " " k; unusable++ }
         }
-      }' "$tmp/required" "$tmp/runs" >"$tmp/verdict"
-    if grep -q '^failed ' "$tmp/verdict"; then
-      sed -n 's/^failed \([^ ]*\) \(.*\)/ci-verify: \2 concluded \1/p' "$tmp/verdict" >&2
-      say "repository verify failed for $sha"
-      exit 1
-    fi
-    if grep -q '^unavailable ' "$tmp/verdict"; then
-      unavailable "$(sed -n 's/^unavailable \([^ ]*\) \(.*\)/\2 concluded \1;/p' "$tmp/verdict" | tr '\n' ' ')"
-    fi
-    if ! grep -qv '^success ' "$tmp/verdict"; then
-      say "all six required checks passed for $sha"
-      exit 0
-    fi
-    if grep -q '^missing ' "$tmp/verdict" && [ $(($(date +%s) - pushed_at)) -ge "$start_wait_s" ]; then
-      unavailable "not started after ${start_wait_s} s: $(sed -n 's/^missing - //p' "$tmp/verdict" | tr '\n' ';')"
-    fi
+        if (failed) print "VERDICT fail"
+        else if (unusable) print "VERDICT unavailable"
+        else if (ok == n) print "VERDICT pass " ok + 0
+        else if (missing) print "VERDICT missing"
+        else print "VERDICT pending"
+      }' "$tmp/required" "$tmp/runs" >"$tmp/verdict" || internal "the check evaluator failed"
+    verdict=$(sed -n '$p' "$tmp/verdict") || internal "cannot read the evaluator's verdict"
+    case $verdict in
+      "VERDICT pass 6")
+        passed=$(grep -c '^success success ' "$tmp/verdict") || internal "the evaluator's pass lists no passed checks"
+        lines=$(grep -c '' "$tmp/verdict") || internal "cannot read the evaluator's verdict"
+        [ "$passed" = 6 ] && [ "$lines" = 7 ] || internal "the evaluator's pass does not list six passed checks"
+        say "all six required checks passed for $sha"
+        result=pass
+        exit 0
+        ;;
+      "VERDICT fail")
+        grep -q '^failed ' "$tmp/verdict" || internal "the evaluator's failure names no failed check"
+        sed -n 's/^failed \([^ ]*\) \(.*\)/ci-verify: \2 concluded \1/p' "$tmp/verdict" >&2
+        say "repository verify failed for $sha"
+        result=fail
+        exit 1
+        ;;
+      "VERDICT unavailable")
+        unavailable "$(sed -n 's/^unavailable \([^ ]*\) \(.*\)/\2 concluded \1;/p' "$tmp/verdict" | tr '\n' ' ')"
+        ;;
+      "VERDICT missing")
+        if [ $(($(date +%s) - pushed_at)) -ge "$start_wait_s" ]; then
+          unavailable "not started after ${start_wait_s} s: $(sed -n 's/^missing - //p' "$tmp/verdict" | tr '\n' ';')"
+        fi
+        ;;
+      "VERDICT pending") ;;
+      *) internal "the check evaluator gave no verdict" ;;
+    esac
   fi
-  past_deadline && unavailable "deadline of ${deadline_s} s reached; still waiting: $(grep -v '^success ' "$tmp/verdict" 2>/dev/null | sed 's/^[^ ]* [^ ]* //' | tr '\n' ';')"
+  past_deadline && unavailable "deadline of ${deadline_s} s reached; still waiting: $(grep -v -e '^success ' -e '^VERDICT ' "$tmp/verdict" 2>/dev/null | sed 's/^[^ ]* [^ ]* //' | tr '\n' ';')"
   sleep "$poll_s"
 done
