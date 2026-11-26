@@ -368,6 +368,32 @@ pub fn signal_daemon_marker(
     }
 }
 
+/// Remove what a fixture daemon that a test signalled to death left of a long
+/// data root's private socket directory, `/tmp/trellis-<euid>-<hash>` (#1338).
+/// A clean exit removes it in `SocketOwner::drop`; SIGTERM and SIGKILL skip that.
+/// Call it once the daemon no longer serves `socket`. Only a socket file in such
+/// a directory is removed, then the directory if it is empty; an in-tree
+/// `run/daemon.sock` is left alone.
+pub fn remove_killed_daemon_socket(socket: &std::path::Path) {
+    use std::os::unix::fs::FileTypeExt;
+    let Some(dir) = socket.parent() else {
+        return;
+    };
+    let prefix = format!("trellis-{}-", unsafe { libc::geteuid() });
+    if dir.parent() != Some(std::path::Path::new("/tmp"))
+        || !dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix))
+    {
+        return;
+    }
+    if std::fs::symlink_metadata(socket).is_ok_and(|meta| meta.file_type().is_socket()) {
+        let _ = std::fs::remove_file(socket);
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 /// Whether `pid` is still running. A process that has exited but not yet been
 /// reaped by its parent (a zombie) is not running.
 pub fn process_running(pid: libc::pid_t) -> bool {

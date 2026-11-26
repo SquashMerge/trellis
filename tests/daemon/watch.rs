@@ -652,6 +652,8 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_source_after_edit() {
                 assert!(Instant::now() < until, "daemon did not release its socket");
                 std::thread::sleep(Duration::from_millis(20));
             }
+            // SIGTERM skipped the daemon's own socket cleanup (#1338).
+            trellis::testing::remove_killed_daemon_socket(&socket);
             // Inspect the published source in-process; CLI export no longer exists.
             use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
             let (cache, data) = if cfg!(target_os = "macos") {
