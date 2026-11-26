@@ -36,7 +36,8 @@ fn replay(
     patched: BTreeSet<DocumentKey>,
     workers: usize,
 ) -> incremental::IncrementalReferences {
-    let preparation = incremental::prepare_with_workers(snapshot, workers, &mut || Ok(())).unwrap();
+    let preparation =
+        incremental::prepare_with_workers(snapshot, workers, None, &mut || Ok(())).unwrap();
     incremental::finish_incremental(
         snapshot,
         preparation,
@@ -138,7 +139,10 @@ fn single(snapshot: &Snapshot, raw: bool, ambiguous: bool) -> CompletedFile {
         .iter()
         .position(|doc| doc.key.path == "src/lib.rs")
         .unwrap();
-    let mut catalogs = build_catalogs(read, 1_000_000, check).unwrap();
+    let mut catalogs = build_catalogs(read, 1_000_000, RustSource::Fresh { keep: false }, check)
+        .unwrap()
+        .unwrap()
+        .0;
     let (declared, _) =
         declared_targets(read.docs, &mut catalogs.rust_execution.work, check).unwrap();
     let locate = |document, sid: &str| {
@@ -182,7 +186,10 @@ fn single(snapshot: &Snapshot, raw: bool, ambiguous: bool) -> CompletedFile {
         check,
     )
     .unwrap();
-    let mut fresh = build_catalogs(read, 1_000_000, check).unwrap();
+    let mut fresh = build_catalogs(read, 1_000_000, RustSource::Fresh { keep: false }, check)
+        .unwrap()
+        .unwrap()
+        .0;
     let (declared, _) = declared_targets(read.docs, &mut fresh.rust_execution.work, check).unwrap();
     let sorted_locate =
         |document, sid: &str| declared.contains(&(document, sid)).then_some(document);
@@ -249,7 +256,10 @@ fn full_source_facts_match_actual_work_sites_and_raw_requests() {
         request: &request,
     };
     let limit = work::reference_limit(read.docs.len(), admitted.total_bytes);
-    let mut catalogs = build_catalogs(read, limit, check).unwrap();
+    let mut catalogs = build_catalogs(read, limit, RustSource::Fresh { keep: false }, check)
+        .unwrap()
+        .unwrap()
+        .0;
     declared_targets(read.docs, &mut catalogs.rust_execution.work, check).unwrap();
     assert_eq!(
         base.work_used,
@@ -626,7 +636,7 @@ fn batch_remaining_matches_full() {
         .find(|source| source.plan.is_some())
         .unwrap();
     Arc::make_mut(clean.plan.as_mut().unwrap()).prepared_work = limit + 1;
-    let prepared = incremental::prepare_with_workers(&snapshot, 2, &mut || Ok(())).unwrap();
+    let prepared = incremental::prepare_with_workers(&snapshot, 2, None, &mut || Ok(())).unwrap();
     let error = incremental::finish_incremental(
         &snapshot,
         prepared,
@@ -801,7 +811,8 @@ fn replay_membership_disagreement_and_missing_plans_are_ordinary_failures() {
                 .packages
                 .clear();
         }
-        let preparation = incremental::prepare_with_workers(&snapshot, 1, &mut || Ok(())).unwrap();
+        let preparation =
+            incremental::prepare_with_workers(&snapshot, 1, None, &mut || Ok(())).unwrap();
         let error = incremental::finish_incremental(
             &snapshot,
             preparation,
@@ -928,4 +939,175 @@ fn patch_unresolved_target() {
         request: &request,
     };
     assert!(incremental::patch_source_targets(&retained, read, &mut BTreeMap::new()).is_err());
+}
+
+/// Kept syntax stands in for each document's stored version with its content hash.
+fn kept_full(snapshot: &Snapshot) -> (ReferenceBase, KeptSyntax) {
+    let versions: Vec<String> = snapshot
+        .documents
+        .iter()
+        .map(|doc| doc.file.hash.clone())
+        .collect();
+    let mut check = || Ok(());
+    let request = parallel_check::RequestCheck::new(&mut check);
+    let (base, kept) = request
+        .result(resolve_keeping(
+            snapshot,
+            Sources::all(),
+            MAX_SAMPLE_LIMIT,
+            2,
+            Some(&versions),
+            &request,
+        ))
+        .unwrap();
+    (base, kept.unwrap())
+}
+
+fn kept_prepare(
+    snapshot: &Snapshot,
+    kept: &KeptSyntax,
+    dirty: &BTreeSet<DocumentKey>,
+) -> ReferencePreparation {
+    let versions: Vec<String> = snapshot
+        .documents
+        .iter()
+        .map(|doc| doc.file.hash.clone())
+        .collect();
+    incremental::prepare_with_workers(
+        snapshot,
+        2,
+        Some(KeptRead {
+            syntax: Some(kept),
+            versions: &versions,
+            dirty,
+        }),
+        &mut || Ok(()),
+    )
+    .unwrap()
+}
+
+const KEPT_FILES: &[(&str, &str)] = &[
+    (
+        "src/0.rs",
+        "#[macro_use]\nextern crate core;\npub fn zero() {}\n",
+    ),
+    (
+        "src/lib.rs",
+        "#[macro_use]\nmod early;\npub mod a;\npub mod b;\npub fn run() { crate::a::f(); if true { crate::b::g(); } }\n",
+    ),
+    ("src/early.rs", "macro_rules! m { () => {}; }\n"),
+    (
+        "src/a.rs",
+        "pub fn f() { let x = 1; { let _ = x + 2; } }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn t() { f(); }\n}\n",
+    ),
+    (
+        "src/b.rs",
+        "use crate::a::*;\npub fn g() { f(); println!(\"{}\", 1); }\n",
+    ),
+    ("app.js", "import x from './other.js'; x();\n"),
+    ("other.js", "export default function x() {}\n"),
+];
+
+/// A kept Rust catalog with a changed file's own phases spliced in is the catalog a full build
+/// computes, with the same Work (#1315); when the change would move another file's result, the
+/// kept catalog declines and the build parses every file.
+#[test]
+fn kept_rust_catalog_equals_a_fresh_one() {
+    let mut reused = Vec::new();
+    for (path, text, kept) in [
+        // Body edits: the same blocks, more or fewer expression nodes.
+        (
+            "src/a.rs",
+            "pub fn f() { let x = 7; { let _ = x + 2; } }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn t() { f(); }\n}\n",
+            true,
+        ),
+        (
+            "src/a.rs",
+            "pub fn f() { let x = 1 + 2 * 3; { let _ = (x + 2, x); } }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn t() { f(); f(); }\n}\n",
+            true,
+        ),
+        // A `macro_use` a later file spells after an earlier one: the same outgoing state.
+        (
+            "src/b.rs",
+            "use crate::a::*;\n#[macro_use]\nextern crate core;\npub fn g() { f(); println!(\"{}\", 2); }\n",
+            true,
+        ),
+        // A new `macro_rules!` name: read again from every text, not kept.
+        (
+            "src/b.rs",
+            "use crate::a::*;\nmacro_rules! n { () => {}; }\npub fn g() { f(); println!(\"{}\", 1); }\n",
+            true,
+        ),
+        // A parser error in a changed file.
+        (
+            "src/b.rs",
+            "use crate::a::*;\npub fn g() { f(); println!(\"{}\", 1) ) }\n",
+            true,
+        ),
+        // A new block moves every later scope ID: declined, built afresh.
+        (
+            "src/a.rs",
+            "pub fn f() { let x = 1; { let _ = x + 2; } { } }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn t() { f(); }\n}\n",
+            false,
+        ),
+        // Without the first `macro_use`, later files' scans read differently: declined.
+        ("src/0.rs", "pub fn zero() {}\n", false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let before = parallel_tests::snapshot_in(root.path(), KEPT_FILES);
+        let (base, kept_syntax) = kept_full(&before);
+        let after = parallel_tests::snapshot_in(root.path(), &[(path, text)]);
+        let dirty = BTreeSet::from([after.documents[document(&after, path)].key.clone()]);
+        let incremental = kept_prepare(&after, &kept_syntax, &dirty);
+        let fresh = incremental::prepare_with_workers(&after, 2, None, &mut || Ok(())).unwrap();
+        let (a, b) = (incremental.catalogs_for_tests(), fresh.catalogs_for_tests());
+        assert_eq!(a.parsed.is_some(), kept, "{path}: {text}");
+        assert_eq!(a.rust.exact_digest(), b.rust.exact_digest(), "{text}");
+        assert_eq!(
+            a.rust_execution.work.used, b.rust_execution.work.used,
+            "catalog Work: {text}"
+        );
+        if kept {
+            let parsed = a.parsed.as_ref().unwrap();
+            let sorted: Vec<_> = {
+                let mut keys: Vec<_> = after.documents.iter().map(|doc| &doc.key).collect();
+                keys.sort();
+                keys
+            };
+            for (i, key) in sorted.iter().enumerate() {
+                assert_eq!(
+                    parsed[i],
+                    key.language != "rust" || key.path == path,
+                    "{key:?} parsed"
+                );
+            }
+        }
+        // Only a kept build carries its syntax on.
+        assert!(incremental.kept.is_some() && fresh.kept.is_none());
+        // A changed catalog digest builds in full (`RustCatalogChanged`): no source is reused.
+        if incremental.rust_digest != base.rust_catalog_digest() {
+            continue;
+        }
+        reused.push(text);
+        let oracle = full(&after, 2);
+        for preparation in [incremental, fresh] {
+            let result = incremental::finish_incremental(
+                &after,
+                preparation,
+                &base,
+                &dirty,
+                &BTreeSet::new(),
+                &mut || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                result.references.canonical().unwrap(),
+                oracle.canonical().unwrap(),
+                "{text}"
+            );
+        }
+    }
+    // The body edits keep the digest; the other kept cases change it (a new binding, a new
+    // macro-rules name, a parser error) and build in full.
+    assert_eq!(reused.len(), 2, "{reused:?}");
 }

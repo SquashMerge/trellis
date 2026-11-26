@@ -1912,12 +1912,18 @@ fn architecture_kept_read_a_equals_a_full_read_a_at_a_new_revision() {
     assert_eq!(all.len(), first.snapshot.documents.len());
     let first_revision = first.fingerprints.native_revision.clone();
     assert!(
-        kept.lock().unwrap().is_none(),
+        kept.lock().unwrap().native.is_none(),
         "the build holds the documents"
     );
     drop(first);
     assert_eq!(
-        kept.lock().unwrap().as_ref().unwrap().documents.len(),
+        kept.lock()
+            .unwrap()
+            .native
+            .as_ref()
+            .unwrap()
+            .documents
+            .len(),
         all.len()
     );
     // A body edit, an added and a deleted document, at a new native revision.
@@ -1958,7 +1964,14 @@ fn architecture_kept_read_a_that_stops_keeps_every_document() {
     let (_state, root, store) = incremental_checkout();
     let kept = KeptSlot::default();
     drop(kept_read(&store, &kept, &mut || Ok(())).unwrap());
-    let documents = kept.lock().unwrap().as_ref().unwrap().documents.len();
+    let documents = kept
+        .lock()
+        .unwrap()
+        .native
+        .as_ref()
+        .unwrap()
+        .documents
+        .len();
     write(
         root.path(),
         "crates/alpha/src/util.rs",
@@ -1974,7 +1987,13 @@ fn architecture_kept_read_a_that_stops_keeps_every_document() {
     });
     assert!(stopped.err().unwrap().to_string().starts_with("cancelled"));
     assert_eq!(
-        kept.lock().unwrap().as_ref().unwrap().documents.len(),
+        kept.lock()
+            .unwrap()
+            .native
+            .as_ref()
+            .unwrap()
+            .documents
+            .len(),
         documents
     );
     let delta = kept_read(&store, &kept, &mut || Ok(())).unwrap();
@@ -1997,7 +2016,14 @@ fn architecture_kept_read_a_that_stops_late_keeps_every_document() {
         })
         .unwrap(),
     );
-    let documents = kept.lock().unwrap().as_ref().unwrap().documents.len();
+    let documents = kept
+        .lock()
+        .unwrap()
+        .native
+        .as_ref()
+        .unwrap()
+        .documents
+        .len();
     write(
         root.path(),
         "crates/alpha/src/util.rs",
@@ -2020,7 +2046,7 @@ fn architecture_kept_read_a_that_stops_late_keeps_every_document() {
         };
         assert!(error.to_string().starts_with("cancelled"), "{error:#}");
         let kept = kept.lock().unwrap();
-        let native = kept.as_ref().expect("the kept documents stay");
+        let native = kept.native.as_ref().expect("the kept documents stay");
         assert_eq!(native.documents.len(), documents, "stopped at check {stop}");
         stopped.push(stop);
     }

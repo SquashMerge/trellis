@@ -399,8 +399,19 @@ pub(crate) struct ArchitectureInput {
     kept: Option<KeptSlot>,
 }
 
-/// The owner's kept native documents (#1315). Only the owner's builds take and return them.
-pub(crate) type KeptSlot = Arc<Mutex<Option<crate::store::KeptNative>>>;
+/// What the owner keeps between builds (#1315). Only the owner's builds take and return it.
+pub(crate) type KeptSlot = Arc<Mutex<Kept>>;
+
+/// Owner-level auxiliary state (#1315): inputs a later build reads instead of computing
+/// them again. No result depends on it.
+#[derive(Default)]
+pub(crate) struct Kept {
+    /// The native documents of the last Read A.
+    pub(crate) native: Option<crate::store::KeptNative>,
+    /// The syntax-bounds gaps and the Rust catalog's per-file half of the last build that
+    /// resolved references.
+    pub(crate) syntax: Option<Arc<crate::references::KeptSyntax>>,
+}
 
 impl Drop for ArchitectureInput {
     fn drop(&mut self) {
@@ -414,11 +425,28 @@ impl Drop for ArchitectureInput {
             std::mem::take(&mut self.regions),
             std::mem::take(&mut self.tables),
         );
-        *slot.lock().unwrap_or_else(|e| e.into_inner()) = kept;
+        slot.lock().unwrap_or_else(|e| e.into_inner()).native = kept;
     }
 }
 
 impl ArchitectureInput {
+    /// Each snapshot document's stored version, when the owner keeps this build's syntax.
+    fn kept_versions(&self) -> Option<Vec<String>> {
+        self.kept.as_ref()?;
+        (self.tables.len() == self.snapshot.documents.len()).then(|| {
+            self.tables
+                .iter()
+                .map(|table| table.identity.version_id.clone())
+                .collect()
+        })
+    }
+
+    fn keep_syntax(&self, syntax: Option<crate::references::KeptSyntax>) {
+        if let (Some(slot), Some(syntax)) = (&self.kept, syntax) {
+            slot.lock().unwrap_or_else(|e| e.into_inner()).syntax = Some(Arc::new(syntax));
+        }
+    }
+
     /// The documents Read A read rather than took from kept documents.
     pub(crate) fn read_documents(&self) -> Vec<DocumentKey> {
         self.snapshot
@@ -519,7 +547,7 @@ impl EvidenceResponse {
         let (snapshot, regions, fingerprints, tables) = self
             .architecture_read_a_kept(
                 Some(pin),
-                held.as_mut().and_then(|held| held.as_mut()),
+                held.as_mut().and_then(|held| held.native.as_mut()),
                 check,
                 &|completed, total| {
                     progress(ArchitectureProgress {
@@ -594,7 +622,10 @@ impl ArchitectureCore {
             completed: 0,
             total: input.snapshot.documents.len(),
         });
-        let references = crate::references::resolve_all(&input.snapshot, check)?;
+        let versions = input.kept_versions();
+        let (references, syntax) =
+            crate::references::resolve_all_keeping(&input.snapshot, versions.as_deref(), check)?;
+        input.keep_syntax(syntax);
         #[cfg(feature = "test-support")]
         if ArchitectureExecutionObserver::current().is_some() {
             let limit = input.reference_limit(&mut || Ok(()))?;
@@ -905,8 +936,26 @@ mod engine {
                 return Ok(plan);
             }
         };
-        let references =
-            crate::references::prepare_incremental(&plan.read_a.input.snapshot, check)?;
+        let syntax = plan.read_a.input.kept.as_ref().and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .syntax
+                .clone()
+        });
+        let versions = plan.read_a.input.kept_versions();
+        let mut references = crate::references::prepare_incremental(
+            &plan.read_a.input.snapshot,
+            versions
+                .as_deref()
+                .map(|versions| crate::references::KeptRead {
+                    syntax: syntax.as_deref(),
+                    versions,
+                    dirty: &changed.dirty,
+                }),
+            check,
+        )?;
+        drop(syntax);
+        plan.read_a.input.keep_syntax(references.kept.take());
         let base = plan.base.as_ref().expect("incremental decision has a base");
         if !changed.native.is_empty() {
             for (current, old, reason) in [

@@ -37,6 +37,97 @@ pub(crate) struct ReferencePreparation {
     pub(crate) javascript_digest: [u8; 32],
     pub(crate) java_digest: [u8; 32],
     workers: usize,
+    /// This build's syntax, for the next one (#1315), when the caller keeps it.
+    pub(crate) kept: Option<KeptSyntax>,
+}
+
+/// What a build keeps of its syntax for the next one (#1315): each document's syntax-bounds
+/// gap and the first half of its Rust catalog, valid for the same document inventory and
+/// manifests, document by document while its stored version and parse-work flag hold.
+pub(crate) struct KeptSyntax {
+    identity: SyntaxIdentity,
+    gaps: Vec<Option<syntax_bounds::SyntaxGap>>,
+    rust: rust::kept::Prepared,
+}
+
+/// What kept syntax is valid for: by sorted document, its key, stored version and parse-work
+/// flag, and the manifests.
+#[derive(PartialEq, Eq)]
+struct SyntaxIdentity {
+    order: Vec<DocumentKey>,
+    versions: Vec<String>,
+    unparsed: Vec<bool>,
+    manifests: [u8; 32],
+}
+
+impl SyntaxIdentity {
+    /// `docs` in sorted order; `versions` in snapshot order, `sorted` mapping it.
+    fn of(
+        snapshot: &Snapshot,
+        docs: &[&DocumentInput],
+        sorted: &[usize],
+        versions: Option<&[String]>,
+    ) -> Result<Option<Self>> {
+        let Some(versions) = versions else {
+            return Ok(None);
+        };
+        ensure!(
+            versions.len() == sorted.len(),
+            "store_unavailable: kept syntax inventory"
+        );
+        let mut by_document = vec![String::new(); docs.len()];
+        for (i, &position) in sorted.iter().enumerate() {
+            by_document[position].clone_from(&versions[i]);
+        }
+        Ok(Some(Self {
+            order: docs.iter().map(|doc| doc.key.clone()).collect(),
+            versions: by_document,
+            unparsed: docs
+                .iter()
+                .map(|doc| snapshot.unparsed.contains(&doc.key))
+                .collect(),
+            manifests: crate::architecture_core::dependencies::manifest_digest(&snapshot.manifests),
+        }))
+    }
+}
+
+impl KeptSyntax {
+    /// `docs` and `gaps` in sorted order; `versions` in snapshot order, `sorted` mapping it.
+    pub(super) fn new(
+        snapshot: &Snapshot,
+        docs: &[&DocumentInput],
+        sorted: &[usize],
+        versions: &[String],
+        gaps: Vec<Option<syntax_bounds::SyntaxGap>>,
+        rust: rust::kept::Prepared,
+    ) -> Result<Self> {
+        ensure!(
+            gaps.len() == docs.len(),
+            "store_unavailable: kept syntax inventory"
+        );
+        Ok(Self {
+            identity: SyntaxIdentity::of(snapshot, docs, sorted, Some(versions))?
+                .context("store_unavailable: kept syntax inventory")?,
+            gaps,
+            rust,
+        })
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+impl ReferencePreparation {
+    pub(super) fn catalogs_for_tests(&self) -> &Catalogs {
+        &self.catalogs
+    }
+}
+
+/// What an incremental build reads with kept syntax (#1315).
+pub(crate) struct KeptRead<'a> {
+    pub(crate) syntax: Option<&'a KeptSyntax>,
+    /// Each snapshot document's stored version, in snapshot order.
+    pub(crate) versions: &'a [String],
+    /// The sources this build extracts again, which need their syntax.
+    pub(crate) dirty: &'a BTreeSet<DocumentKey>,
 }
 
 #[derive(Default, Debug, Clone, Serialize)]
@@ -46,6 +137,9 @@ pub struct ReferenceReplayTrace {
     pub logical_work: usize,
     pub file_references: Vec<DocumentKey>,
     pub batches: Vec<(Vec<DocumentKey>, usize)>,
+    /// An incremental build's documents whose syntax it parsed (#1315): with a kept Rust
+    /// catalog, the dirty sources and every document outside Rust.
+    pub parsed: Vec<DocumentKey>,
 }
 
 pub(crate) struct IncrementalReferences {
@@ -55,14 +149,16 @@ pub(crate) struct IncrementalReferences {
 
 pub(crate) fn prepare_incremental(
     snapshot: &Snapshot,
+    kept: Option<KeptRead<'_>>,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<ReferencePreparation> {
-    prepare_with_workers(snapshot, crate::parallel::default_workers(), check)
+    prepare_with_workers(snapshot, crate::parallel::default_workers(), kept, check)
 }
 
 pub(super) fn prepare_with_workers(
     snapshot: &Snapshot,
     workers: usize,
+    kept: Option<KeptRead<'_>>,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<ReferencePreparation> {
     let workers = workers.clamp(1, crate::parallel::MAX_WORKERS);
@@ -77,7 +173,7 @@ pub(super) fn prepare_with_workers(
             document_map,
             total_bytes,
         } = admit_snapshot(snapshot, check)?;
-        let (trees, gaps): (Vec<_>, Vec<_>) = map_all(&docs, workers, &request, |doc| {
+        let syntax = |doc: &DocumentInput| -> Result<(Tree, Option<syntax_bounds::SyntaxGap>)> {
             let check = &mut request.worker();
             let (tree, unread) = syntax(doc, snapshot.unparsed.contains(&doc.key), check)?;
             let gap = if unread {
@@ -88,9 +184,109 @@ pub(super) fn prepare_with_workers(
                 syntax_bounds::scan(tree.root_node(), check)?
             };
             Ok((tree, gap))
-        })?
+        };
+        // With kept syntax for this inventory and these manifests, a Rust document whose
+        // version and parse-work flag are unchanged and whose source is clean is not parsed:
+        // its gap and its part of the Rust catalog are kept (#1315).
+        let keeping = kept.is_some();
+        let (kept_syntax, versions, dirty) = match kept {
+            Some(KeptRead {
+                syntax,
+                versions,
+                dirty,
+            }) => (syntax, Some(versions), Some(dirty)),
+            None => (None, None, None),
+        };
+        let current = SyntaxIdentity::of(snapshot, &docs, &sorted, versions)?;
+        let usable = kept_syntax.filter(|kept| {
+            current.as_ref().is_some_and(|current| {
+                kept.identity.order == current.order && kept.identity.manifests == current.manifests
+            })
+        });
+        let mut parsed = vec![true; docs.len()];
+        let mut changed = BTreeSet::new();
+        if let (Some(kept), Some(current)) = (usable, &current) {
+            for (i, doc) in docs.iter().enumerate() {
+                let same = kept.identity.versions[i] == current.versions[i]
+                    && kept.identity.unparsed[i] == current.unparsed[i];
+                if doc.key.language == "rust" {
+                    if !same {
+                        changed.insert(i);
+                    }
+                    parsed[i] = !same || dirty.is_some_and(|dirty| dirty.contains(&doc.key));
+                }
+            }
+        }
+        let placeholder = syntax_bounds::unread_tree("");
+        let (mut trees, mut gaps): (Vec<_>, Vec<_>) = map_all(
+            &(0..docs.len()).collect::<Vec<_>>(),
+            workers,
+            &request,
+            |&i| match usable {
+                Some(kept) if !parsed[i] => Ok((placeholder.clone(), kept.gaps[i].clone())),
+                _ => syntax(docs[i]),
+            },
+        )?
         .into_iter()
         .unzip();
+        let limit = work::reference_limit(docs.len(), total_bytes);
+        let selected = docs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, doc)| (!snapshot.evidence_gaps.contains_key(&doc.key)).then_some(i))
+            .collect::<Vec<_>>();
+        let mut built = None;
+        if let Some(kept) = usable {
+            built = build_catalogs(
+                ReadContext {
+                    snapshot,
+                    docs: &docs,
+                    trees: &trees,
+                    document_map: &document_map,
+                    selected: &selected,
+                    sample_limit: MAX_SAMPLE_LIMIT,
+                    workers,
+                    request: &request,
+                },
+                limit,
+                RustSource::Kept {
+                    prepared: &kept.rust,
+                    changed: &changed,
+                    parsed: &parsed,
+                },
+                check,
+            )?;
+        }
+        let (catalogs, prepared) = match built {
+            Some(built) => built,
+            None => {
+                // No kept catalog, or one that cannot take this change: parse the rest and
+                // build in full.
+                let rest: Vec<usize> = (0..docs.len()).filter(|&i| !parsed[i]).collect();
+                let reparsed = map_all(&rest, workers, &request, |&i| syntax(docs[i]))?;
+                for (i, (tree, gap)) in rest.into_iter().zip(reparsed) {
+                    trees[i] = tree;
+                    gaps[i] = gap;
+                    parsed[i] = true;
+                }
+                build_catalogs(
+                    ReadContext {
+                        snapshot,
+                        docs: &docs,
+                        trees: &trees,
+                        document_map: &document_map,
+                        selected: &selected,
+                        sample_limit: MAX_SAMPLE_LIMIT,
+                        workers,
+                        request: &request,
+                    },
+                    limit,
+                    RustSource::Fresh { keep: keeping },
+                    check,
+                )?
+                .context("store_unavailable: fresh Rust catalog")?
+            }
+        };
         let partial_files = docs
             .iter()
             .zip(&gaps)
@@ -106,26 +302,14 @@ pub(super) fn prepare_with_workers(
                     .map(|gap| gap.file(&doc.key))
             })
             .collect();
-        let selected = docs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, doc)| (!snapshot.evidence_gaps.contains_key(&doc.key)).then_some(i))
-            .collect::<Vec<_>>();
-        let limit = work::reference_limit(docs.len(), total_bytes);
-        let catalogs = build_catalogs(
-            ReadContext {
-                snapshot,
-                docs: &docs,
-                trees: &trees,
-                document_map: &document_map,
-                selected: &selected,
-                sample_limit: MAX_SAMPLE_LIMIT,
-                workers,
-                request: &request,
-            },
-            limit,
-            check,
-        )?;
+        let kept = match (current, prepared) {
+            (Some(identity), Some(rust)) => Some(KeptSyntax {
+                identity,
+                gaps: gaps.clone(),
+                rust,
+            }),
+            _ => None,
+        };
         let rust_digest = catalogs.rust.digest();
         let python_digest = catalogs.python.digest();
         let javascript_digest = javascript::digest(catalogs.javascript.as_ref());
@@ -150,6 +334,7 @@ pub(super) fn prepare_with_workers(
             javascript_digest,
             java_digest,
             workers,
+            kept,
         })
     })();
     request.result(result)
@@ -182,6 +367,7 @@ pub(crate) fn finish_incremental(
             javascript_digest,
             java_digest,
             workers,
+            kept: _,
         } = preparation;
         ensure!(
             base.identities.len() == order.len(),
@@ -208,6 +394,12 @@ pub(crate) fn finish_incremental(
         };
         let mut trace = ReferenceReplayTrace {
             catalog_work: catalogs.rust_execution.work.used,
+            parsed: docs
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| catalogs.parsed.as_ref().is_none_or(|parsed| parsed[i]))
+                .map(|(_, doc)| doc.key.clone())
+                .collect(),
             ..Default::default()
         };
         let mut executed = trace.catalog_work;
@@ -569,6 +761,7 @@ impl ReferenceBase {
             logical_work: self.work_used,
             file_references: selected.into_iter().map(key).collect(),
             batches,
+            parsed: (0..self.identities.len()).map(key).collect(),
         }
     }
 

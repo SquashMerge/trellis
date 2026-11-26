@@ -992,6 +992,21 @@ answer: the snapshot equals a full Read A's. A stopped or failed build returns t
 next one, a Read A that stops leaves them untouched, and they are dropped on a new index
 generation. The verify oracle and the full retry read every document.
 
+The owner also keeps the last build's syntax (#1315), for the same document inventory and
+manifests: each document's syntax-bounds gap, and the per-file half of the Rust catalog (each
+Rust file's scopes, bindings, imports, macro proofs and module edges, what its indexing and scan
+charged, and the cross-file macro state it passed on), not syntax trees. An incremental build
+parses only its Dirty sources, the Rust files whose stored version changed, and the documents
+outside Rust, whose catalogs it builds again. It indexes and scans each changed Rust file again
+from the state a full build scans it in, and splices the result in; the macro-rules names and
+the phases that read across files run on every build. So the catalog and its Work are a full
+build's. A changed file whose block-scope count or outgoing macro state differs would move
+other files' results: that build parses every Rust file and builds the catalog in full. A clean
+Rust source is resolved again without its syntax tree: the one tree read of its resolution,
+which of a private glob's names its scope spells (#986), is recorded in its charge plan and
+reused for the same number of names, which the unchanged catalog digest guarantees; anything
+else is an incremental failure, retried in full.
+
 A checkout keeps at most two results: the head's, and the one it replaced or an older retained
 revision a page is showing. The base is its newest eligible earlier successful core in the same
 generation and live-rules eligibility episode, with complete dependencies and metrics. Startup,

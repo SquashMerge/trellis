@@ -4,6 +4,7 @@ use super::shared::DeclarationId;
 use super::*;
 
 mod digest;
+pub(super) mod kept;
 
 type RouteKey = (usize, String);
 type Route = BTreeSet<RouteKey>;
@@ -26,6 +27,7 @@ struct ExportMemo {
     names: std::sync::Arc<Names>,
     consulted: Route,
 }
+#[derive(Clone)]
 struct ScopeIndex {
     ranges: Vec<(usize, usize, usize)>,
     max_ends: Vec<usize>,
@@ -118,7 +120,7 @@ struct Import {
 }
 /// A scope's imports in source order. Named imports are also indexed by binding name and star
 /// imports listed, so a name lookup reads only the imports that can bind it (#894).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Imports {
     all: Vec<Import>,
     named: BTreeMap<String, Vec<usize>>,
@@ -179,6 +181,7 @@ enum RootReading {
     /// Anything else, or a root scope that cannot rule the name out.
     Other,
 }
+#[derive(Clone)]
 struct Scope {
     document: usize,
     start: usize,
@@ -192,6 +195,7 @@ struct Scope {
     /// Something past the walk bounds was skipped here, so even an explicit name can collide.
     cut: bool,
 }
+#[derive(Clone)]
 struct ModuleEdge {
     scope: usize,
     name: String,
@@ -199,6 +203,7 @@ struct ModuleEdge {
     end: usize,
     child: Option<usize>,
 }
+#[derive(Clone)]
 pub(super) struct Catalog {
     scopes: Vec<Scope>,
     scope_indexes: BTreeMap<usize, ScopeIndex>,
@@ -246,7 +251,39 @@ pub(super) struct RustExecution {
     /// While `scan` is inside an expression statement whose macro calls are all
     /// statement macros: the scope of the outermost such statement.
     statement_owner: Option<usize>,
+    /// The private glob a site's resolution read in its tree, recorded for a later build
+    /// that resolves the site again without the tree (#1315).
+    glob: Option<GlobUse>,
     pub(super) work: Work,
+}
+
+/// Where a site's resolution reads its source's syntax: the tree, or, for a clean source
+/// resolved again without it (#1315), what an earlier resolution read there.
+#[derive(Clone, Copy)]
+pub(super) enum SiteSyntax<'a> {
+    Tree(&'a Tree),
+    Recorded(Option<&'a GlobUse>),
+}
+
+/// What [`RustResolver::drop_unused`] read in a site's syntax tree, for the number of names
+/// it was given (#1315). A clean source of a later build, whose catalog has the same digest,
+/// is given the same names, so its resolution reads this instead of the tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct GlobUse {
+    names: usize,
+    outcome: GlobOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+enum GlobOutcome {
+    /// No node spans the scope.
+    NoRoot,
+    /// The scope's syntax has an error.
+    Error,
+    /// The walk passed its bounds.
+    Bounded,
+    /// The walk ended: the names the scope never spells, `r#` removed, sorted.
+    Unseen(Vec<String>),
 }
 
 pub(super) struct RustResolver<'a> {
@@ -268,6 +305,10 @@ impl std::ops::DerefMut for RustResolver<'_> {
 }
 
 impl RustExecution {
+    /// What the last site's resolution read in its syntax tree, if anything.
+    pub(super) fn take_glob(&mut self) -> Option<GlobUse> {
+        self.glob.take()
+    }
     fn new(work: Work) -> Self {
         Self {
             export_memo: BTreeMap::new(),
@@ -278,6 +319,7 @@ impl RustExecution {
             #[cfg(test)]
             memos: true,
             statement_owner: None,
+            glob: None,
             work,
         }
     }
@@ -308,16 +350,8 @@ fn crate_root(
 }
 
 impl Catalog {
-    pub(super) fn new(
-        docs: &[&DocumentInput],
-        trees: &[Tree],
-        documents: &BTreeMap<DocumentKey, usize>,
-        workspace: &super::cargo_workspace::Workspace,
-        packages: &external::RustPackages,
-        work: Work,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Self, RustExecution)> {
-        let mut catalog = Self {
+    fn empty() -> Self {
+        Self {
             scopes: Vec::new(),
             scope_indexes: BTreeMap::new(),
             files: BTreeMap::new(),
@@ -330,99 +364,97 @@ impl Catalog {
             variants: BTreeMap::new(),
             shadows: MacroShadows::default(),
             statement_macros: Vec::new(),
-        };
-        let mut execution = RustExecution::new(work);
-        let mut result = catalog.resolver(&mut execution);
-        result.read_macro_rules(docs, trees, check)?;
-        let declarations = result.index_files(docs, trees, workspace, check)?;
-        let mut edges = Vec::new();
-        for (&document, &scope) in &result.files.clone() {
-            result.scan(
-                docs,
-                trees[document].root_node(),
-                scope,
-                &declarations,
-                &mut edges,
-                0,
-                check,
-            )?;
         }
-        // A parser error can hide an item from any scope of its file, or move it to another.
-        for scope in &mut result.scopes {
-            if trees[scope.document].root_node().has_error() {
-                scope.opaque = true;
-                scope.cut = true;
-            }
-        }
-        result.link_module_edges(docs, documents, &mut edges, check)?;
-        result.assign_parents(&edges, check)?;
-        result.mark_roots(docs, documents, workspace, &edges, check)?;
-        result.keep_lost_owners_unknown(docs, trees, &edges, check)?;
-        result.prove_known_macros(docs, packages, check)?;
-        result.build_scope_indexes(check)?;
-        Ok((catalog, execution))
+    }
+
+    /// Every file's own phases, then the phases that read across files (#1315 splits them so
+    /// that a later build can keep the first).
+    #[cfg(test)]
+    pub(super) fn new(
+        docs: &[&DocumentInput],
+        trees: &[Tree],
+        documents: &BTreeMap<DocumentKey, usize>,
+        workspace: &super::cargo_workspace::Workspace,
+        packages: &external::RustPackages,
+        work: Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Self, RustExecution)> {
+        let (prepared, execution) = kept::Prepared::build(docs, trees, workspace, work, check)?;
+        prepared.finish_owned(docs, documents, workspace, packages, execution, check)
     }
 }
 
 impl RustResolver<'_> {
-    /// The declarations of every Rust file by range, and each file's module scope.
-    fn index_files<'a>(
+    /// The phases that read across documents, after every file was indexed and scanned and
+    /// its scopes marked for a parser error. `has_error` is by document.
+    #[allow(clippy::too_many_arguments)] // The catalog's captured inputs stay explicit.
+    fn finish(
         &mut self,
-        docs: &[&'a DocumentInput],
-        trees: &[Tree],
+        docs: &[&DocumentInput],
+        has_error: &[bool],
+        documents: &BTreeMap<DocumentKey, usize>,
         workspace: &super::cargo_workspace::Workspace,
+        packages: &external::RustPackages,
+        edges: &mut [ModuleEdge],
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<DeclarationsByRange<'a>> {
-        let mut declarations = BTreeMap::new();
-        for (document, doc) in docs.iter().enumerate() {
-            if doc.key.language != "rust" {
+    ) -> Result<()> {
+        self.link_module_edges(docs, documents, edges, check)?;
+        self.assign_parents(edges, check)?;
+        self.mark_roots(docs, documents, workspace, edges, check)?;
+        self.keep_lost_owners_unknown(docs, has_error, edges, check)?;
+        self.prove_known_macros(docs, packages, check)?;
+        self.build_scope_indexes(check)
+    }
+}
+
+impl RustResolver<'_> {
+    /// One Rust file's declarations by range, and its module scope.
+    fn index_file<'a>(
+        &mut self,
+        document: usize,
+        doc: &'a DocumentInput,
+        tree: &Tree,
+        workspace: &super::cargo_workspace::Workspace,
+        declarations: &mut DeclarationsByRange<'a>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for declaration in &doc.declarations {
+            self.step(check)?;
+            // The file module can span exactly the same bytes as its sole item.
+            if declaration.kind == "module" && declaration.ancestors.is_empty() {
                 continue;
             }
-            for declaration in &doc.declarations {
-                self.step(check)?;
-                // The file module can span exactly the same bytes as its sole item.
-                if declaration.kind == "module" && declaration.ancestors.is_empty() {
-                    continue;
-                }
-                declarations
-                    .entry((document, declaration.range.start, declaration.range.end))
-                    .or_insert_with(Vec::new)
-                    .push(declaration);
-            }
-            if let Some(declaration) = doc
-                .declarations
-                .iter()
-                .find(|d| d.kind == "module" && d.ancestors.is_empty())
-            {
-                self.file_declarations.insert(
-                    document,
-                    DeclarationId {
-                        document,
-                        start: declaration.range.start,
-                        end: declaration.range.end,
-                        sid: declaration.syntax_id.clone(),
-                    },
-                );
-            }
-            let path = &doc.key.path;
-            let directory = if let Some(directory) = crate_root(workspace, doc) {
-                directory
-            } else if let Some(prefix) = path.strip_suffix("/mod.rs") {
-                prefix.to_owned()
-            } else {
-                path.strip_suffix(".rs").unwrap_or(path).to_owned()
-            };
-            let scope = self.add_scope(
-                document,
-                trees[document].root_node(),
-                None,
-                directory,
-                true,
-                check,
-            )?;
-            self.files.insert(document, scope);
+            declarations
+                .entry((document, declaration.range.start, declaration.range.end))
+                .or_default()
+                .push(declaration);
         }
-        Ok(declarations)
+        if let Some(declaration) = doc
+            .declarations
+            .iter()
+            .find(|d| d.kind == "module" && d.ancestors.is_empty())
+        {
+            self.file_declarations.insert(
+                document,
+                DeclarationId {
+                    document,
+                    start: declaration.range.start,
+                    end: declaration.range.end,
+                    sid: declaration.syntax_id.clone(),
+                },
+            );
+        }
+        let path = &doc.key.path;
+        let directory = if let Some(directory) = crate_root(workspace, doc) {
+            directory
+        } else if let Some(prefix) = path.strip_suffix("/mod.rs") {
+            prefix.to_owned()
+        } else {
+            path.strip_suffix(".rs").unwrap_or(path).to_owned()
+        };
+        let scope = self.add_scope(document, tree.root_node(), None, directory, true, check)?;
+        self.files.insert(document, scope);
+        Ok(())
     }
     /// A `mod name;` finds its file, and the binding of every `mod` learns its module scope.
     fn link_module_edges(
@@ -594,13 +626,13 @@ impl RustResolver<'_> {
     fn keep_lost_owners_unknown(
         &mut self,
         docs: &[&DocumentInput],
-        trees: &[Tree],
+        has_error: &[bool],
         edges: &[ModuleEdge],
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         let mut pending = Vec::new();
         for (&document, &owner) in &self.files.clone() {
-            if !trees[document].root_node().has_error() {
+            if !has_error[document] {
                 continue;
             }
             let file = &docs[document].file;
@@ -939,7 +971,7 @@ impl RustResolver<'_> {
     fn read_macro_rules(
         &mut self,
         docs: &[&DocumentInput],
-        trees: &[Tree],
+        has_error: &[bool],
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         for (document, doc) in docs.iter().enumerate() {
@@ -961,9 +993,7 @@ impl RustResolver<'_> {
             self.shadows.unread |= rules.unbounded;
             self.shadows.rules.extend(rules.names);
             // An attribute a parser error hides is read from the text instead.
-            if trees[document].root_node().has_error()
-                && (text.contains("macro_use") || text.contains("decl_macro"))
-            {
+            if has_error[document] && (text.contains("macro_use") || text.contains("decl_macro")) {
                 self.shadows.unread = true;
             }
         }
@@ -2974,7 +3004,7 @@ impl RustResolver<'_> {
     fn drop_unused(
         &mut self,
         doc: &DocumentInput,
-        tree: &Tree,
+        syntax: SiteSyntax<'_>,
         scope: usize,
         import: &Import,
         names: &mut Names,
@@ -2984,12 +3014,53 @@ impl RustResolver<'_> {
         if names.names.is_empty() {
             return Ok(false);
         }
-        let (start, end) = (self.scopes[scope].start, self.scopes[scope].end);
-        let Some(root) = tree.root_node().descendant_for_byte_range(start, end) else {
+        let outcome = match syntax {
+            SiteSyntax::Tree(tree) => {
+                let outcome = self.unseen(doc, tree, scope, import, names, check)?;
+                self.execution.glob = Some(GlobUse {
+                    names: names.names.len(),
+                    outcome: outcome.clone(),
+                });
+                outcome
+            }
+            SiteSyntax::Recorded(recorded) => {
+                let recorded = recorded.context("incremental glob without its syntax")?;
+                ensure!(
+                    recorded.names == names.names.len(),
+                    "incremental glob names changed"
+                );
+                if !matches!(recorded.outcome, GlobOutcome::NoRoot | GlobOutcome::Error) {
+                    self.charge(names.names.len(), check)?;
+                }
+                self.execution.glob = Some(recorded.clone());
+                recorded.outcome.clone()
+            }
+        };
+        let GlobOutcome::Unseen(unseen) = outcome else {
             return Ok(false);
         };
+        let plain = |name: &str| name.strip_prefix("r#").unwrap_or(name).to_owned();
+        names
+            .names
+            .retain(|(_, name), _| unseen.binary_search(&plain(name)).is_err());
+        Ok(!unseen.is_empty())
+    }
+    /// Which of a private glob's names its scope never spells (#986), read in the tree.
+    fn unseen(
+        &mut self,
+        doc: &DocumentInput,
+        tree: &Tree,
+        scope: usize,
+        import: &Import,
+        names: &Names,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<GlobOutcome> {
+        let (start, end) = (self.scopes[scope].start, self.scopes[scope].end);
+        let Some(root) = tree.root_node().descendant_for_byte_range(start, end) else {
+            return Ok(GlobOutcome::NoRoot);
+        };
         if root.has_error() {
-            return Ok(false);
+            return Ok(GlobOutcome::Error);
         }
         self.charge(names.names.len(), check)?;
         // `r#name` and `name` are one identifier, whichever side spells the prefix.
@@ -3000,12 +3071,12 @@ impl RustResolver<'_> {
         let mut visits = 0;
         while let Some((node, depth)) = stack.pop() {
             if unseen.is_empty() {
-                return Ok(false);
+                return Ok(GlobOutcome::Unseen(Vec::new()));
             }
             check()?;
             visits += 1;
             if visits > VISITS || depth > DEPTH {
-                return Ok(false);
+                return Ok(GlobOutcome::Bounded);
             }
             if node.start_byte() == import.start && node.end_byte() == import.end {
                 continue;
@@ -3022,12 +3093,9 @@ impl RustResolver<'_> {
                 stack.push((child, depth + 1));
             }
         }
-        names
-            .names
-            .retain(|(_, name), _| !unseen.contains(&plain(name)));
-        Ok(!unseen.is_empty())
+        Ok(GlobOutcome::Unseen(unseen.into_iter().collect()))
     }
-    #[allow(clippy::too_many_arguments)] // Captured inputs and the site's own tree stay explicit.
+    #[allow(clippy::too_many_arguments)] // Captured inputs and the site's own syntax stay explicit.
     pub(super) fn resolve(
         &mut self,
         document: usize,
@@ -3035,9 +3103,10 @@ impl RustResolver<'_> {
         packages: &external::RustPackages,
         external_packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
         docs: &[&DocumentInput],
-        tree: &Tree,
+        syntax: SiteSyntax<'_>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
+        self.execution.glob = None;
         self.step(check)?;
         let Some(scope) = self.scope_at(document, site.start, site.end, check)? else {
             return Ok(SiteResolution::unknown("rust_scope_unproved"));
@@ -3082,7 +3151,7 @@ impl RustResolver<'_> {
                     document,
                     scope,
                     import,
-                    tree,
+                    syntax,
                     &mut route,
                     context,
                     &mut shadowed,
@@ -3212,13 +3281,13 @@ impl RustResolver<'_> {
     /// private glob's scope never spells and the names the scope binds explicitly, each
     /// marked by what the scope's other globs also offer. `route` is the site's, shared
     /// with every expansion and path walk; the two flags say why a name was dropped.
-    #[allow(clippy::too_many_arguments)] // The site's tree, route and flags stay the caller's.
+    #[allow(clippy::too_many_arguments)] // The site's syntax, route and flags stay the caller's.
     fn star_names(
         &mut self,
         document: usize,
         scope: usize,
         import: &Import,
-        tree: &Tree,
+        syntax: SiteSyntax<'_>,
         route: &mut Route,
         context: ResolveContext<'_, '_>,
         shadowed: &mut bool,
@@ -3230,7 +3299,7 @@ impl RustResolver<'_> {
         // A re-exporting glob passes every name on; a private one references only
         // the names its scope spells (#986).
         if !import.public {
-            *unused = self.drop_unused(docs[document], tree, scope, import, &mut own, check)?;
+            *unused = self.drop_unused(docs[document], syntax, scope, import, &mut own, check)?;
         }
         let others = self.scope_imports(scope, check)?;
         let competing = self.competing_star_names(scope, import, &others, route, context, check)?;
@@ -3430,6 +3499,7 @@ struct Variant {
 }
 /// An item under known attribute macros, with the bindings it made, which the failed proof
 /// of any of them leaves uncertain, as under an attribute this catalog does not read.
+#[derive(Clone)]
 struct MacroProof {
     scope: usize,
     macros: Vec<KnownMacro>,
@@ -3513,7 +3583,7 @@ enum MacroCalls {
 }
 /// What across the checkout could give a statement macro's bare name another meaning
 /// (#1210).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MacroShadows {
     /// Every name a `macro_rules!` in a file's text could define.
     rules: BTreeSet<String>,
@@ -3532,6 +3602,7 @@ impl MacroShadows {
     }
 }
 /// A statement macro call held until its proof (#1210).
+#[derive(Clone)]
 struct StatementMacro {
     /// The scope the call stands in.
     scope: usize,
@@ -4737,7 +4808,7 @@ mod memo_tests {
                         &packages,
                         &mut external_packages,
                         &docs,
-                        &trees[document],
+                        SiteSyntax::Tree(&trees[document]),
                         &mut check,
                     )
                     .unwrap();
@@ -4857,7 +4928,7 @@ mod memo_tests {
                     &packages,
                     &mut external_packages,
                     &docs,
-                    &trees[0],
+                    SiteSyntax::Tree(&trees[0]),
                     &mut check,
                 )
                 .unwrap();
@@ -4929,7 +5000,7 @@ mod memo_tests {
                 &packages,
                 &mut BTreeMap::new(),
                 &docs,
-                &trees[0],
+                SiteSyntax::Tree(&trees[0]),
                 &mut check,
             )
             .unwrap();

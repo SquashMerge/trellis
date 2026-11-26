@@ -24,7 +24,9 @@ mod incremental;
 #[cfg(all(test, feature = "test-support"))]
 mod incremental_tests;
 pub use incremental::ReferenceReplayTrace;
-pub(crate) use incremental::{ReferencePreparation, finish_incremental, prepare_incremental};
+pub(crate) use incremental::{
+    KeptRead, KeptSyntax, ReferencePreparation, finish_incremental, prepare_incremental,
+};
 pub(crate) use incremental::{SourceChargePlan, SourceFacts};
 #[cfg(feature = "test-support")]
 pub use work::{
@@ -417,13 +419,24 @@ pub fn resolve_all(
     snapshot: &Snapshot,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<ReferenceBase> {
+    Ok(resolve_all_keeping(snapshot, None, check)?.0)
+}
+
+/// [`resolve_all`], also keeping its syntax for a later build when `versions` gives each
+/// snapshot document's stored version (#1315).
+pub(crate) fn resolve_all_keeping(
+    snapshot: &Snapshot,
+    versions: Option<&[String]>,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<(ReferenceBase, Option<incremental::KeptSyntax>)> {
     let request = parallel_check::RequestCheck::new(check);
     let workers = crate::parallel::default_workers().clamp(1, crate::parallel::MAX_WORKERS);
-    let result = resolve(
+    let result = resolve_keeping(
         snapshot,
         Sources::all(),
         MAX_SAMPLE_LIMIT,
         workers,
+        versions,
         &request,
     );
     request.result(result)
@@ -474,6 +487,19 @@ fn resolve(
     workers: usize,
     request: &parallel_check::RequestCheck<'_>,
 ) -> Result<ReferenceBase> {
+    Ok(resolve_keeping(snapshot, sources, sample_limit, workers, None, request)?.0)
+}
+
+/// [`resolve`], also keeping its syntax for a later build when `keep` gives each snapshot
+/// document's stored version (#1315).
+fn resolve_keeping(
+    snapshot: &Snapshot,
+    sources: Sources<'_>,
+    sample_limit: usize,
+    workers: usize,
+    keep: Option<&[String]>,
+    request: &parallel_check::RequestCheck<'_>,
+) -> Result<(ReferenceBase, Option<incremental::KeptSyntax>)> {
     let check = &mut request.worker();
     ensure!(
         (1..=MAX_SAMPLE_LIMIT).contains(&sample_limit),
@@ -538,7 +564,21 @@ fn resolve(
         workers,
         request,
     };
-    let mut catalogs = build_catalogs(read, limit, check)?;
+    let (mut catalogs, prepared) = build_catalogs(
+        read,
+        limit,
+        RustSource::Fresh {
+            keep: keep.is_some(),
+        },
+        check,
+    )?
+    .context("store_unavailable: fresh Rust catalog")?;
+    let kept = keep
+        .zip(prepared)
+        .map(|(versions, rust)| {
+            incremental::KeptSyntax::new(snapshot, &docs, &sorted, versions, gaps.clone(), rust)
+        })
+        .transpose()?;
     let rust_catalog_digest = catalogs.rust.digest();
     let python_catalog_digest = catalogs.python.digest();
     let javascript_catalog_digest = javascript::digest(catalogs.javascript.as_ref());
@@ -557,7 +597,7 @@ fn resolve(
     } = selected_references(read, &mut catalogs, &locate, check)?;
     external_packages.validate(&sources)?;
     drop_trees(trees, workers);
-    Ok(ReferenceBase {
+    let base = ReferenceBase {
         pin: snapshot.pin,
         partial_files,
         identities,
@@ -584,7 +624,8 @@ fn resolve(
             }),
         sample_limit,
         work_used: catalogs.rust_execution.work.used,
-    })
+    };
+    Ok((base, kept))
 }
 
 /// What `admit_snapshot` hands the rest of a read.
@@ -622,6 +663,9 @@ struct Catalogs {
     java: Box<java::Catalog>,
     python: Box<python::Catalog>,
     javascript: Option<javascript::Catalog>,
+    /// By sorted document, whether its syntax was parsed: `None` when every document was.
+    /// A kept Rust catalog spares clean Rust documents (#1315).
+    parsed: Option<Vec<bool>>,
 }
 
 /// Admission: the documents in key order, each with one file module and within the byte
@@ -709,13 +753,29 @@ fn admit_snapshot<'a>(
     })
 }
 
+/// Where a read's Rust catalog comes from (#1315).
+#[derive(Clone, Copy)]
+enum RustSource<'k> {
+    /// Every Rust file; `keep` also returns the first half for a later build.
+    Fresh { keep: bool },
+    /// A kept first half, with the files `changed` built again from their new syntax. Only
+    /// their trees are read; `parsed` says which documents have one.
+    Kept {
+        prepared: &'k rust::kept::Prepared,
+        changed: &'k BTreeSet<usize>,
+        parsed: &'k [bool],
+    },
+}
+
 /// The four catalogs, each built under its own count of the limit; the counts are then
-/// admitted in catalog order into the one budget the Rust execution state keeps.
+/// admitted in catalog order into the one budget the Rust execution state keeps. With a kept
+/// Rust catalog that cannot take the change, `None`: the caller builds afresh.
 fn build_catalogs(
     read: ReadContext<'_, '_>,
     limit: usize,
+    rust_source: RustSource<'_>,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Catalogs> {
+) -> Result<Option<(Catalogs, Option<rust::kept::Prepared>)>> {
     let ReadContext {
         snapshot,
         docs,
@@ -735,17 +795,43 @@ fn build_catalogs(
                     external::RustPackages::new(&snapshot.manifests, &mut work, &mut check)?;
                 let workspace =
                     cargo_workspace::Workspace::new(&snapshot.manifests, &mut work, &mut check)?;
-                let catalog = rust::Catalog::new(
-                    docs,
-                    trees,
-                    document_map,
-                    &workspace,
-                    &packages,
-                    work,
-                    &mut check,
-                )?;
+                let (prepared, execution) = match rust_source {
+                    RustSource::Fresh { .. } => {
+                        rust::kept::Prepared::build(docs, trees, &workspace, work, &mut check)?
+                    }
+                    RustSource::Kept {
+                        prepared, changed, ..
+                    } => match prepared
+                        .replace(docs, trees, changed, &workspace, work, &mut check)?
+                    {
+                        Some(replaced) => replaced,
+                        None => return Ok((CatalogJob::Declined, 0)),
+                    },
+                };
+                let keep = !matches!(rust_source, RustSource::Fresh { keep: false });
+                let (catalog, kept) = if keep {
+                    let catalog = prepared.finish(
+                        docs,
+                        document_map,
+                        &workspace,
+                        &packages,
+                        execution,
+                        &mut check,
+                    )?;
+                    (catalog, Some(prepared))
+                } else {
+                    let catalog = prepared.finish_owned(
+                        docs,
+                        document_map,
+                        &workspace,
+                        &packages,
+                        execution,
+                        &mut check,
+                    )?;
+                    (catalog, None)
+                };
                 let used = catalog.1.work.used;
-                return Ok((CatalogJob::Rust(Box::new((catalog, packages))), used));
+                return Ok((CatalogJob::Rust(Box::new((catalog, packages, kept))), used));
             }
             1 => CatalogJob::Java(Box::new(java::Catalog::new(
                 docs, trees, selected, &mut work, &mut check,
@@ -798,10 +884,14 @@ fn build_catalogs(
         merge_work(&mut work, used, check)?;
         Ok(catalog)
     };
-    let CatalogJob::Rust(rust_job) = admit(catalogs.next().expect("Rust catalog"))? else {
+    let rust_job = match catalogs.next().expect("Rust catalog") {
+        (CatalogJob::Declined, _) => return Ok(None),
+        job => admit(job)?,
+    };
+    let CatalogJob::Rust(rust_job) = rust_job else {
         unreachable!()
     };
-    let ((rust, mut rust_execution), packages) = *rust_job;
+    let ((rust, mut rust_execution), packages, kept) = *rust_job;
     let CatalogJob::Java(java) = admit(catalogs.next().expect("Java catalog"))? else {
         unreachable!()
     };
@@ -814,14 +904,22 @@ fn build_catalogs(
     };
     let javascript = *javascript;
     rust_execution.work = work;
-    Ok(Catalogs {
-        rust,
-        rust_execution,
-        packages,
-        java,
-        python,
-        javascript,
-    })
+    let parsed = match rust_source {
+        RustSource::Kept { parsed, .. } => Some(parsed.to_vec()),
+        RustSource::Fresh { .. } => None,
+    };
+    Ok(Some((
+        Catalogs {
+            rust,
+            rust_execution,
+            packages,
+            java,
+            python,
+            javascript,
+            parsed,
+        },
+        kept,
+    )))
 }
 
 /// Every declaration of the snapshot, by sorted document and syntax ID.
@@ -1002,15 +1100,16 @@ fn file_references<'a>(
         site.ordinal = ordinal;
         let anchor = anchor.map(|index| &doc.semantic.anchors[index]);
         let historical = doc.semantic.projection.is_some();
-        let charge = shared::ChargeSite {
+        let mut charge = shared::ChargeSite {
             structural: shared::structural_charge(
                 raw,
                 historical && anchor.is_some(),
                 site.owner_syntax_id.is_none(),
             ),
             semantic: anchor.map(shared::SemanticCharge::new).transpose()?,
+            glob: None,
         };
-        let charged = shared::resolve_charge_site(
+        let mut charged = shared::resolve_charge_site(
             read,
             catalogs,
             source,
@@ -1020,6 +1119,7 @@ fn file_references<'a>(
             check,
         )?;
         incremental::resolution_endpoints(&mut endpoints, &charged);
+        charge.glob = charged.glob.take();
         plan.push(read, charge)?;
         let Some((resolution, semantic)) = charged.effective(source) else {
             continue;
@@ -1508,7 +1608,15 @@ fn semantic_resolution(
 }
 
 enum CatalogJob {
-    Rust(Box<((rust::Catalog, rust::RustExecution), external::RustPackages)>),
+    Rust(
+        Box<(
+            (rust::Catalog, rust::RustExecution),
+            external::RustPackages,
+            Option<rust::kept::Prepared>,
+        )>,
+    ),
+    /// A kept Rust catalog that cannot take this change (#1315).
+    Declined,
     Java(Box<java::Catalog>),
     Python(Box<python::Catalog>),
     Javascript(Box<Option<javascript::Catalog>>),
