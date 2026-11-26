@@ -149,6 +149,7 @@ pub(crate) struct Extraction {
 /// The routes and client calls of a snapshot, with each call matched to at most one route.
 /// `wrappers` are the rules file's `[[interfaces.wrappers]]` (#855), and `apps` the app of each
 /// file, for the wrappers scoped to an app.
+#[cfg(test)]
 pub(crate) fn extract(
     snapshot: &Snapshot,
     wrappers: &[crate::rules::InterfaceWrapper],
@@ -156,36 +157,195 @@ pub(crate) fn extract(
     work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Extraction> {
-    let mut routes = routes::extract(snapshot, work, check)?;
+    Ok(extract_keeping(snapshot, wrappers, apps, work, None, None, check)?.0)
+}
+
+/// One extractor's output and Work, for a digest of everything it reads (#1315).
+#[derive(Clone)]
+struct KeptPart<T> {
+    inputs: [u8; 32],
+    output: T,
+    work: usize,
+}
+
+/// The extractors' outputs of an earlier build (#1315), each reused while the inputs it
+/// reads are unchanged: the Rust route and `reqwest` extractors read only the documents
+/// their own predicates select, and the JavaScript/TypeScript, Python and Java extractors
+/// their language's documents. Matching always runs again.
+#[derive(Clone, Default)]
+pub(crate) struct KeptInterfaces {
+    rust_routes: Option<KeptPart<Vec<Route>>>,
+    script: Option<KeptPart<(Vec<Route>, Vec<ClientCall>)>>,
+    rust_calls: Option<KeptPart<Vec<ClientCall>>>,
+    python: Option<KeptPart<(Vec<Route>, Vec<ClientCall>)>>,
+    java: Option<KeptPart<(Vec<Route>, Vec<ClientCall>)>>,
+}
+
+/// A kept extractor's Work did not fit this build's budget: not a failure of the revision.
+/// The build is redone in full, so a failure it keeps is a full extraction's.
+#[derive(Debug)]
+pub(crate) struct KeptWorkDoesNotFit;
+impl std::fmt::Display for KeptWorkDoesNotFit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incremental interface work does not fit")
+    }
+}
+impl std::error::Error for KeptWorkDoesNotFit {}
+
+/// The digest of the documents an extractor reads: each one's key, stored version and
+/// evidence and parse-work flags, in snapshot order, under the manifests and root config.
+fn inputs(
+    snapshot: &Snapshot,
+    versions: &[String],
+    domain: &str,
+    reads: impl Fn(&DocumentInput) -> bool,
+    extra: &str,
+) -> [u8; 32] {
+    use crate::architecture_core::dependencies::{
+        Fingerprint, manifest_digest, root_config_digest,
+    };
+    let mut hash = Fingerprint::new(domain);
+    hash.bytes(&manifest_digest(&snapshot.manifests));
+    hash.bytes(&root_config_digest(snapshot.root_tsconfig.as_ref()));
+    hash.text(extra);
+    for (doc, version) in snapshot.documents.iter().zip(versions) {
+        if !reads(doc) {
+            continue;
+        }
+        hash.text(&doc.key.source_set_id);
+        hash.text(&doc.key.language);
+        hash.text(&doc.key.path);
+        hash.text(version);
+        hash.integer(i64::from(snapshot.evidence_gaps.contains_key(&doc.key)));
+        hash.integer(i64::from(snapshot.unparsed.contains(&doc.key)));
+    }
+    hash.finish()
+}
+
+/// One extractor: its kept output when its inputs are unchanged, charging its kept Work, else
+/// a fresh extraction whose output and Work are kept.
+fn part<T: Clone>(
+    kept: Option<&Option<KeptPart<T>>>,
+    inputs: Option<[u8; 32]>,
+    work: &mut Work,
+    check: &mut impl FnMut() -> Result<()>,
+    extract: impl FnOnce(&mut Work, &mut dyn FnMut() -> Result<()>) -> Result<T>,
+) -> Result<(T, Option<KeptPart<T>>)> {
+    if let (Some(Some(part)), Some(inputs)) = (kept, inputs)
+        && part.inputs == inputs
+    {
+        check()?;
+        anyhow::ensure!(work.charge(part.work), KeptWorkDoesNotFit);
+        return Ok((part.output.clone(), Some(part.clone())));
+    }
+    let before = work.used;
+    let output = extract(work, check)?;
+    let kept = inputs.map(|inputs| KeptPart {
+        inputs,
+        output: output.clone(),
+        work: work.used - before,
+    });
+    Ok((output, kept))
+}
+
+/// [`extract`], reusing the parts of `kept` whose inputs are unchanged and keeping this
+/// extraction's parts, when `versions` gives each snapshot document's stored version (#1315).
+pub(crate) fn extract_keeping(
+    snapshot: &Snapshot,
+    wrappers: &[crate::rules::InterfaceWrapper],
+    apps: &BTreeMap<String, String>,
+    work: &mut Work,
+    kept: Option<&KeptInterfaces>,
+    versions: Option<&[String]>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<(Extraction, Option<KeptInterfaces>)> {
+    let digest = |domain: &str, reads: &dyn Fn(&DocumentInput) -> bool, extra: &str| {
+        versions.map(|versions| inputs(snapshot, versions, domain, reads, extra))
+    };
+    let (mut routes, rust_routes) = part(
+        kept.map(|kept| &kept.rust_routes),
+        digest(
+            "interfaces:rust-routes:v1",
+            &|doc| routes::reads(snapshot, doc),
+            "",
+        ),
+        work,
+        check,
+        |work, mut check| routes::extract(snapshot, work, &mut check),
+    )?;
     let next_roots = next_roots(snapshot, work, check)?;
     let configured = scoped(wrappers);
-    let world = js::World::new(snapshot);
-    let mut budget = js::Budget {
+    let ((script_routes, script_calls), script) = part(
+        kept.map(|kept| &kept.script),
+        digest(
+            "interfaces:script:v1",
+            &js::javascript,
+            &format!("{wrappers:?}{apps:?}{next_roots:?}"),
+        ),
         work,
-        check: &mut *check,
-    };
-    let mut found = js_routes::extract(&world, &next_roots, &mut budget)?;
-    found.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
-    let mut seen = BTreeSet::new();
-    routes.extend(
-        found
-            .into_iter()
-            .filter(|f| {
-                seen.insert((
-                    f.route.method.clone(),
-                    f.route.path_template.clone(),
-                    f.path.clone(),
-                ))
-            })
-            .map(|f| f.route),
-    );
-    let mut calls = calls::extract(&world, &configured, apps, &mut budget)?;
-    calls.extend(rust_calls::extract(snapshot, work, check)?);
-    let sources = python::Sources::new(snapshot, work, check)?;
-    let python = python::Python::new(snapshot, &sources, work, check)?;
-    routes.extend(python_routes::extract(&python, work, check)?);
-    calls.extend(python_calls::extract(&python, work, check)?);
-    let (java_routes, java_calls) = java::extract(snapshot, work, check)?;
+        check,
+        |work, check| {
+            let world = js::World::new(snapshot);
+            let mut budget = js::Budget { work, check };
+            let mut found = js_routes::extract(&world, &next_roots, &mut budget)?;
+            found.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
+            let mut seen = BTreeSet::new();
+            let found: Vec<_> = found
+                .into_iter()
+                .filter(|f| {
+                    seen.insert((
+                        f.route.method.clone(),
+                        f.route.path_template.clone(),
+                        f.path.clone(),
+                    ))
+                })
+                .map(|f| f.route)
+                .collect();
+            let calls = calls::extract(&world, &configured, apps, &mut budget)?;
+            Ok((found, calls))
+        },
+    )?;
+    routes.extend(script_routes);
+    let mut calls = script_calls;
+    let (rust_client_calls, rust_calls) = part(
+        kept.map(|kept| &kept.rust_calls),
+        digest(
+            "interfaces:rust-calls:v1",
+            &|doc| rust_calls::reads(snapshot, doc),
+            "",
+        ),
+        work,
+        check,
+        |work, mut check| rust_calls::extract(snapshot, work, &mut check),
+    )?;
+    calls.extend(rust_client_calls);
+    let ((python_routes, python_calls), python) = part(
+        kept.map(|kept| &kept.python),
+        digest(
+            "interfaces:python:v1",
+            &|doc| doc.key.language == "python",
+            "",
+        ),
+        work,
+        check,
+        |work, mut check| {
+            let sources = python::Sources::new(snapshot, work, &mut check)?;
+            let python = python::Python::new(snapshot, &sources, work, &mut check)?;
+            Ok((
+                python_routes::extract(&python, work, &mut check)?,
+                python_calls::extract(&python, work, &mut check)?,
+            ))
+        },
+    )?;
+    routes.extend(python_routes);
+    calls.extend(python_calls);
+    let ((java_routes, java_calls), java) = part(
+        kept.map(|kept| &kept.java),
+        digest("interfaces:java:v1", &|doc| doc.key.language == "java", ""),
+        work,
+        check,
+        |work, mut check| java::extract(snapshot, work, &mut check),
+    )?;
     routes.extend(java_routes);
     calls.extend(java_calls);
     let matched = calls::resolve(&routes, &calls, work, check)?;
@@ -196,12 +356,22 @@ pub(crate) fn extract(
             callees.push(wrapper.callee.clone());
         }
     }
-    Ok(Extraction {
-        routes,
-        calls,
-        matched,
-        callees,
-    })
+    let kept = versions.map(|_| KeptInterfaces {
+        rust_routes,
+        script,
+        rust_calls,
+        python,
+        java,
+    });
+    Ok((
+        Extraction {
+            routes,
+            calls,
+            matched,
+            callees,
+        },
+        kept,
+    ))
 }
 
 /// The configured wrappers grouped by scope, in precedence order: app scopes first, then

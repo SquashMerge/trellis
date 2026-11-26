@@ -1007,6 +1007,16 @@ which of a private glob's names its scope spells (#986), is recorded in its char
 reused for the same number of names, which the unchanged catalog digest guarantees; anything
 else is an incremental failure, retried in full.
 
+Interface extraction is kept per extractor (#1315): the Rust route and `reqwest` extractors,
+the JavaScript/TypeScript extractor (routes and calls), and the Python and Java extractors each
+keep their output and Work with a digest of what they read: the documents their own predicate
+selects (by key, stored version, and evidence and parse-work flags), the manifests and root
+configuration, and for JavaScript/TypeScript the wrappers, file apps and Next.js roots. An
+incremental build reuses each part whose digest is unchanged and charges its kept Work in its
+place; a Rust edit outside every Rust extractor's candidates reuses them all. Matching calls to
+routes always runs again. A kept part whose Work does not fit the build's budget is an
+incremental failure, retried in full, so a kept interface failure is a full extraction's.
+
 A checkout keeps at most two results: the head's, and the one it replaced or an older retained
 revision a page is showing. The base is its newest eligible earlier successful core in the same
 generation and live-rules eligibility episode, with complete dependencies and metrics. Startup,

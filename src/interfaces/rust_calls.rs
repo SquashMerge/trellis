@@ -39,6 +39,11 @@ pub(super) fn extract(
     Ok(found)
 }
 
+/// Whether `extract` reads this document.
+pub(super) fn reads(snapshot: &crate::references::Snapshot, doc: &DocumentInput) -> bool {
+    candidate(doc) && !snapshot.evidence_gaps.contains_key(&doc.key) && !super::test_file(doc)
+}
+
 /// Whether a Rust document can make `reqwest` calls.
 fn candidate(doc: &DocumentInput) -> bool {
     doc.key.language == "rust" && doc.file.text.contains("reqwest")
