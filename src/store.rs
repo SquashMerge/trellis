@@ -2033,6 +2033,9 @@ impl EvidenceResponse {
         }
         drop(cursor);
         for (key, diagnostic, identity, fingerprint, source) in rows {
+            // Each document's step checks first, kept or read, as the single pass did: a
+            // read held at one document's progress gives way before the next one's.
+            check()?;
             if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
                 evidence_gaps.insert(key.clone(), reason);
             }
@@ -2054,7 +2057,6 @@ impl EvidenceResponse {
                 }
                 Source::Fetch(header) => *header,
             };
-            check()?;
             let header_sizes = (header.bytes, header.stored_bytes);
             let fetched = {
                 let progress_failure = Mutex::new(None);
