@@ -246,9 +246,12 @@ fn a_stop_cancels_a_held_first_index_which_restarts_on_the_next_activation() {
         cold.stderr()
     );
     release(held);
-    let mut after = fixture.spawn("status-after", fixture.status());
+    // `index` waits for its row, so its success shows this activation indexed.
+    let mut index = fixture.cli();
+    index.arg("index").arg("--workspace").arg(&fixture.root);
+    let mut after = fixture.spawn("index-after", index);
     assert!(
-        after.exit("status after restart").success(),
+        after.exit("index after restart").success(),
         "{}",
         after.stderr()
     );

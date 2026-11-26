@@ -67,6 +67,12 @@ impl CheckoutRegistry {
                     }
                 }
                 if checked.runtimes.is_empty() {
+                    // Nothing is active any more; accepted work left is durable
+                    // and belongs to the next activation.
+                    for entry in checked.entries.values_mut() {
+                        entry.released = true;
+                        entry.pending_work = false;
+                    }
                     return Ok(());
                 }
             }
