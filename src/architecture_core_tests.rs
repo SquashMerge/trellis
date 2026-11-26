@@ -110,7 +110,11 @@ fn architecture_incremental_canonical_index() {
         assert_eq!(dependency.fingerprint.as_ref(), &inputs.documents[key]);
         assert_eq!(dependency.references.work, facts.work);
         assert_eq!(dependency.references.sites, facts.sites);
-        assert_eq!(dependency.references.endpoints.as_ref(), facts.endpoints);
+        assert_eq!(dependency.references.endpoints, facts.endpoints);
+        assert!(Arc::ptr_eq(
+            &dependency.references.endpoints,
+            &facts.endpoints
+        ));
         assert!(facts.endpoints.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(
             facts
@@ -200,9 +204,7 @@ fn architecture_incremental_canonical_index() {
                 2 => references.endpoints = Arc::from([]),
                 3 => references.plan = None,
                 4 => Arc::make_mut(references.plan.as_mut().unwrap()).prepared_work += 1,
-                _ => Arc::make_mut(references.plan.as_mut().unwrap())
-                    .sites
-                    .clear(),
+                _ => Arc::make_mut(references.plan.as_mut().unwrap()).clear_for_tests(),
             }
         });
     }
