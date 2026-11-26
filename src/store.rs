@@ -25,6 +25,16 @@ pub use crate::architecture_inputs::{
     ArchitectureFingerprints, DocumentFingerprint, NativeFingerprint, SemanticFreshnessState,
     SemanticInputState, SemanticTupleState,
 };
+pub(crate) use crate::architecture_inputs::{KeptNative, NativeIdentity, NativeRead, NativeTable};
+
+/// One Read A: the snapshot, each document's control regions, the Architecture fingerprints
+/// and each document's native table, in snapshot order.
+pub(crate) type ReadA = (
+    crate::architecture_inputs::Snapshot,
+    Vec<Vec<crate::native_records::ControlRegion>>,
+    ArchitectureFingerprints,
+    Vec<NativeTable>,
+);
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
@@ -1712,6 +1722,7 @@ impl EvidenceResponse {
     }
 
     /// Read A and its Architecture-only sidecar under this same admitted revision.
+    #[cfg(feature = "test-support")]
     pub(crate) fn architecture_read_a_fingerprinted(
         &self,
         pin: Option<IndexPin>,
@@ -1722,7 +1733,56 @@ impl EvidenceResponse {
         Vec<Vec<crate::native_records::ControlRegion>>,
         ArchitectureFingerprints,
     )> {
-        let (mut snapshot, regions) = self.architecture_native_regions(pin, check, progress)?;
+        let (snapshot, regions, fingerprints, _) =
+            self.architecture_read_a_kept(pin, None, check, progress)?;
+        Ok((snapshot, regions, fingerprints))
+    }
+
+    /// Read A with the documents an earlier Read A kept (#1315): a kept document whose
+    /// stored identity is unchanged is not read again. Its rows are rebased to this
+    /// revision's native revision, so the snapshot equals the one a full Read A returns.
+    pub(crate) fn architecture_read_a_kept(
+        &self,
+        pin: Option<IndexPin>,
+        mut kept: Option<&mut KeptNative>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<ReadA> {
+        let NativeRead {
+            mut snapshot,
+            regions,
+            tables,
+            native_revision,
+        } = self.architecture_native_read(pin, kept.as_deref_mut(), check, progress)?;
+        match self.architecture_fingerprints(&mut snapshot, &tables, check) {
+            Ok(fingerprints) => Ok((snapshot, regions, fingerprints, tables)),
+            Err(error) => {
+                // The kept documents were taken: a Read A that stops or fails after that hands
+                // back every document it holds, as a dropped input does (#1315).
+                if let Some(kept) = kept
+                    && let Some(back) = KeptNative::of(
+                        snapshot.pin.index_generation,
+                        native_revision,
+                        std::mem::take(&mut snapshot.documents),
+                        regions,
+                        tables,
+                    )
+                {
+                    *kept = back;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Read A's Architecture-only sidecar for `snapshot`'s documents, which it gives their
+    /// Read A semantic state.
+    fn architecture_fingerprints(
+        &self,
+        snapshot: &mut crate::architecture_inputs::Snapshot,
+        tables: &[NativeTable],
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<ArchitectureFingerprints> {
         let key = semantic_pin_key(snapshot.pin);
         let defaults = semantic_display::default_producers(&self.db, &key)?;
         let (producers, selections) =
@@ -1744,14 +1804,11 @@ impl EvidenceResponse {
             .collect::<rusqlite::Result<_>>()?;
         let mut documents = BTreeMap::new();
         let mut semantic_states = BTreeMap::new();
-        for document in &mut snapshot.documents {
+        for (document, table) in snapshot.documents.iter_mut().zip(tables) {
             check()?;
-            // Native read above already applied selected-header, graph and class validation.
-            let native = self.db.query_row(
-                "SELECT d.id,m.coverage_requested,m.coverage_selected,m.coverage_state,m.coverage_diagnostic FROM revision_documents m JOIN document_versions d ON d.vid=m.vid AND d.language=m.language AND d.path=m.path WHERE m.revision_id=?1 AND m.language=?2 AND m.path=?3",
-                params![key, document.key.language, document.key.path],
-                |row| Ok(NativeFingerprint { version_id: row.get(0)?, coverage_requested: row.get(1)?, coverage_selected: row.get(2)?, coverage_state: row.get(3)?, coverage_diagnostic: row.get(4)? }),
-            )?;
+            // Native read above already applied selected-header, graph and class validation,
+            // and its listing carried each document's fingerprint.
+            let native = table.fingerprint.clone();
             let (semantic, state) = semantic_display::architecture_document_fingerprint(
                 &self.db,
                 snapshot.pin,
@@ -1811,17 +1868,13 @@ impl EvidenceResponse {
             semantic_states.insert(document.key.clone(), state);
         }
         check()?;
-        Ok((
-            snapshot,
-            regions,
-            ArchitectureFingerprints {
-                documents,
-                semantic_states,
-                producers,
-                selections,
-                native_revision,
-            },
-        ))
+        Ok(ArchitectureFingerprints {
+            documents,
+            semantic_states,
+            producers,
+            selections,
+            native_revision,
+        })
     }
 
     /// Read A of an Architecture build (#1301): each selected native document once with its
@@ -1836,6 +1889,21 @@ impl EvidenceResponse {
         crate::architecture_inputs::Snapshot,
         Vec<Vec<crate::native_records::ControlRegion>>,
     )> {
+        let NativeRead {
+            snapshot, regions, ..
+        } = self.architecture_native_read(pin, None, check, progress)?;
+        Ok((snapshot, regions))
+    }
+
+    /// Read A's native documents. A document `kept` holds with the same stored identity is
+    /// taken from it instead of read (#1315); it is drained only once the whole read succeeds.
+    fn architecture_native_read(
+        &self,
+        pin: Option<IndexPin>,
+        mut kept: Option<&mut KeptNative>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<NativeRead> {
         use crate::native_records::DocumentKey;
         check()?;
         let selected = self.selected(pin)?;
@@ -1844,15 +1912,34 @@ impl EvidenceResponse {
             [&selected.key],
             |row| row.get::<_, i64>(0),
         )? as usize;
+        // The left joins keep every inventory row: a document whose stored identity is
+        // incomplete is read, and fails, as before.
         let mut statement = self.db.prepare(
-            "SELECT r.source_set_id,m.language,m.path,m.coverage_diagnostic
+            "SELECT r.source_set_id,m.language,m.path,m.coverage_diagnostic,
+               d.id,g.graph_hash,c.content_hash,d.producer_id,
+               m.coverage_requested,m.coverage_selected,m.coverage_state
              FROM revision_documents m
              JOIN native_revisions r ON r.id=m.revision_id
+             LEFT JOIN document_versions d ON d.vid=m.vid AND d.language=m.language AND d.path=m.path
+             LEFT JOIN graph_projections g ON g.gid=m.gid AND g.vid=d.vid AND g.language=d.language
+             LEFT JOIN class_projections c ON c.cid=m.cid AND c.gid=g.gid
              WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
         )?;
+        let native_revision: String = self.db.query_row(
+            "SELECT native_revision_id FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )?;
+        if kept
+            .as_ref()
+            .is_some_and(|kept| kept.generation != selected.pin.index_generation)
+        {
+            kept = None;
+        }
         let mut cursor = statement.query([&selected.key])?;
         let mut documents = Vec::new();
         let mut regions = Vec::new();
+        let mut tables = Vec::new();
         let mut evidence_gaps = BTreeMap::new();
         let mut unparsed = BTreeSet::new();
         let mut pending = Vec::new();
@@ -1870,6 +1957,67 @@ impl EvidenceResponse {
                 path: row.get(2)?,
             };
             let diagnostic: Option<String> = row.get(3)?;
+            let identity = match (
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ) {
+                (Some(version_id), Some(graph_hash), class_hash, Some(producer_id)) => {
+                    Some(NativeIdentity {
+                        version_id,
+                        graph_hash,
+                        class_hash,
+                        producer_id,
+                    })
+                }
+                _ => None,
+            };
+            let fingerprint = NativeFingerprint {
+                version_id: identity
+                    .as_ref()
+                    .map(|identity| identity.version_id.clone())
+                    .unwrap_or_default(),
+                coverage_requested: row.get(8)?,
+                coverage_selected: row.get(9)?,
+                coverage_state: row.get(10)?,
+                coverage_diagnostic: diagnostic.clone(),
+            };
+            let reused = kept
+                .as_ref()
+                .and_then(|kept| kept.documents.get(&key))
+                .filter(|document| Some(&document.table.identity) == identity.as_ref())
+                .map(|document| (document.table.bytes, document.table.stored_bytes));
+            if let Some((bytes, stored)) = reused {
+                // The same budgets as a read, from the sizes this identity was read with.
+                source_bytes = source_bytes.saturating_add(bytes.max(0) as u64);
+                stored_bytes = stored_bytes.saturating_add(stored);
+                ensure!(
+                    bytes <= 2 * 1024 * 1024
+                        && source_bytes <= 256 * 1024 * 1024
+                        && stored_bytes <= 512 * 1024 * 1024,
+                    "bounded_work: architecture source"
+                );
+                if let Some(reason) =
+                    crate::syntax_bounds::module_only_reason(diagnostic.as_deref())
+                {
+                    evidence_gaps.insert(key.clone(), reason);
+                }
+                if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
+                    unparsed.insert(key.clone());
+                }
+                tables.push(NativeTable {
+                    identity: identity.expect("a kept document matched its identity"),
+                    fingerprint,
+                    bytes,
+                    stored_bytes: stored,
+                    read: false,
+                });
+                pending.push((key, None));
+                progress(pending.len(), total);
+                continue;
+            }
+            let header_sizes;
             let fetched = {
                 let progress_failure = Mutex::new(None);
                 let check = Mutex::new(&mut *check);
@@ -1890,6 +2038,7 @@ impl EvidenceResponse {
                     return Err(error);
                 }
                 let header = header?;
+                header_sizes = (header.bytes, header.stored_bytes);
                 source_bytes = source_bytes.saturating_add(header.bytes.max(0) as u64);
                 stored_bytes = stored_bytes.saturating_add(header.stored_bytes);
                 ensure!(
@@ -1912,11 +2061,22 @@ impl EvidenceResponse {
             if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
                 unparsed.insert(key.clone());
             }
-            pending.push((key, std::sync::Mutex::new(Some(fetched))));
+            // A row whose identity is incomplete failed its header above.
+            tables.push(NativeTable {
+                identity: identity.context(SelectedIntegrity(
+                    "incompatible_index: selected native identity missing".into(),
+                ))?,
+                fingerprint,
+                bytes: header_sizes.0,
+                stored_bytes: header_sizes.1,
+                read: true,
+            });
+            pending.push((key, Some(std::sync::Mutex::new(Some(fetched)))));
             progress(pending.len(), total);
         }
         // SQLite reads stay on this connection; decoding needs no connection, so
         // it runs in parallel. The first decode failure in document order is reported.
+        let mut fetched_documents = Vec::new();
         {
             let stopped = std::sync::atomic::AtomicBool::new(false);
             let progress_failure = Mutex::new(None);
@@ -1934,11 +2094,15 @@ impl EvidenceResponse {
                     }
                 }
             };
+            let fresh: Vec<_> = pending
+                .iter()
+                .filter_map(|(_, decode)| decode.as_ref())
+                .collect();
             let decoded = crate::parallel::map_ordered(
-                &pending,
+                &fresh,
                 crate::parallel::default_workers(),
                 &stopped,
-                |_, (_, decode)| {
+                |_, decode| {
                     let decode = decode
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1961,20 +2125,21 @@ impl EvidenceResponse {
             if let Some(error) = progress_failure.lock().unwrap().take() {
                 return Err(error);
             }
-            for ((key, _), fetched) in pending.into_iter().zip(decoded) {
-                let fetched = fetched.context("cancelled: architecture decode not started")??;
+            let mut decoded = decoded.into_iter();
+            fetched_documents.reserve(fresh.len());
+            for (key, decode) in &pending {
+                if decode.is_none() {
+                    continue;
+                }
+                let fetched = decoded
+                    .next()
+                    .flatten()
+                    .context("cancelled: architecture decode not started")??;
                 selected_ensure!(
                     fetched.file.language == key.language,
                     "incompatible_index: architecture language mismatch"
                 );
-                regions.push(fetched.regions);
-                documents.push(crate::architecture_inputs::DocumentInput {
-                    key,
-                    file: fetched.file,
-                    declarations: fetched.declarations,
-                    calls: fetched.calls,
-                    semantic: Default::default(),
-                });
+                fetched_documents.push(fetched);
             }
         }
         // Retained manifests belong to this selected row and this admitted transaction.
@@ -2214,8 +2379,61 @@ impl EvidenceResponse {
                 bytes,
             });
         }
-        Ok((
-            crate::architecture_inputs::Snapshot {
+        // Every fallible step is done: only now are kept documents taken, so a read that
+        // stops or fails anywhere leaves them where they were (#1315). The rest of the kept
+        // set is superseded by this read.
+        ensure!(
+            fetched_documents.len()
+                == pending
+                    .iter()
+                    .filter(|(_, decode)| decode.is_some())
+                    .count()
+                && pending.iter().all(|(key, decode)| {
+                    decode.is_some()
+                        || kept
+                            .as_ref()
+                            .is_some_and(|kept| kept.documents.contains_key(key))
+                }),
+            "store_unavailable: architecture decode inventory"
+        );
+        let (kept_revision, mut kept_documents) = kept
+            .map(|kept| {
+                (
+                    std::mem::take(&mut kept.native_revision),
+                    std::mem::take(&mut kept.documents),
+                )
+            })
+            .unwrap_or_default();
+        let mut fetched_documents = fetched_documents.into_iter();
+        for ((key, decode), table) in pending.into_iter().zip(&tables) {
+            let Some(mut document) = decode
+                .is_none()
+                .then(|| kept_documents.remove(&key))
+                .flatten()
+            else {
+                let fetched = fetched_documents
+                    .next()
+                    .expect("one decoded document per read row");
+                regions.push(fetched.regions);
+                documents.push(crate::architecture_inputs::DocumentInput {
+                    key,
+                    file: fetched.file,
+                    declarations: fetched.declarations,
+                    calls: fetched.calls,
+                    semantic: Default::default(),
+                });
+                continue;
+            };
+            document.rebase(
+                &kept_revision,
+                &native_revision,
+                &table.identity.producer_id,
+            );
+            regions.push(document.regions);
+            documents.push(document.input);
+        }
+        Ok(NativeRead {
+            snapshot: crate::architecture_inputs::Snapshot {
                 pin: selected.pin,
                 documents,
                 manifests: manifests.into_values().collect(),
@@ -2224,7 +2442,9 @@ impl EvidenceResponse {
                 unparsed,
             },
             regions,
-        ))
+            tables,
+            native_revision,
+        })
     }
 
     pub(crate) fn report_index_failure(&self, error: anyhow::Error) -> anyhow::Error {
@@ -10173,17 +10393,26 @@ impl V8NativeScope {
         }
     }
     pub(crate) fn proof_id(&self) -> String {
-        format!(
-            "native-proof:v1:{}",
-            crate::native_ids::digest(
-                b"trellis.native-proof.v1\0",
-                &crate::native_ids::canonical(&serde_json::json!({
-                    "producerId":self.producer_id,"document":self.key,
-                    "revisionId":self.native_revision_id
-                })),
-            )
-        )
+        native_proof_id(&self.producer_id, &self.key, &self.native_revision_id)
     }
+}
+
+/// The native proof ID of one document's rows at one native revision.
+pub(crate) fn native_proof_id(
+    producer_id: &str,
+    key: &crate::native_records::DocumentKey,
+    native_revision_id: &str,
+) -> String {
+    format!(
+        "native-proof:v1:{}",
+        crate::native_ids::digest(
+            b"trellis.native-proof.v1\0",
+            &crate::native_ids::canonical(&serde_json::json!({
+                "producerId":producer_id,"document":key,
+                "revisionId":native_revision_id
+            })),
+        )
+    )
 }
 // Decode compact ID columns at the SQLite row boundary. A malformed stored
 // BLOB is a corrupt index, not a malformed caller selector.

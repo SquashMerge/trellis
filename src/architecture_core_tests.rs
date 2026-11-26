@@ -1856,3 +1856,181 @@ fn architecture_incremental_retry_excludes_cancelled_and_contended_errors() {
         &crate::store::topology::StorageBusy.into()
     ));
 }
+
+fn kept_read(
+    store: &Store,
+    kept: &KeptSlot,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<ArchitectureInput> {
+    let response = store.evidence_response().unwrap();
+    let pin = response.selected_pin(None).unwrap();
+    let input = response.architecture_native_input_kept(pin, Some(kept), check, &|_| {});
+    response.finish(()).unwrap();
+    input
+}
+
+fn paths(keys: Vec<DocumentKey>) -> Vec<String> {
+    keys.into_iter().map(|key| key.path).collect()
+}
+
+/// Everything of a Read A an Architecture build reads, field by field.
+fn assert_same_read_a(kept: &ArchitectureInput, full: &ArchitectureInput) {
+    let (a, b) = (&kept.snapshot, &full.snapshot);
+    assert_eq!(a.pin, b.pin);
+    assert_eq!(a.documents.len(), b.documents.len());
+    for (a, b) in a.documents.iter().zip(&b.documents) {
+        assert_eq!(a.key, b.key);
+        assert_eq!(a.file, b.file);
+        assert_eq!(a.declarations, b.declarations, "{:?}", a.key);
+        assert_eq!(a.calls, b.calls, "{:?}", a.key);
+        assert_eq!(format!("{:?}", a.semantic), format!("{:?}", b.semantic));
+    }
+    assert_eq!(kept.regions, full.regions);
+    assert_eq!(format!("{:?}", a.manifests), format!("{:?}", b.manifests));
+    assert_eq!(
+        format!("{:?}", a.root_tsconfig),
+        format!("{:?}", b.root_tsconfig)
+    );
+    assert_eq!(a.evidence_gaps, b.evidence_gaps);
+    assert_eq!(a.unparsed, b.unparsed);
+    assert_eq!(kept.fingerprints, full.fingerprints);
+    assert_eq!(kept.tables.len(), full.tables.len());
+    for (a, b) in kept.tables.iter().zip(&full.tables) {
+        assert_eq!(
+            (&a.identity, &a.fingerprint, a.bytes, a.stored_bytes),
+            (&b.identity, &b.fingerprint, b.bytes, b.stored_bytes)
+        );
+    }
+}
+
+#[test]
+fn architecture_kept_read_a_equals_a_full_read_a_at_a_new_revision() {
+    let (_state, root, store) = incremental_checkout();
+    let kept = KeptSlot::default();
+    let first = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    let all = paths(first.read_documents());
+    assert_eq!(all.len(), first.snapshot.documents.len());
+    let first_revision = first.fingerprints.native_revision.clone();
+    assert!(
+        kept.lock().unwrap().is_none(),
+        "the build holds the documents"
+    );
+    drop(first);
+    assert_eq!(
+        kept.lock().unwrap().as_ref().unwrap().documents.len(),
+        all.len()
+    );
+    // A body edit, an added and a deleted document, at a new native revision.
+    write(
+        root.path(),
+        "crates/alpha/src/util.rs",
+        "pub fn u() { let _ = 2; }\n",
+    );
+    write(root.path(), "added.rs", "pub fn added() {}\n");
+    fs::remove_file(root.path().join("idle.rs")).unwrap();
+    publish(&store, root.path());
+    let delta = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    assert_eq!(
+        paths(delta.read_documents()),
+        ["added.rs", "crates/alpha/src/util.rs"]
+    );
+    assert_ne!(delta.fingerprints.native_revision, first_revision);
+    let full = native_input(&store);
+    assert_eq!(full.read_documents().len(), full.snapshot.documents.len());
+    assert_same_read_a(&delta, &full);
+    // Kept documents were rebased to this revision's IDs, not only left equal by chance.
+    let clean = delta
+        .snapshot
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "crates/alpha/src/main.rs")
+        .unwrap();
+    assert!(
+        clean
+            .declarations
+            .iter()
+            .all(|declaration| declaration.revision_id == delta.fingerprints.native_revision)
+    );
+}
+
+#[test]
+fn architecture_kept_read_a_that_stops_keeps_every_document() {
+    let (_state, root, store) = incremental_checkout();
+    let kept = KeptSlot::default();
+    drop(kept_read(&store, &kept, &mut || Ok(())).unwrap());
+    let documents = kept.lock().unwrap().as_ref().unwrap().documents.len();
+    write(
+        root.path(),
+        "crates/alpha/src/util.rs",
+        "pub fn u() { let _ = 3; }\n",
+    );
+    publish(&store, root.path());
+    // A read that stops part way, as one that gives way to a publication does.
+    let mut calls = 0;
+    let stopped = kept_read(&store, &kept, &mut || {
+        calls += 1;
+        anyhow::ensure!(calls < 4, "cancelled: injected give-way");
+        Ok(())
+    });
+    assert!(stopped.err().unwrap().to_string().starts_with("cancelled"));
+    assert_eq!(
+        kept.lock().unwrap().as_ref().unwrap().documents.len(),
+        documents
+    );
+    let delta = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    assert_eq!(paths(delta.read_documents()), ["crates/alpha/src/util.rs"]);
+    assert_same_read_a(&delta, &native_input(&store));
+}
+
+/// A Read A that stops at any of its checks, before or after it took the kept documents
+/// (the manifest, config and fingerprint stages come after), leaves every document kept
+/// (#1315 review): the next read reads at most what changed, and equals a full Read A.
+#[test]
+fn architecture_kept_read_a_that_stops_late_keeps_every_document() {
+    let (_state, root, store) = incremental_checkout();
+    let kept = KeptSlot::default();
+    let mut checks = 0;
+    drop(
+        kept_read(&store, &kept, &mut || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap(),
+    );
+    let documents = kept.lock().unwrap().as_ref().unwrap().documents.len();
+    write(
+        root.path(),
+        "crates/alpha/src/util.rs",
+        "pub fn u() { let _ = 4; }\n",
+    );
+    publish(&store, root.path());
+    // Each read stops at its `stop`th check, until one makes fewer checks and succeeds. The
+    // last read that stops does so at its own last check, the fingerprint stage's, after
+    // it took the kept documents and read the edited one.
+    let mut stopped = Vec::new();
+    for stop in 1..=checks {
+        let mut calls = 0;
+        let read = kept_read(&store, &kept, &mut || {
+            calls += 1;
+            anyhow::ensure!(calls < stop, "cancelled: injected give-way");
+            Ok(())
+        });
+        let Err(error) = read else {
+            continue;
+        };
+        assert!(error.to_string().starts_with("cancelled"), "{error:#}");
+        let kept = kept.lock().unwrap();
+        let native = kept.as_ref().expect("the kept documents stay");
+        assert_eq!(native.documents.len(), documents, "stopped at check {stop}");
+        stopped.push(stop);
+    }
+    assert!(stopped.len() > 1);
+    assert_eq!(stopped, (1..=stopped.len() as i32).collect::<Vec<_>>());
+    let delta = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    let read = paths(delta.read_documents());
+    assert!(
+        read.is_empty() || read == ["crates/alpha/src/util.rs"],
+        "{read:?}"
+    );
+    assert_same_read_a(&delta, &native_input(&store));
+}

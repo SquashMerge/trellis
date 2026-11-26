@@ -392,9 +392,44 @@ pub(crate) struct ArchitectureInput {
     regions: Vec<Vec<crate::native_records::ControlRegion>>,
     fingerprints: crate::architecture_inputs::ArchitectureFingerprints,
     semantic_counts: crate::store::semantic_display::ArchitectureSemanticCounts,
+    /// Each document's Read A table, in snapshot order (#1315).
+    tables: Vec<crate::store::NativeTable>,
+    /// Where this input's native documents go when it is dropped, whatever the build's
+    /// outcome, so the owner's next Read A need not read them again (#1315).
+    kept: Option<KeptSlot>,
+}
+
+/// The owner's kept native documents (#1315). Only the owner's builds take and return them.
+pub(crate) type KeptSlot = Arc<Mutex<Option<crate::store::KeptNative>>>;
+
+impl Drop for ArchitectureInput {
+    fn drop(&mut self) {
+        let Some(slot) = self.kept.take() else {
+            return;
+        };
+        let kept = crate::store::KeptNative::of(
+            self.snapshot.pin.index_generation,
+            std::mem::take(&mut self.fingerprints.native_revision),
+            std::mem::take(&mut self.snapshot.documents),
+            std::mem::take(&mut self.regions),
+            std::mem::take(&mut self.tables),
+        );
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = kept;
+    }
 }
 
 impl ArchitectureInput {
+    /// The documents Read A read rather than took from kept documents.
+    pub(crate) fn read_documents(&self) -> Vec<DocumentKey> {
+        self.snapshot
+            .documents
+            .iter()
+            .zip(&self.tables)
+            .filter(|(_, table)| table.read)
+            .map(|(doc, _)| doc.key.clone())
+            .collect()
+    }
+
     pub(crate) fn document_keys(&self) -> Vec<DocumentKey> {
         self.fingerprints.documents.keys().cloned().collect()
     }
@@ -421,9 +456,10 @@ impl EvidenceResponse {
         &self,
         pin: IndexPin,
     ) -> Result<crate::references::Snapshot> {
-        Ok(self
-            .architecture_input(pin, &mut || Ok(()), &|_| {})?
-            .snapshot)
+        let (mut snapshot, _, _) =
+            self.architecture_read_a_fingerprinted(Some(pin), &mut || Ok(()), &|_, _| {})?;
+        self.architecture_semantic_rows(&mut snapshot, &mut || Ok(()))?;
+        Ok(snapshot)
     }
 
     #[cfg(feature = "test-support")]
@@ -466,20 +502,42 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<ArchitectureInput> {
-        let (snapshot, regions, fingerprints) = self
-            .architecture_read_a_fingerprinted(Some(pin), check, &|completed, total| {
-                progress(ArchitectureProgress {
-                    phase: "reading",
-                    completed,
-                    total,
-                });
-            })
+        self.architecture_native_input_kept(pin, None, check, progress)
+    }
+
+    /// Read A with the owner's kept native documents (#1315): those whose stored identity
+    /// is unchanged are taken rather than read, and the input returns its documents to
+    /// `kept` when it is dropped. Without `kept` every document is read.
+    pub(crate) fn architecture_native_input_kept(
+        &self,
+        pin: IndexPin,
+        kept: Option<&KeptSlot>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+        progress: &(dyn Fn(ArchitectureProgress) + Sync),
+    ) -> Result<ArchitectureInput> {
+        let mut held = kept.map(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()));
+        let (snapshot, regions, fingerprints, tables) = self
+            .architecture_read_a_kept(
+                Some(pin),
+                held.as_mut().and_then(|held| held.as_mut()),
+                check,
+                &|completed, total| {
+                    progress(ArchitectureProgress {
+                        phase: "reading",
+                        completed,
+                        total,
+                    });
+                },
+            )
             .map_err(|error| self.store.report_index_failure(error))?;
+        drop(held);
         Ok(ArchitectureInput {
             snapshot,
             regions,
             fingerprints,
             semantic_counts: Default::default(),
+            tables,
+            kept: kept.cloned(),
         })
     }
 
@@ -573,12 +631,16 @@ impl ArchitectureCore {
             measure,
             progress,
         } = context;
-        let ArchitectureInput {
-            snapshot,
-            regions,
-            fingerprints,
-            semantic_counts,
-        } = input;
+        let mut input = input;
+        let fingerprints = std::mem::take(&mut input.fingerprints);
+        // The kept documents are returned at this native revision.
+        input
+            .fingerprints
+            .native_revision
+            .clone_from(&fingerprints.native_revision);
+        let semantic_counts = std::mem::take(&mut input.semantic_counts);
+        let snapshot = &input.snapshot;
+        let regions = &input.regions;
         let total = snapshot.documents.len();
         let report = |phase| {
             progress(ArchitectureProgress {
@@ -588,7 +650,7 @@ impl ArchitectureCore {
             });
         };
         let mut dependencies = dependencies::ArchitectureDependencies::full(
-            &snapshot,
+            snapshot,
             fingerprints,
             &semantic_counts.sources,
             semantic_counts.global,
@@ -600,7 +662,7 @@ impl ArchitectureCore {
         report("evaluating");
         let rules = config
             .map(|config| {
-                let base = match crate::rules::prepare(config, &snapshot, check) {
+                let base = match crate::rules::prepare(config, snapshot, check) {
                     Ok(base) => Ok(base),
                     Err(error) if CoreFailure::repeats(&error) => Err(CoreFailure::of(&error)),
                     Err(error) => return Err(error),
@@ -616,14 +678,14 @@ impl ArchitectureCore {
             let measured = match reuse {
                 Some((base, changed)) => engine::measure_changed_documents(
                     store,
-                    &snapshot,
-                    &regions,
+                    snapshot,
+                    regions,
                     base.metrics()?,
                     changed,
                     check,
                     progress,
                 ),
-                None => measure_documents(store, &snapshot, &regions, check, progress),
+                None => measure_documents(store, snapshot, regions, check, progress),
             };
             Some(match measured {
                 Ok(metrics) => Ok(metrics),
@@ -633,7 +695,7 @@ impl ArchitectureCore {
         } else {
             None
         };
-        let app_candidates = kept(crate::rules::app_candidates(&snapshot, check))?;
+        let app_candidates = kept(crate::rules::app_candidates(snapshot, check))?;
         let interfaces = match (config, &app_candidates) {
             // Authored apps can split one manifest's checkout (#794), so they count too: an
             // upper bound of the effective inventory. Without a rules file every detected
@@ -642,7 +704,7 @@ impl ArchitectureCore {
                 let mut work =
                     crate::references::work::Work::new(crate::references::work::rules_limit(
                         snapshot.documents.len(),
-                        crate::references::work::snapshot_bytes(&snapshot, check)?,
+                        crate::references::work::snapshot_bytes(snapshot, check)?,
                     ));
                 // App-scoped wrappers (#855) need each file's app, as rule evaluation assigns
                 // it; a failed rules part is this part's failure too. Without a rules file
@@ -675,7 +737,7 @@ impl ArchitectureCore {
                 };
                 Some(match apps {
                     Ok(apps) => kept(crate::interfaces::extract(
-                        &snapshot, wrappers, &apps, &mut work, check,
+                        snapshot, wrappers, &apps, &mut work, check,
                     ))?,
                     Err(failure) => Err(failure),
                 })
@@ -1480,8 +1542,8 @@ impl Store {
     pub fn architecture_reference_snapshot_for_tests(&self) -> Result<crate::references::Snapshot> {
         let response = self.evidence_response()?;
         let pin = response.selected_pin(None)?;
-        let input = response.architecture_input(pin, &mut || Ok(()), &|_| {})?;
-        response.finish(input.snapshot)
+        let snapshot = response.architecture_snapshot_for_tests(pin)?;
+        response.finish(snapshot)
     }
 
     /// The head's Architecture read and core twice (#1301): read A and read B in one

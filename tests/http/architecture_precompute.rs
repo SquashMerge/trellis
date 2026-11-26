@@ -268,6 +268,9 @@ async fn architecture_incremental_body_edit() {
     let attempt = published_attempt(&scheduler, pin);
     assert_eq!(attempt.base, Some(first));
     assert_incremental(&attempt, &["src/main.rs"], &[]);
+    // #1315: Read A read every document once, then only the edited one.
+    assert_eq!(initial.native_reads.len(), 5);
+    assert_eq!(source_paths(&attempt.native_reads), ["src/main.rs"]);
     assert_eq!(source_paths(&attempt.semantic_sources), ["src/main.rs"]);
     assert_eq!(source_paths(&attempt.measured_sources), ["src/main.rs"]);
     let after = core(&scheduler, pin);
@@ -1365,6 +1368,8 @@ async fn give_way_at(point: &'static str) {
     let next = published_attempt(&scheduler, pin);
     assert_eq!(next.base, Some(original));
     assert_incremental(&next, &["src/main.rs"], &[]);
+    // #1315: a build that gave way kept its native documents for the next one.
+    assert_eq!(source_paths(&next.native_reads), ["src/main.rs"]);
 }
 
 #[tokio::test]
