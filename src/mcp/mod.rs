@@ -438,7 +438,8 @@ fn producer_failure(id: &serde_json::Value) -> serde_json::Value {
 /// The files of the apps a find, search or call graph `app` argument names (#851), or the
 /// typed failure that answers instead: `not_found` for an unknown app, and the rules check's
 /// `invalid_rules` and `bounded_work`. Contention and a building core return as errors, so
-/// the read waits for the owner and is admitted again.
+/// the read retries, or waits for the owner and answers `building` as the architecture tools
+/// do (#1278).
 fn app_files(
     runtime: &crate::daemon::registry::CheckoutRuntime,
     response: &crate::daemon::registry::CheckoutEvidence,
@@ -536,18 +537,6 @@ fn lookup_root(
         }
     }
 }
-/// How a read that needs the head's Architecture core waits for the owner while it builds.
-/// The wait follows an admitted read that found the core building, and holds no read.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ArchitectureWait {
-    /// The architecture tools and the prompt wait until one second before the deadline, then
-    /// answer the typed `building` from the owner's state, admitting no other read (#798,
-    /// #1252).
-    AnswersBuilding,
-    /// A find, search or call graph `app` filter waits within its deadline and fails
-    /// `deadline_exceeded` if the core is still building (#851).
-    UntilDeadline,
-}
 
 #[cfg(feature = "test-support")]
 fn capture_evidence_error(
@@ -593,6 +582,12 @@ fn capture_evidence_error(
 /// checkout must show a prior head before it is activated; then one snapshot is
 /// admitted, read, and finished. Store contention, including the cold check's,
 /// retries until the call deadline.
+///
+/// `architecture` marks a read that may need the head's Architecture core: the architecture
+/// tools, the prompt, and a find, search or call graph `app` filter. A read that found the
+/// core building waits for the owner, holding no read, until one second before the deadline,
+/// then answers the typed `building` from the owner's state, admitting no other read (#798,
+/// #1252, #1278).
 #[allow(clippy::too_many_arguments)]
 fn evidence_read(
     registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
@@ -606,7 +601,7 @@ fn evidence_read(
     id: &serde_json::Value,
     #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
     query: Option<&str>,
-    architecture: Option<ArchitectureWait>,
+    architecture: bool,
     read: &EvidenceToolReadFn<'_>,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
     let _profile = query.map(|_| crate::search_model::SearchPhaseTimer::start("search_total"));
@@ -752,9 +747,10 @@ fn evidence_read(
         };
         // The core is still building. The read has ended, so this wait holds nothing; the
         // next attempt answers from what the owner published.
-        let reserve = match architecture {
-            Some(ArchitectureWait::AnswersBuilding) => ARCHITECTURE_ANSWER_TIME,
-            _ => std::time::Duration::ZERO,
+        let reserve = if architecture {
+            ARCHITECTURE_ANSWER_TIME
+        } else {
+            std::time::Duration::ZERO
         };
         let left = || {
             deadline
@@ -780,7 +776,7 @@ fn evidence_read(
             // #1252: answered from the owner's state, with the admitted read's basis. Another
             // admitted read could outlast the deadline on a loaded host or behind a
             // publication's COMMIT, also once the head moved during the wait (#1329).
-            (Some(still), Some(ArchitectureWait::AnswersBuilding)) => {
+            (Some(still), true) => {
                 let mut envelope = architecture::failure(id, &anyhow::Error::new(still));
                 envelope["error"]["currentBasis"] = serde_json::json!({
                     "indexGeneration": basis.index_generation.to_string(),
@@ -1324,17 +1320,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 && let Some((registry, _)) = &registry
             {
                 // An architecture read waits for the owner, leaving its deadline's last
-                // second for the answer.
-                let architecture_read =
-                    architecture::is_tool(&name) || name == architecture::PROMPT_NAME;
-                // #851: a find, search or call graph `app` filter reads the head's core too.
-                let app_filtered =
-                    !architecture_read && args.is_some_and(|args| args.contains_key("app"));
-                let architecture_wait = if architecture_read {
-                    Some(ArchitectureWait::AnswersBuilding)
-                } else {
-                    app_filtered.then_some(ArchitectureWait::UntilDeadline)
-                };
+                // second for the `building` answer. A find, search or call graph `app` filter
+                // reads the head's core too (#851), and answers alike (#1278).
+                let architecture_read = architecture::is_tool(&name)
+                    || name == architecture::PROMPT_NAME
+                    || args.is_some_and(|args| args.contains_key("app"));
                 let publish = |sampled: bool| {
                     *resolved.lock().unwrap() = Some((root.to_owned(), sampled));
                 };
@@ -1355,7 +1345,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             .as_str()
                             .expect("validated search query")
                     }),
-                    architecture_wait,
+                    architecture_read,
                     &*tool_read,
                 ) {
                     Ok((found, sampled)) => {

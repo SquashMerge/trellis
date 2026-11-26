@@ -723,7 +723,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 34
+                  "const": 35
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1259,7 +1259,8 @@
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
-                    "workspace_selection_failed"
+                    "workspace_selection_failed",
+                    "building"
                   ]
                 },
                 "message": {
@@ -1329,6 +1330,41 @@
                     "identity_changed",
                     "unavailable"
                   ]
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
                 }
               },
               "required": [
@@ -1337,7 +1373,37 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ]
+              ],
+              "if": {
+                "properties": {
+                  "code": {
+                    "const": "building"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "progress",
+                  "retryAfterMs"
+                ],
+                "properties": {
+                  "retryable": {
+                    "const": true
+                  },
+                  "currentBasis": {
+                    "$ref": "#/$defs/Basis"
+                  },
+                  "currentContentHash": {
+                    "const": null
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "progress": false,
+                  "retryAfterMs": false
+                }
+              }
             }
           },
           "required": [
@@ -2335,7 +2401,8 @@
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
-                    "workspace_selection_failed"
+                    "workspace_selection_failed",
+                    "building"
                   ]
                 },
                 "message": {
@@ -2405,6 +2472,41 @@
                     "identity_changed",
                     "unavailable"
                   ]
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
                 }
               },
               "required": [
@@ -2413,7 +2515,37 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ]
+              ],
+              "if": {
+                "properties": {
+                  "code": {
+                    "const": "building"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "progress",
+                  "retryAfterMs"
+                ],
+                "properties": {
+                  "retryable": {
+                    "const": true
+                  },
+                  "currentBasis": {
+                    "$ref": "#/$defs/Basis"
+                  },
+                  "currentContentHash": {
+                    "const": null
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "progress": false,
+                  "retryAfterMs": false
+                }
+              }
             }
           },
           "required": [
@@ -9548,7 +9680,8 @@
                     "invalid_rules",
                     "bounded_work",
                     "response_too_large",
-                    "workspace_selection_failed"
+                    "workspace_selection_failed",
+                    "building"
                   ]
                 },
                 "message": {
@@ -9618,6 +9751,41 @@
                     "identity_changed",
                     "unavailable"
                   ]
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "reading",
+                            "resolving",
+                            "evaluating",
+                            "measuring"
+                          ]
+                        },
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "$ref": "#/$defs/UInt"
+                        }
+                      },
+                      "required": [
+                        "phase",
+                        "completed",
+                        "total"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "retryAfterMs": {
+                  "$ref": "#/$defs/UInt"
                 }
               },
               "required": [
@@ -9626,7 +9794,37 @@
                 "retryable",
                 "currentBasis",
                 "currentContentHash"
-              ]
+              ],
+              "if": {
+                "properties": {
+                  "code": {
+                    "const": "building"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "progress",
+                  "retryAfterMs"
+                ],
+                "properties": {
+                  "retryable": {
+                    "const": true
+                  },
+                  "currentBasis": {
+                    "$ref": "#/$defs/Basis"
+                  },
+                  "currentContentHash": {
+                    "const": null
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "progress": false,
+                  "retryAfterMs": false
+                }
+              }
             }
           },
           "required": [
