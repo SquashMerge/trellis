@@ -21021,6 +21021,8 @@ mod rebaseline_fault_tests;
 mod recreate_capture_point_tests;
 #[cfg(test)]
 mod recreate_spool_tests;
+#[cfg(test)]
+mod recreate_upgrade_marker_tests;
 
 #[cfg(test)]
 mod sqlite_schema_race_tests;
