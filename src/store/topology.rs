@@ -1396,8 +1396,9 @@ pub(crate) fn index_stage_name(name: &str) -> Option<&str> {
 }
 
 /// A derived index directory's entries as GC sees them. Besides `index.db` and
-/// `requests.db`, only dead recreation stages (any schema) and semantic batch
-/// stages (an earlier schema only) can be collected with the index.
+/// `requests.db`, only dead recreation stages and semantic batch stages can be
+/// collected with an eligible index: under its verified EX use lock no worker
+/// can hold either (#1316, owner 2026-11-25).
 #[derive(Default)]
 struct GcInventory {
     requests: bool,
@@ -1442,14 +1443,10 @@ fn gc_inventory(dir: &Path) -> Result<std::result::Result<GcInventory, &'static 
 }
 
 /// Whether GC's inventory rule admits a directory the inspection found eligible.
-fn gc_inventory_skip(dir: &Path, old_schema: bool) -> Option<&'static str> {
+fn gc_inventory_skip(dir: &Path) -> Option<&'static str> {
     match gc_inventory(dir) {
         Err(_) => Some("metadata_unreadable"),
         Ok(Err(reason)) => Some(reason),
-        // T06: a current-schema index skips while semantic stage residue exists.
-        Ok(Ok(inventory)) if !old_schema && !inventory.semantic.is_empty() => {
-            Some("semantic_stage_residue")
-        }
         Ok(Ok(_)) => None,
     }
 }
@@ -1524,9 +1521,6 @@ fn gc_remove_candidate(
         let reason = if !old_index_schema(version) {
             if version != i64::from(super::DATABASE_SCHEMA_VERSION) {
                 return Ok(Err("unknown_index_schema"));
-            }
-            if !inventory.semantic.is_empty() {
-                return Ok(Err("semantic_stage_residue"));
             }
             // The cheap root and age test first (#1316); every check below still
             // runs before an eligible candidate is unlinked.
@@ -2012,10 +2006,8 @@ impl TopologyRoots {
                             .unwrap_or(("unknown", "metadata_unreadable"));
                         // Eligible only if GC's inventory rule would admit it too (#1316).
                         let result = match result {
-                            ("eligible", reason) => {
-                                gc_inventory_skip(&entry.path(), reason == "old_schema")
-                                    .map_or(result, |skip| ("unknown", skip))
-                            }
+                            ("eligible", _) => gc_inventory_skip(&entry.path())
+                                .map_or(result, |skip| ("unknown", skip)),
                             _ => result,
                         };
                         if guard.verify().is_err() {

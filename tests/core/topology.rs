@@ -1914,9 +1914,10 @@ fn old_schema_index_with_stage_residue_is_collected() {
     assert!(!roots.index_use_lock(&old).exists());
 }
 
-/// #1316: a current-schema eligible index with a dead recreation stage is
-/// collected with it. Hot journals and semantic stage residue still make GC skip
-/// (Decision 0006 §2, T06), and `gc --report` says so instead of "eligible".
+/// #1316: a current-schema eligible index is collected with its dead recreation
+/// stage, or with semantic stage residue (owner 2026-11-25). Residue never makes
+/// an index eligible: a live, recent one with residue is kept. Hot journals still
+/// make GC skip (Decision 0006 §2), and `gc --report` says so instead of "eligible".
 #[cfg(feature = "test-support")]
 #[test]
 fn gc_report_and_gc_agree_on_index_residue() {
@@ -1925,7 +1926,15 @@ fn gc_report_and_gc_agree_on_index_residue() {
     let staged = gc_candidate(temp.path(), &roots, "dead-stage", false);
     leave_dead_stage(&roots.index_dir(&staged));
     let semantic = gc_candidate(temp.path(), &roots, "semantic-residue", false);
-    fs::create_dir(roots.index_dir(&semantic).join("semantic-stage-r-1-c-2")).unwrap();
+    let semantic_stage = roots.index_dir(&semantic).join("semantic-stage-r-1-c-2");
+    fs::create_dir(&semantic_stage).unwrap();
+    fs::write(semantic_stage.join("stage.db"), b"semantic stage").unwrap();
+    let live_root = temp.path().join("live-residue");
+    fs::create_dir(&live_root).unwrap();
+    drop(common::open_store(temp.path(), &live_root).unwrap());
+    let live = WorkspaceIdentity::discover(Some(&live_root), &live_root).unwrap();
+    let live_stage = roots.index_dir(&live).join("semantic-stage-r-2-c-3");
+    fs::create_dir(&live_stage).unwrap();
     let hot = gc_candidate(temp.path(), &roots, "hot-queue", false);
     fs::write(roots.index_dir(&hot).join("requests.db-journal"), b"hot").unwrap();
     let old_hot = gc_candidate(temp.path(), &roots, "old-hot", true);
@@ -1943,20 +1952,29 @@ fn gc_report_and_gc_agree_on_index_residue() {
         (entry.status, entry.reason)
     };
     assert_eq!(verdict(&staged), ("eligible", "root_missing"));
-    assert_eq!(verdict(&semantic), ("unknown", "semantic_stage_residue"));
+    assert_eq!(verdict(&semantic), ("eligible", "root_missing"));
+    assert_eq!(verdict(&live), ("unknown", "recent_open"));
     assert_eq!(verdict(&hot), ("unknown", "hot_journal"));
     assert_eq!(verdict(&old_hot), ("unknown", "metadata_unreadable"));
     let run = roots
         .gc_run_at_with_hook(&current, &writer, now, &mut |_| Ok(()))
         .unwrap();
-    let collected: Vec<_> = run
+    let mut collected: Vec<_> = run
         .collected
         .iter()
         .map(|entry| (entry.root_key.clone(), entry.reason))
         .collect();
-    assert_eq!(collected, vec![(staged.root_key.clone(), "root_missing")]);
+    let mut expected = vec![
+        (staged.root_key.clone(), "root_missing"),
+        (semantic.root_key.clone(), "root_missing"),
+    ];
+    collected.sort();
+    expected.sort();
+    assert_eq!(collected, expected);
+    assert!(!roots.index_dir(&semantic).exists(), "residue goes with it");
+    assert!(live_stage.exists(), "a kept index keeps its residue");
     for (identity, reason) in [
-        (&semantic, "semantic_stage_residue"),
+        (&live, "recent_open"),
         (&hot, "hot_journal"),
         (&old_hot, "hot_journal"),
     ] {
