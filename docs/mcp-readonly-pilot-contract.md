@@ -1474,3 +1474,10 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **Reserved.** `semantic producer does not cover this language; showing syntax` and `no semantic producer published; showing syntax` are only for a language with no such state that no published producer covers.
 - **Describe.** A `LanguageStatus.semantic.note` of a language without a selected producer follows the same labels, so describe and the call tools say the same thing.
 - **Unchanged.** A language with a selected producer has no coverage note: its older-basis, catching-up and needs-re-import documents stay labelled per item by `SemanticProjection` and in `semanticStatus`.
+
+## Amendment (#1321): `bounded_work` names its bound
+
+**Status:** implemented (supervisor-ratified under the [#1119 follow-up ruling](https://github.com/SquashMerge/trellis/issues/1119), which names the bound of `input_bounds_exceeded`). It changes only the value of an existing message; no tool object, schema, field or bound changes, and `toolVersion` stays as it is.
+
+- **Message.** A `bounded_work` failure of the architecture tools, and of find, search and the call graph with `app`, says `Architecture projection work bound exceeded: <bound>`, where `<bound>` is the refusal's text after its code. The Architecture snapshot's byte bounds name the limit and the observed value, for example `architecture stored total: 672452376 bytes, over the 512 MiB limit` ([rules](rules.md#work-bounds-and-located-failures)). The browser's Architecture answer carries the same message with code `bounded_work`, instead of `Storage is unavailable`.
+- **Unchanged.** The code, `retryable:false`, the kept failure and every bound and its value.

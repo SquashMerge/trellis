@@ -1948,6 +1948,13 @@ async fn metrics_family_answer(
                     ));
                 }
             }
+            // #1321: a work bound is named, with the observed value, as on MCP.
+            if let Some(message) = crate::mcp::tools::bounded_work_message(&error) {
+                return Ok((
+                    api_error::error(StatusCode::SERVICE_UNAVAILABLE, "bounded_work", &message),
+                    false,
+                ));
+            }
             return Err(ApiError::from(error));
         }
     };
