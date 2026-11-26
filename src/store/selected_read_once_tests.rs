@@ -442,3 +442,63 @@ fn architecture_read_a_names_the_stored_total_it_exceeds() {
     );
     read_a_under(&store, stored_limit(total)).0.unwrap();
 }
+
+#[test]
+fn architecture_read_a_charges_only_the_rows_it_decodes() {
+    // Owner ruling 2026-11-26 (#1321): the stored total counts each document's source and the
+    // native rows Read A decodes, and the retained inputs, not the rows it never reads
+    // (references, coverage roles, class rows, the class extraction).
+    let (_state, _root, store) = published_store(3);
+    let stored_limit = |stored| ArchitectureByteLimits {
+        stored,
+        ..ArchitectureByteLimits::READ_A
+    };
+    let message = read_a_under(&store, stored_limit(1))
+        .0
+        .unwrap_err()
+        .to_string();
+    let charged: u64 = message
+        .strip_prefix("bounded_work: architecture stored total: ")
+        .and_then(|rest| rest.strip_suffix(" bytes, over the 1-byte limit"))
+        .unwrap_or_else(|| panic!("{message}"))
+        .parse()
+        .unwrap();
+    let response = store.evidence_response().unwrap();
+    let selected = response.selected(None).unwrap();
+    let paths: Vec<String> = response
+        .db
+        .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
+        .unwrap()
+        .query_map([&selected.key], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(paths.len(), 3);
+    let (mut every_row, mut decoded) = (0u64, 0u64);
+    for path in &paths {
+        let header = response
+            .store
+            .fetch_selected_header(&response.db, path, &selected, None)
+            .unwrap();
+        every_row += header.stored_bytes;
+        decoded += header.read_a_bytes;
+    }
+    let retained: i64 = response
+        .db
+        .query_row(
+            "SELECT length(CAST(retained_dependencies AS BLOB))
+                    +length(CAST(retained_config AS BLOB))
+             FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(response);
+    assert!(
+        decoded < every_row,
+        "the fixture has rows Read A does not decode: {decoded} < {every_row}"
+    );
+    assert_eq!(charged, decoded + retained as u64);
+    // A limit at that total admits the revision, below what every row would charge.
+    read_a_under(&store, stored_limit(charged)).0.unwrap();
+}

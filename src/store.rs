@@ -980,8 +980,10 @@ pub(crate) struct ArchitectureByteLimits {
     pub(crate) document: u64,
     /// All admitted captured source, plus present retained-manifest and root-config bytes.
     pub(crate) source: u64,
-    /// All stored bytes the read charges: each document's header charge, plus the retained
-    /// dependency and config inputs.
+    /// All stored bytes the read charges: each document's source and the native rows the read
+    /// decodes, plus the retained dependency and config inputs (owner ruling 2026-11-26,
+    /// #1321). Rows the read never decodes (references, class rows, capability, macro and
+    /// coverage rows, the class extraction) are not charged.
     pub(crate) stored: u64,
 }
 
@@ -1066,40 +1068,40 @@ fn limit_text(bytes: u64) -> String {
     }
 }
 
-const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(CASE WHEN NOT class THEN row_bytes END),0),COALESCE(sum(CASE WHEN class THEN row_bytes END),0) FROM (
-SELECT ?3+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_coverage_roles x WHERE x.vid=?1
+const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(CASE WHEN NOT class THEN row_bytes END),0),COALESCE(sum(CASE WHEN class THEN row_bytes END),0),COALESCE(sum(CASE WHEN read_a THEN row_bytes END),0) FROM (
+SELECT ?3+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class,0 AS read_a FROM native_version_coverage_roles x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.lookup_key AS BLOB)),0)+COALESCE(length(CAST(x.key_signature_present AS BLOB)),0)+COALESCE(length(CAST(x.key_type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.key_variadic AS BLOB)),0)+COALESCE(length(CAST(x.key_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.name_start AS BLOB)),0)+COALESCE(length(CAST(x.name_end AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_declarations x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.lookup_key AS BLOB)),0)+COALESCE(length(CAST(x.key_signature_present AS BLOB)),0)+COALESCE(length(CAST(x.key_type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.key_variadic AS BLOB)),0)+COALESCE(length(CAST(x.key_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.name_start AS BLOB)),0)+COALESCE(length(CAST(x.name_end AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_declarations x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.sibling_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.signature_present AS BLOB)),0)+COALESCE(length(CAST(x.type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_declaration_ancestors x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.sibling_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.signature_present AS BLOB)),0)+COALESCE(length(CAST(x.type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_declaration_ancestors x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_own_signature_types x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_own_signature_types x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ancestor_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_ancestor_signature_types x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ancestor_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_ancestor_signature_types x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.result_type AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_headers x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.result_type AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_headers x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.item_kind AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.value AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_header_items x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.item_kind AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.value AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_header_items x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_parameters x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_parameters x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.callee_start AS BLOB)),0)+COALESCE(length(CAST(x.callee_end AS BLOB)),0)+COALESCE(length(CAST(x.spelling AS BLOB)),0)+?4+COALESCE(length(CAST(x.language AS BLOB)),0)+COALESCE(length(CAST(x.callee_lookup_key AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_calls x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.callee_start AS BLOB)),0)+COALESCE(length(CAST(x.callee_end AS BLOB)),0)+COALESCE(length(CAST(x.spelling AS BLOB)),0)+?4+COALESCE(length(CAST(x.language AS BLOB)),0)+COALESCE(length(CAST(x.callee_lookup_key AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_calls x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+(CASE WHEN x.parent_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.arm AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_control_regions x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+(CASE WHEN x.parent_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.arm AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_control_regions x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+(CASE WHEN x.call_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.region_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_call_regions x WHERE x.vid=?1
+SELECT ?3+(CASE WHEN x.call_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.region_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class,1 AS read_a FROM native_version_call_regions x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+78+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+length(CAST(x.spelling AS BLOB))+length(CAST(COALESCE(x.lookup_key,x.spelling) AS BLOB)) AS row_bytes,0 AS class FROM native_version_references x WHERE x.vid=?1
+SELECT ?3+78+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+length(CAST(x.spelling AS BLOB))+length(CAST(COALESCE(x.lookup_key,x.spelling) AS BLOB)) AS row_bytes,0 AS class,0 AS read_a FROM native_version_references x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.available AS BLOB))+COALESCE(length(CAST(x.diagnostic AS BLOB)),0)+length(CAST(x.ordinal AS BLOB)) AS row_bytes,0 AS class FROM native_version_capability_families x WHERE x.vid=?1
+SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.available AS BLOB))+COALESCE(length(CAST(x.diagnostic AS BLOB)),0)+length(CAST(x.ordinal AS BLOB)) AS row_bytes,0 AS class,0 AS read_a FROM native_version_capability_families x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB))+length(CAST(x.diagnostic AS BLOB)) AS row_bytes,0 AS class FROM native_version_capability_gaps x WHERE x.vid=?1
+SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB))+length(CAST(x.diagnostic AS BLOB)) AS row_bytes,0 AS class,0 AS read_a FROM native_version_capability_gaps x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB)) AS row_bytes,0 AS class FROM native_version_macro_expansions x WHERE x.vid=?1
+SELECT ?3+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB)) AS row_bytes,0 AS class,0 AS read_a FROM native_version_macro_expansions x WHERE x.vid=?1
 UNION ALL
-SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(SELECT length(graph_hash)+9 FROM graph_projections WHERE gid=x.gid)+39+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM classes x WHERE x.cid=?2
+SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(SELECT length(graph_hash)+9 FROM graph_projections WHERE gid=x.gid)+39+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class,0 AS read_a FROM classes x WHERE x.cid=?2
 UNION ALL
-SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class FROM class_relations x WHERE x.cid=?2
+SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes,1 AS class,0 AS read_a FROM class_relations x WHERE x.cid=?2
 )"#;
 const DATABASE_SCHEMA_VERSION: u32 = 50;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
@@ -1327,6 +1329,9 @@ pub(crate) struct SelectedHeader {
     /// The source, native and class ancillary rows, graph rows and F this
     /// document's rows hold, in stored bytes, as its budgets measured them.
     stored_bytes: u64,
+    /// The part of `stored_bytes` an Architecture Read A decodes: the source and the
+    /// declaration, call and control-region rows (owner ruling 2026-11-26, #1321).
+    read_a_bytes: u64,
 }
 
 /// One selected document's stored source and native rows,
@@ -2119,7 +2124,7 @@ impl EvidenceResponse {
             };
             let (bytes, stored) = match (reused, &header) {
                 (Some(sizes), _) => sizes,
-                (None, Some(header)) => (header.bytes, header.stored_bytes),
+                (None, Some(header)) => (header.bytes, header.read_a_bytes),
                 (None, None) => unreachable!("a document is kept or has a header"),
             };
             let document_bytes = bytes.max(0) as u64;
@@ -19188,8 +19193,9 @@ impl Store {
         Ok(())
     }
 
-    // SQL aggregates the selected path's ancillary native and class rows.
-    // SourceFile JSON has its own envelope; derived graph bytes are checked
+    // SQL aggregates the selected path's ancillary native and class rows: the largest row,
+    // the native and the class rows' bytes, and the bytes of the native rows Architecture
+    // Read A decodes. SourceFile JSON has its own envelope; derived graph bytes are checked
     // after source and native rows are decoded.
     fn selected_ancillary_byte_usage(
         db: &Connection,
@@ -19197,7 +19203,7 @@ impl Store {
         cid: i64,
         version_id: &str,
         source_set_id: &str,
-    ) -> Result<(i64, i64, i64)> {
+    ) -> Result<(i64, i64, i64, i64)> {
         Ok(db.prepare_cached(SELECTED_ANCILLARY_BYTE_SQL)?.query_row(
             params![
                 vid,
@@ -19205,7 +19211,7 @@ impl Store {
                 version_id.len() as i64,
                 source_set_id.len() as i64
             ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?)
     }
     /// Read one selected document and project its graph once from the stored
@@ -19390,7 +19396,7 @@ impl Store {
             "incompatible_index: selected evidence row budget exceeded"
         );
         optional_hint_check(progress)?;
-        let (max_row, native_bytes, class_bytes) =
+        let (max_row, native_bytes, class_bytes, read_a_native_bytes) =
             Self::selected_ancillary_byte_usage(db, vid, cid, &version_id, &source_set)?;
         selected_ensure!(
             max_row >= 0
@@ -19409,6 +19415,10 @@ impl Store {
             .iter()
             .map(|&n| u64::try_from(n).unwrap_or(0))
             .sum();
+        let read_a_bytes = [bytes, read_a_native_bytes]
+            .iter()
+            .map(|&n| u64::try_from(n).unwrap_or(0))
+            .sum();
         Ok(SelectedHeader {
             path: path.to_owned(),
             language,
@@ -19416,6 +19426,7 @@ impl Store {
             bytes,
             scope,
             stored_bytes,
+            read_a_bytes,
         })
     }
     pub(crate) fn fetch_selected_rows(
@@ -19444,6 +19455,7 @@ impl Store {
             bytes,
             scope,
             stored_bytes,
+            read_a_bytes: _,
         } = header;
         let path = path.as_str();
         let file = Self::selected_source_row_bounded_for_inner(
@@ -20830,12 +20842,16 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let actual = Store::selected_ancillary_byte_usage(&db, 1, 3, version, source_set).unwrap();
     // The last three rows are the two classes and their relation.
     let (native, class) = rows.split_at(rows.len() - 3);
+    // Read A decodes the declaration, call, control-region and call-region rows, not the
+    // coverage role or the references (#1321).
+    let read_a = &rows[1..5];
     assert_eq!(
         actual,
         (
             *rows.iter().max().unwrap() as i64,
             native.iter().sum::<usize>() as i64,
             class.iter().sum::<usize>() as i64,
+            read_a.iter().sum::<usize>() as i64,
         )
     );
 }
