@@ -312,15 +312,12 @@ impl DaemonState {
                 None,
                 session.clone(),
             )?;
-            coordinator.run_serving(&options, &Arc::new(AtomicBool::new(false)), |_| {})?;
+            // An explicit daemon stop cancels the capture before it publishes (#1293).
+            coordinator.run_serving(&options, &self.stop, |_| {})?;
             return Ok(session);
         }
         let options = self.startup_options()?;
-        crate::index_coordinator::establish_serving_session(
-            &self.store,
-            Some(&options),
-            &Arc::new(AtomicBool::new(false)),
-        )
+        crate::index_coordinator::establish_serving_session(&self.store, Some(&options), &self.stop)
     }
 
     fn confirm_recovery_disposition(&self) -> anyhow::Result<()> {
@@ -393,6 +390,9 @@ impl DaemonState {
                 self.step_progress.store(true, Ordering::Release);
                 Ok(())
             }
+            // A stop cancelled this attempt: no failure, backoff or blocked
+            // recovery is recorded, and the next activation starts over (#1293).
+            Err(_) if self.stop_requested() => Ok(()),
             Err(error) => {
                 {
                     let mut first = self.startup_error.lock().unwrap();
@@ -908,6 +908,43 @@ impl DaemonState {
         RetireOutcome::Requested
     }
 
+    /// The explicit daemon stop command (#1293, owner ruling 2026-11-26).
+    /// Unlike a release, it is never declined: accepted work stops at its
+    /// next cancellation point, before any publication, and the worker
+    /// closes the runtime at its next step boundary. Queued and running
+    /// requests stay durable and recover on the next activation (Decision
+    /// 0008 §3); first-index work restarts there.
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.watcher_cancel.store(true, Ordering::Release);
+        // Waiters re-read their state and see the stop.
+        self.store.notify_terminal_waiters();
+        self.note_state_change();
+        self.inbox.wake();
+    }
+
+    /// Whether an explicit daemon stop was requested for this runtime.
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// The worker's stop step: close at this boundary, whatever is accepted.
+    pub(super) fn close_for_stop(&self) {
+        let held = {
+            let mut state = self.runtime.lock().unwrap();
+            match std::mem::replace(&mut *state, RuntimeState::Closing) {
+                RuntimeState::Ready(session) => Some(session),
+                RuntimeState::RetireRequested { session, .. } => session,
+                RuntimeState::Retired => {
+                    *state = RuntimeState::Retired;
+                    return;
+                }
+                _ => None,
+            }
+        };
+        self.close(held);
+    }
+
     /// The worker's retirement step. A FIFO row accepted around the request
     /// (through any Store) cancels it. Otherwise one attempt at watcher
     /// intent up to the cutoff, then the `Closing` linearization and close.
@@ -1196,6 +1233,13 @@ fn worker_loop_with_wait(
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
         if step.is_err() {
             state.publish_fifo_pending();
+        }
+        // A runtime this step retired (a stop or a release) has no further
+        // work: end now, so a waiting `gc --run` gets its answer (#1293).
+        if matches!(*state.runtime.lock().unwrap(), RuntimeState::Retired) {
+            state.fail_requested_gc();
+            state.note_state_change();
+            return;
         }
         deadline = match step {
             Ok(Ok(())) => {

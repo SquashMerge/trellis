@@ -237,6 +237,9 @@ impl CheckoutRuntime {
                         "; inspect job status",
                     ));
                 }
+                "queued" | "running" if resources.scheduler.stop_requested() => {
+                    anyhow::bail!("{}", super::STOPPING_ACCEPTED);
+                }
                 "queued" | "running" => {
                     crate::index_coordinator::diagnostic_marker(
                         "-",
@@ -288,6 +291,9 @@ impl CheckoutRuntime {
                     );
                 }
                 "failed" => return Err(failed_request_error(&row, "index_failed", "")),
+                "queued" | "running" if resources.scheduler.stop_requested() => {
+                    anyhow::bail!("{}", super::STOPPING_ACCEPTED);
+                }
                 "queued" | "running" => resources.store.wait_terminal_change(seen),
                 _ => anyhow::bail!("store_unavailable: invalid request state"),
             }

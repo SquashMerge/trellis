@@ -23,6 +23,9 @@ use std::{
 pub const BROWSER_IDLE_DELAY: Duration = Duration::from_secs(15 * 60);
 pub const CHECKOUT_RELEASE_DELAY: Duration = Duration::from_secs(15 * 60);
 pub const DAEMON_IDLE_DELAY: Duration = Duration::from_secs(30 * 60);
+/// A client wait an explicit daemon stop ended (#1293). The accepted
+/// request is durable and runs on the checkout's next activation.
+pub const STOPPING_ACCEPTED: &str = "daemon_unavailable: the daemon is stopping; the accepted request stays queued and runs when the checkout next activates";
 /// A closing runtime finishes bounded local work (watcher, session, witness
 /// handles); activation waits this long for it before reporting not ready.
 const RETIRED_WAIT: Duration = Duration::from_secs(5);
@@ -1058,6 +1061,15 @@ impl CheckoutRuntime {
         self.resources()
             .ok()
             .and_then(|resources| resources.scheduler.startup_error())
+    }
+
+    /// Whether this runtime is stopping with the daemon (#1293), or already
+    /// gave up its resources: a client wait on it ends instead of waiting.
+    pub fn stopping(&self) -> bool {
+        match self.resources() {
+            Ok(resources) => resources.scheduler.stop_requested(),
+            Err(_) => true,
+        }
     }
 
     /// The runtime state version a reader records before retrying a read.

@@ -1190,6 +1190,16 @@ async fn run_daemon() -> Result<()> {
     }
     if stop.is_some() {
         registry::CheckoutRegistry::cancel_producers(registry.clone()).await?;
+        // An explicit stop cancels accepted work instead of draining it
+        // (#1293): connection waits on that work end with it.
+        registry::CheckoutRegistry::request_stop(registry.clone()).await;
+        #[cfg(feature = "test-support")]
+        if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STOP_SOCKET") {
+            use std::io::Write;
+            if let Ok(mut hook) = std::os::unix::net::UnixStream::connect(path) {
+                let _ = hook.write_all(b"S");
+            }
+        }
     }
     stop_daemon_connections(&browser_shutdown, &mut connections).await;
     browser.lock().await.finish_owned().await?;

@@ -302,9 +302,13 @@ pub struct DaemonState {
     search_fill: Mutex<Option<crate::daemon::search_fill::FillRegistration>>,
     /// The checkout's one Architecture owner (#556).
     architecture: architecture::ArchitectureHandle,
-    /// Watcher inventories run on the worker and are never cancelled from
-    /// outside it (Decision 0009 §1).
+    /// Watcher inventories run on the worker. Only an explicit daemon stop
+    /// cancels them, through the stop command (#1293).
     watcher_cancel: CancelFlag,
+    /// The explicit daemon stop command (#1293): sticky, set once. The
+    /// worker's own startup, FIFO and watcher captures observe it at their
+    /// cancellation points, and the worker closes at its next step boundary.
+    stop: CancelFlag,
     #[cfg(feature = "test-support")]
     startup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// A failed startup reconciliation's backoff stays open until retirement.

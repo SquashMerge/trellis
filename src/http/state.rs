@@ -165,6 +165,7 @@ pub fn new_with_config(
         search_fill: Mutex::new(None),
         architecture: architecture::ArchitectureHandle(architecture::ArchitectureOwner::new()),
         watcher_cancel: Arc::new(AtomicBool::new(false)),
+        stop: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
         startup_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
@@ -1289,6 +1290,12 @@ impl DaemonState {
         if self.retired() {
             return Ok(());
         }
+        // An explicit daemon stop closes the runtime at this boundary, before
+        // any further startup, claim or watcher work (#1293).
+        if self.stop_requested() {
+            self.close_for_stop();
+            return Ok(());
+        }
         #[cfg(test)]
         self.test_queue_after_stream.run();
         // Queue openers may provision a missing index directory. Observe its
@@ -1396,6 +1403,7 @@ impl DaemonState {
             let processed = match crate::index_coordinator::drain_one_request_with_watcher(
                 &self.store,
                 session,
+                &self.stop,
                 &self.watcher_work,
                 |id, p| {
                     self.job_progress.lock().unwrap().insert(id.to_owned(), p);
@@ -1432,6 +1440,9 @@ impl DaemonState {
                 },
             ) {
                 Ok(processed) => processed,
+                // A stop interrupted the claim: its row stays running for the next
+                // activation's verified reclaim, and the next step closes (#1293).
+                Err(_) if self.stop_requested() => return Ok(()),
                 Err(error) => {
                     // A failed gate capture retains this watcher and its retry
                     // deadline; only request/completion failures retire the writer.
