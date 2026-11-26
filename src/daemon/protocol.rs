@@ -33,6 +33,39 @@ pub fn check_mcp_identity(value: Option<&serde_json::Value>) -> io::Result<()> {
     }
 }
 
+/// An explicit daemon stop in progress (#1293): the stopping daemon answers
+/// every new request with this, before admitting it, so a client may resend
+/// even a mutation. Retryable: clients wait for the stop, then re-run the
+/// election and reach the successor.
+pub const DAEMON_STOPPING: &str = "daemon_stopping";
+pub const DAEMON_STOPPING_MESSAGE: &str =
+    "daemon_stopping: the daemon is stopping; retry once it has exited";
+
+/// Whether a daemon reply is the stopping daemon's `daemon_stopping` answer.
+pub fn is_stopping(payload: &serde_json::Value) -> bool {
+    payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|error| error.starts_with(DAEMON_STOPPING))
+}
+
+/// The `daemon_stopping` answer as an I/O error cause.
+#[derive(Debug)]
+pub struct DaemonStopping;
+impl std::fmt::Display for DaemonStopping {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(DAEMON_STOPPING_MESSAGE)
+    }
+}
+impl std::error::Error for DaemonStopping {}
+
+/// Whether an I/O error carries the `daemon_stopping` answer.
+pub fn stopping_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<DaemonStopping>())
+}
+
 #[derive(Debug)]
 pub struct McpRestartRequired;
 impl std::fmt::Display for McpRestartRequired {

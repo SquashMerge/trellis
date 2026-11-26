@@ -78,24 +78,44 @@ pub(crate) async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         fields.remove("maxFileBytes");
     }
     let socket = socket_path()?;
-    let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
-        .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
-    // Serve registers in place and never waits for a checkout's index work
-    // (Decision 0009 §6).
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    protocol::write_frame(
-        &mut stream,
-        &daemon_request(
-            "serve",
-            serde_json::json!({
-                "workspace": identity.root, "bind": args.bind, "tokenFile": token_file,
-                "options": options_json,
-            }),
-        ),
-    )?;
-    let reply: protocol::Reply = protocol::read_frame(&mut stream)
-        .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
-    let address = checked_reply(reply)?;
+    let registration = daemon_request(
+        "serve",
+        serde_json::json!({
+            "workspace": identity.root, "bind": args.bind, "tokenFile": token_file,
+            "options": options_json,
+        }),
+    );
+    // A stopping daemon answers `daemon_stopping` before admission: wait it
+    // out, bounded, then register with its successor (#1293).
+    let mut stop_wait: Option<client::StopWait> = None;
+    let (mut stream, address) = loop {
+        let connected = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5));
+        let mut stream = match connected {
+            Ok(stream) => stream,
+            Err(_)
+                if stop_wait
+                    .as_mut()
+                    .is_some_and(|wait| wait.pause(&mut client::stderr_progress)) =>
+            {
+                continue;
+            }
+            Err(_) => anyhow::bail!("daemon_unavailable"),
+        };
+        // Serve registers in place and never waits for a checkout's index work
+        // (Decision 0009 §6).
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        protocol::write_frame(&mut stream, &registration)?;
+        let reply: protocol::Reply = protocol::read_frame(&mut stream)
+            .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
+        if protocol::is_stopping(&reply.payload)
+            && stop_wait
+                .get_or_insert_with(|| client::StopWait::new(client::STOP_WAIT))
+                .pause(&mut client::stderr_progress)
+        {
+            continue;
+        }
+        break (stream, checked_reply(reply)?);
+    };
     stream
         .set_read_timeout(None)
         .context("daemon_unavailable: prepare serve control read")?;
@@ -192,5 +212,33 @@ pub(crate) fn stop_existing_daemon() -> Result<serde_json::Value> {
     let reply: protocol::Reply = protocol::read_frame(&mut stream)
         .context("daemon_unavailable: stop completion not received")?;
     ensure!(reply.id == request.id, "invalid daemon stop reply");
+    if protocol::is_stopping(&reply.payload) {
+        // Another stop is under way: wait, bounded, until that owner is gone (#1293).
+        drop(stream);
+        let mut stop_wait = client::StopWait::new(client::STOP_WAIT);
+        while owner_stopping(&socket_path()?) {
+            if !stop_wait.pause(&mut client::stderr_progress) {
+                anyhow::bail!("{}", protocol::DAEMON_STOPPING_MESSAGE);
+            }
+        }
+        return Ok(serde_json::json!({"stopped": false}));
+    }
     checked_reply(reply)
+}
+
+/// Whether the daemon at `socket` answers a no-op request `daemon_stopping`.
+fn owner_stopping(socket: &std::path::Path) -> bool {
+    use std::os::unix::net::UnixStream;
+    (|| -> std::io::Result<bool> {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        protocol::write_frame(
+            &mut stream,
+            &daemon_request("daemon_probe", serde_json::json!({})),
+        )?;
+        let reply: protocol::Reply = protocol::read_frame(&mut stream)?;
+        Ok(protocol::is_stopping(&reply.payload))
+    })()
+    .unwrap_or(false)
 }

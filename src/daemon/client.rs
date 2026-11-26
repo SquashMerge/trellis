@@ -22,6 +22,60 @@ impl CallError {
     }
 }
 
+/// How long a CLI, `serve` or `trellis mcp` attach waits out an explicit
+/// daemon stop before it fails (#1293, owner ruling 2026-11-26).
+pub const STOP_WAIT: Duration = Duration::from_secs(60);
+/// How often a waiting CLI reports on stderr, as the first-index wait does (#842).
+const STOP_WAIT_PROGRESS: Duration = Duration::from_secs(10);
+
+/// A client's wait for a stopping daemon to exit. Each `daemon_stopping`
+/// answer pauses briefly, then the client connects again; once the old owner
+/// has released, that connect re-runs the election and reaches the successor.
+pub struct StopWait {
+    started: Instant,
+    bound: Duration,
+    reported: Option<Instant>,
+}
+
+impl StopWait {
+    pub fn new(bound: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            bound,
+            reported: None,
+        }
+    }
+
+    /// False once the bound has passed. Otherwise report progress (at most
+    /// every 10 s) and pause before the next attempt.
+    pub fn pause(&mut self, progress: &mut dyn FnMut(String)) -> bool {
+        let now = Instant::now();
+        let deadline = self.started + self.bound;
+        if now >= deadline {
+            return false;
+        }
+        if self
+            .reported
+            .is_none_or(|at| now.duration_since(at) >= STOP_WAIT_PROGRESS)
+        {
+            progress(format!(
+                "trellis: the daemon is stopping; waiting to reach its successor ({}s elapsed, waiting up to {}s)",
+                now.duration_since(self.started).as_secs(),
+                self.bound.as_secs()
+            ));
+            self.reported = Some(now);
+        }
+        thread::sleep(Duration::from_millis(50).min(deadline - now));
+        true
+    }
+}
+
+/// Progress of a CLI's stop wait goes to stderr; a closed stderr cannot fail it.
+pub fn stderr_progress(message: String) {
+    use std::io::Write;
+    let _ = writeln!(io::stderr(), "{message}");
+}
+
 /// The starter reports election loss separately from unexpected startup failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartOutcome {
@@ -158,6 +212,10 @@ pub fn call_metrics(
             protocol::write_preface_until(&mut stream, ingress_deadline)?;
             protocol::write_frame_until(&mut stream, request, ingress_deadline)?;
             let admission: Reply = protocol::read_frame_until(&mut stream, ingress_deadline)?;
+            // A stopping daemon answers before admission (#1293): pass it up.
+            if admission.id == request.id && protocol::is_stopping(&admission.payload) {
+                return Ok(admission);
+            }
             if admission.id != request.id
                 || admission.payload != serde_json::json!({"admitted": true})
             {
@@ -303,6 +361,9 @@ fn attach_mcp(
         if error.starts_with(protocol::MCP_RESTART_REQUIRED) {
             return Err(io::Error::other(protocol::McpRestartRequired));
         }
+        if error.starts_with(protocol::DAEMON_STOPPING) {
+            return Err(io::Error::other(protocol::DaemonStopping));
+        }
         return Err(io::Error::other(error.to_owned()));
     }
     protocol::check_mcp_identity(reply.payload.get("mcpIdentity"))?;
@@ -329,6 +390,27 @@ fn mcp_failure(
             "code":-32603, "message":protocol::MCP_RESTART_MESSAGE,
             "data":{"code":protocol::MCP_RESTART_REQUIRED, "retryable":false}
         }});
+    }
+    if code == protocol::DAEMON_STOPPING
+        && value.get("method").and_then(|v| v.as_str()) == Some("tools/call")
+        && let Some(name) = value
+            .pointer("/params/name")
+            .and_then(|v| v.as_str())
+            .filter(|name| crate::mcp::catalog::known(name))
+    {
+        // Application validation still takes precedence; nothing was answered.
+        let envelope = match crate::mcp::tools::validate(name, value.pointer("/params/arguments")) {
+            Err(error) => crate::mcp::tools::failure(&id, error),
+            Ok(_) => crate::mcp::tools::failure(&id, protocol::DAEMON_STOPPING),
+        };
+        let modern = value.pointer("/params/_meta").is_some();
+        return json!({"jsonrpc":"2.0","id":id,
+            "result":crate::mcp::tools::result(name, envelope, modern)});
+    }
+    if code == protocol::DAEMON_STOPPING {
+        return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,
+            "message":protocol::DAEMON_STOPPING_MESSAGE,
+            "data":{"code":protocol::DAEMON_STOPPING,"retryable":true}}});
     }
     if matches!(code, "daemon_unavailable" | "selection_unavailable")
         && value.get("method").and_then(|v| v.as_str()) == Some("tools/call")
@@ -951,6 +1033,8 @@ struct Relay<'a, W: std::io::Write> {
     daemon: Option<DaemonConnection>,
     generation: u64,
     restart_required: bool,
+    /// The last reconnect reached a stopping daemon (#1293).
+    stopping: bool,
     connect: Reconnect<'a>,
     attachments:
         std::collections::BTreeMap<std::path::PathBuf, crate::store::topology::WorkspaceIdentity>,
@@ -966,6 +1050,10 @@ impl<W: std::io::Write> Relay<'_, W> {
     fn connection_failure(&self, value: &serde_json::Value) -> serde_json::Value {
         let code = if self.restart_required {
             protocol::MCP_RESTART_REQUIRED
+        } else if self.stopping {
+            // The reconnect reached a stopping daemon: the call keeps its own
+            // deadline and answers the retryable code instead of waiting (#1293).
+            protocol::DAEMON_STOPPING
         } else {
             "daemon_unavailable"
         };
@@ -1042,9 +1130,11 @@ impl<W: std::io::Write> Relay<'_, W> {
                     self.restart_required = error
                         .get_ref()
                         .is_some_and(|cause| cause.is::<protocol::McpRestartRequired>());
+                    self.stopping = protocol::stopping_error(&error);
                     return false;
                 }
             };
+            self.stopping = false;
             if let (Some(init), true) = (&self.legacy_init, legacy && self.legacy_ready) {
                 let mut setup = format!("{SETUP_RELAY_ID} ").into_bytes();
                 setup.extend_from_slice(init);
@@ -1539,7 +1629,32 @@ pub fn relay_stdio(
             Ok(DaemonConnection { stream, generation })
         }
     };
-    let (first, restart_required) = match open(Ok(stream), 0, &[]) {
+    // The launch attach waits out an explicit daemon stop (#1293), bounded,
+    // then reaches the successor; any other failure is typed, never a raw
+    // I/O error such as a read timeout's EAGAIN.
+    let mut attached = open(Ok(stream), 0, &[]);
+    let mut stop_wait: Option<StopWait> = None;
+    loop {
+        let waiting = match &attached {
+            Err(error) if protocol::stopping_error(error) => true,
+            Err(error) => {
+                stop_wait.is_some()
+                    && !error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<protocol::McpRestartRequired>())
+            }
+            Ok(_) => false,
+        };
+        if !waiting
+            || !stop_wait
+                .get_or_insert_with(|| StopWait::new(STOP_WAIT))
+                .pause(&mut |_| {})
+        {
+            break;
+        }
+        attached = open(reconnect(), 0, &[]);
+    }
+    let (first, restart_required) = match attached {
         Ok(first) => (Some(first), false),
         Err(error)
             if error
@@ -1548,7 +1663,16 @@ pub fn relay_stdio(
         {
             (None, true)
         }
-        Err(error) => return Err(error),
+        // The daemon's own typed answer (for example `root_changed`), or the stop.
+        Err(error) if error.kind() == io::ErrorKind::Other => return Err(error),
+        Err(error) => {
+            return Err(io::Error::other(match error.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                    "daemon_unavailable: the daemon did not answer the MCP attach in time"
+                }
+                _ => "daemon_unavailable: the MCP attach failed",
+            }));
+        }
     };
     let mut relay = Relay {
         workspace,
@@ -1563,6 +1687,7 @@ pub fn relay_stdio(
         daemon: first,
         generation: 0,
         restart_required,
+        stopping: false,
         connect: Box::new(move |generation, attachments| {
             open(reconnect(), generation, attachments)
         }),
@@ -1793,6 +1918,7 @@ mod reply_gate_tests {
                 daemon: None,
                 generation: 0,
                 restart_required: false,
+                stopping: false,
                 connect: Box::new(|_, _| Err(io::Error::other("no daemon in this fixture"))),
                 attachments: Default::default(),
                 legacy_init: None,

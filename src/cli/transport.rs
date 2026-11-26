@@ -39,10 +39,39 @@ pub(super) fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value>
         .context("invalid daemon reply")
 }
 
+/// Send `request`, waiting out an explicit daemon stop (#1293): a
+/// `daemon_stopping` answer was given before admission, so even a mutation is
+/// sent again, to the successor, within the stop wait (60 s; `trellis api`
+/// keeps its own 25 s bound). Progress goes to stderr every 10 s. Only an
+/// attempt that never wrote (`daemon_unavailable`) is retried inside the wait.
 pub(crate) fn send_daemon(
     request: &protocol::Request,
     read_only: bool,
 ) -> Result<serde_json::Value> {
+    let bound = if request.operation == "api" {
+        CLI_API_REPLY_BOUND.min(client::STOP_WAIT)
+    } else {
+        client::STOP_WAIT
+    };
+    let mut stop_wait: Option<client::StopWait> = None;
+    loop {
+        let reply = send_daemon_once(request, read_only);
+        let stopping = match &reply {
+            Ok(reply) => protocol::is_stopping(&reply.payload),
+            Err(error) => stop_wait.is_some() && error.to_string() == "daemon_unavailable",
+        };
+        if stopping
+            && stop_wait
+                .get_or_insert_with(|| client::StopWait::new(bound))
+                .pause(&mut client::stderr_progress)
+        {
+            continue;
+        }
+        return checked_reply(reply?);
+    }
+}
+
+fn send_daemon_once(request: &protocol::Request, read_only: bool) -> Result<protocol::Reply> {
     let socket = socket_path()?;
     if request.operation == "metrics" {
         let started = Instant::now();
@@ -73,7 +102,7 @@ pub(crate) fn send_daemon(
             )
         })
         .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
-        return checked_reply(reply);
+        return Ok(reply);
     }
     // Index replies only once its request is terminal, which takes as long as
     // the checkout needs (#179). Its bound is a liveness backstop: a checkout
@@ -125,5 +154,5 @@ pub(crate) fn send_daemon(
         Ok(stream)
     })
     .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
-    checked_reply(reply)
+    Ok(reply)
 }
