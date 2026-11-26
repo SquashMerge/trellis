@@ -836,7 +836,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("recovery_required")
+            .contains("index_not_ready: recreating index after upgrade")
     );
     let (pin, _session) = trellis::index_coordinator::reconcile_workspace(
         &store,
@@ -3643,7 +3643,9 @@ fn schemas16_19_23_24_26_27_28_29_30_31_38_and39_recreate_exclusively_without_mi
         );
         let error = store.status().unwrap_err();
         assert!(
-            error.to_string().contains("recovery_required"),
+            error
+                .to_string()
+                .contains("index_not_ready: recreating index after upgrade"),
             "schema{old_version}: {error:#}"
         );
         let (pin, _owner) = trellis::index_coordinator::reconcile_workspace(
