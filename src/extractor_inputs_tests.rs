@@ -159,6 +159,10 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "post-native semantic join: keeps one role-site syntax tree for type relationships",
     ),
     (
+        "src/capture_partial_files_tests.rs",
+        "tests that the checkout's own sources parse without a partial file (#1328)",
+    ),
+    (
         "src/semantic_import_complexity_tests.rs",
         "post-native semantic parser reservation tests",
     ),

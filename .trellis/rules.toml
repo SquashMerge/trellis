@@ -81,7 +81,7 @@ paths = [
   # A tree-sitter extractor run at capture time (#998). The persisted Catalog record and its
   # composition are in src/class_catalog.rs, shared (S13).
   "src/classes.rs", "src/classes/**",
-  "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/watch.rs",
+  "src/index_coordinator.rs", "src/index_coordinator/**", "src/capture.rs", "src/capture_partial_files_tests.rs", "src/watch.rs",
   "src/native_evidence.rs", "src/native_evidence/**", "src/native_capture.rs",
   # Storage's spool reader trait, implemented by delegation (S15 seam A).
   "src/native_spool_reader.rs",
