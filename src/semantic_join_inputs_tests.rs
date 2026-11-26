@@ -316,7 +316,7 @@ const NON_OUTPUT_STORE_ITEMS: &[(&str, &str)] = &[
         "the test oracle's re-authenticated producer descriptor",
     ),
     (
-        "CACHE_SCHEMA_V49",
+        "CACHE_SCHEMA_V50",
         "the schema text; a change bumps the schema version",
     ),
     (

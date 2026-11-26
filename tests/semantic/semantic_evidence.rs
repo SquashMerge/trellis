@@ -586,6 +586,13 @@ fn captured_basis_is_authenticated_before_requested_freshness() {
         d.revision_id = native.revision.id.clone();
     }
     semantic.coverage[0].revision_id = native.revision.id.clone();
+    // A revision identity alone no longer makes evidence possibly stale (#1327); another
+    // requested producer version does.
+    for p in &mut semantic.provenance {
+        p.freshness = s::Freshness::Fresh;
+    }
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    captured.requested_producers[0].version = "v2".into();
     for p in &mut semantic.provenance {
         p.freshness = s::Freshness::PossiblyStale;
     }
@@ -1173,7 +1180,9 @@ fn captured_manifest_uses_language_enum_order_not_alphabetical_order() {
         proof.basis.as_mut().unwrap().revision_id = captured_id.clone();
         proof.basis.as_mut().unwrap().source_manifest_hash =
             native_ids::digest(b"", &native_ids::canonical(&manifest));
-        proof.freshness = s::Freshness::PossiblyStale;
+        // The extra captured document is JavaScript, outside the Rust producer's languages, so
+        // the Rust evidence stays fresh (#1327).
+        proof.freshness = s::Freshness::Fresh;
     }
     assert_ne!(old, captured_id);
     s::validate_evidence(&semantic, &native, &captured).unwrap();

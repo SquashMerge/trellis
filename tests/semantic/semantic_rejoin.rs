@@ -356,7 +356,9 @@ fn unchanged_caller_revalidates_destination_and_mints_raw_linked_proofs() {
     assert!(!result.publication.declaration_bindings.is_empty());
     for p in &result.publication.provenance {
         assert_eq!(p.revision_id, destination.revision.id);
-        assert_eq!(p.freshness, semantic::Freshness::PossiblyStale);
+        // Only the revision identity differs: the producer's documents, context and producer
+        // are unchanged, so the rejoined proof is fresh (rule 2 as amended, #1327).
+        assert_eq!(p.freshness, semantic::Freshness::Fresh);
         let raw = p.derived_from.as_ref().unwrap();
         let claim = inventory
             .lookup(

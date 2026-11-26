@@ -45,6 +45,14 @@ Resolved semantic calls carried `dispatch=unknown` (#453), so the static-expansi
 
 Every Python call stayed `unknown`, so a Python call graph never expanded past its root. By owner ruling, extending #470 and #557 with the same measured facts and preconditions: a plain or module-attribute call to a free function is `direct`; calling a class is `constructor`; a member call to a method is `dynamic`; anything else stays `unknown`. A method is a native Python `function` whose immediate parent is a class; any other Python `function` is a free function. The rows are specified in `contract-v1.md` § Dispatch.
 
+### Amendment: freshness compares the producer's own languages (owner ruling 2026-11-25, #1327)
+
+Freshness rule 2 compared the captured revision identity and the source-set-wide manifest. So after any head move, even one that changed only documents of other languages (a `.py` edit in a Rust checkout), every producer's evidence read `possiblyStale` once semantic catch-up finished. Calls stopped at the root and `describe` reported the language unavailable. Because the automatic re-run is due per producer and per language, nothing repaired it.
+
+By owner ruling, rule 2 now compares the **manifest of the documents in the producer's own languages** at the captured and the requested revision. It no longer compares the captured revision identity or the source-set-wide manifest. Toolchain, config, dependency, producer and source-set comparisons are unchanged. A change to a config or dependency input still makes evidence `possiblyStale`, and under the same ruling it now makes the producer due for an automatic re-run (`local-topology.md` D4).
+
+This supersedes, for languages, the "conservative source-set-wide freshness" stance of this record (Risks, above) and of `contract-v1.md` rule 2: another language's documents are not an input to a producer's evidence. Lookup dependencies still do not narrow freshness within the producer's languages. The rows are specified in `contract-v1.md` § Freshness.
+
 ## Rejected alternatives
 
 | Alternative | Reason rejected |

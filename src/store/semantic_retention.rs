@@ -127,13 +127,21 @@ const DOCUMENTS_DIFFER: &str = "SELECT EXISTS(
             WHERE h.revision_id=?1 AND h.language=?3 AND h.path=c.path AND h.vid=c.vid)
     )";
 
+// The config or dependency inputs (manifests, lockfiles, project config) differ between the
+// head and the capture: freshness rule 2 compares them for every producer, so their change
+// leaves its evidence `possiblyStale` until a re-run (#1327, owner ruling 2026-11-25).
+const INPUTS_DIFFER: &str =
+    "SELECT h.config_hash<>c.config_hash OR h.dependency_hash<>c.dependency_hash
+    FROM native_revisions h JOIN native_revisions c ON c.id=?2 WHERE h.id=?1";
+
 impl Store {
     /// Which of `producers` (ID and languages) are due an automatic re-run at the head, read
     /// in one snapshot. Everything is keyed by the producer asked about (#660 AC5): it is due
     /// for a re-import row of its own, or a producer-less legacy row, on one of its languages,
     /// or when its own selected batch was captured at another native revision and one of its
-    /// languages has different documents. Another producer's row or batch never makes it due.
-    /// No selection and no row is not due; manifest-only changes never are.
+    /// languages has different documents, or the config and dependency inputs that freshness
+    /// compares differ (#1327). Another producer's row or batch never makes it due. No
+    /// selection and no row is not due.
     pub fn auto_run_due(&self, producers: &[(&str, &[&str])]) -> Result<AutoRunHead> {
         self.with_evidence(|db| {
             let pin = self.read_revision(db, None)?.pin;
@@ -164,13 +172,16 @@ impl Store {
                 if let Some((captured_revision, captured_pin)) = captured
                     && captured_revision != native_revision_id
                 {
+                    is_due = db
+                        .prepare_cached(INPUTS_DIFFER)?
+                        .query_row(params![key, captured_pin], |row| row.get(0))?;
                     for language in languages.iter() {
-                        is_due = db
-                            .prepare_cached(DOCUMENTS_DIFFER)?
-                            .query_row(params![key, captured_pin, language], |row| row.get(0))?;
                         if is_due {
                             break;
                         }
+                        is_due = db
+                            .prepare_cached(DOCUMENTS_DIFFER)?
+                            .query_row(params![key, captured_pin, language], |row| row.get(0))?;
                     }
                 }
                 due.insert((*producer).to_string(), is_due);

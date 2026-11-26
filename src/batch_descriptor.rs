@@ -702,3 +702,51 @@ impl SourceManifestHasher {
         hex::encode(self.hasher.finalize())
     }
 }
+
+/// The source manifest of one producer's languages (contract-v1 freshness rule 2 as amended,
+/// owner ruling 2026-11-25, #1327): the canonical `{document, contentHash}` rows of the documents
+/// whose language the producer analyzes, pushed in canonical order. Freshness compares it
+/// between the captured and the destination revision, in place of the source-set-wide manifest
+/// and the captured revision identity, so a change confined to other languages leaves the
+/// producer's evidence `fresh`.
+pub struct ProducerManifestHasher {
+    languages: Vec<&'static str>,
+    manifest: SourceManifestHasher,
+}
+
+impl ProducerManifestHasher {
+    pub fn new(source_set_id: &str, languages: &[crate::semantic_records::Language]) -> Self {
+        Self {
+            languages: languages.iter().map(|language| language.as_str()).collect(),
+            manifest: SourceManifestHasher::new(source_set_id),
+        }
+    }
+
+    /// Adds a document of the revision; one of another language is left out.
+    pub fn push(&mut self, language: &str, relative_path: &str, content_hash: &str) {
+        if self.languages.contains(&language) {
+            self.manifest.push(language, relative_path, content_hash);
+        }
+    }
+
+    pub fn finish(self) -> String {
+        self.manifest.finish()
+    }
+
+    /// The producer manifest of `documents`, given in canonical order.
+    pub fn of<'a>(
+        source_set_id: &str,
+        languages: &[crate::semantic_records::Language],
+        documents: impl IntoIterator<Item = &'a crate::native_records::Document>,
+    ) -> String {
+        let mut manifest = Self::new(source_set_id, languages);
+        for document in documents {
+            manifest.push(
+                &document.key.language,
+                &document.key.path,
+                &document.content_hash,
+            );
+        }
+        manifest.finish()
+    }
+}

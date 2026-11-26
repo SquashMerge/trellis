@@ -6,8 +6,8 @@ pub use crate::batch_descriptor::{
     ArtifactEntry, CoverageRow, Descriptor, DescriptorComponents, DescriptorMetadata,
     DescriptorProducer, DescriptorSourceSet, Disposition, ExclusionReason, FORMAT_VERSION,
     Generation, GenerationComponent, GenerationOrigin, GenerationRuntime, GenerationTrust,
-    IdentityKind, ImportOrigin, Page, PageEntry, PageKind, RowOrder, SourceManifestHasher,
-    SourceRow, Totals, basis_artifact_ordinal, check_page_bytes, parse_page,
+    IdentityKind, ImportOrigin, Page, PageEntry, PageKind, ProducerManifestHasher, RowOrder,
+    SourceManifestHasher, SourceRow, Totals, basis_artifact_ordinal, check_page_bytes, parse_page,
 };
 use crate::{
     scip_admission::{admission, validate_selected_role},

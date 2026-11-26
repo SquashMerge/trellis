@@ -279,7 +279,7 @@ If a run fails, `producer run` prints one line saying why, and `.failure` in its
 
 ### Re-run after edits
 
-Semantic evidence describes the code as it was when you imported it. **Any** change to an indexed source file or project config affects imported evidence for **every** language: the changed file's evidence is [stale](#stale-and-possibly-stale), and every other file's is [possibly stale](#stale-and-possibly-stale). Trellis keeps the old results for unchanged files and labels them, but it doesn't re-run a producer by itself unless you turn on [automatic re-runs](#automatic-re-runs-optional). To refresh, repeat the commands above for each producer you use:
+Semantic evidence describes the code as it was when you imported it. A change to an indexed source file affects the evidence of the producers that cover its language: the changed file's evidence is [stale](#stale-and-possibly-stale), and every other file's evidence from those producers is [possibly stale](#stale-and-possibly-stale). Other languages' evidence stays fresh. A change to a manifest or project config makes every producer's evidence possibly stale. Trellis keeps the old results for unchanged files and labels them, but it doesn't re-run a producer by itself unless you turn on [automatic re-runs](#automatic-re-runs-optional). To refresh, repeat the commands above for each producer you use:
 
 ```sh
 for P in scip-typescript scip-python scip-java; do
@@ -430,7 +430,7 @@ The most common cause is Rust macros. A macro Trellis can't see into is shown as
 Imported evidence describes an earlier version of your code as soon as you edit an indexed source file or project config. Until you [re-import](#re-run-after-edits), it has one of two states:
 
 - **Stale:** this file changed since the import, so its evidence no longer applies. The file counts as `failed` under `coverage`, and its calls go back to syntax.
-- **Possibly stale:** this file didn't change, but something around it did. Its evidence may still be right, but Trellis can't prove it, so it stops drawing conclusions from it.
+- **Possibly stale:** this file didn't change, but something around it did: another file in a language the same producer covers, or a manifest or project config. Its evidence may still be right, but Trellis can't prove it, so it stops drawing conclusions from it. A change confined to files in other languages leaves the evidence fresh.
 
 Where you'll see this:
 

@@ -9428,6 +9428,114 @@ forbid = [{ calls = "helper" }]
     mcp.finish();
 }
 
+/// #1327: imports the real JavaScript fixture, publishes an edit of `path` natively and lets
+/// semantic catch-up finish. Returns describe's JavaScript row, `caller`'s same-document call to
+/// `plain` and whether scip-typescript is due an automatic re-run.
+fn catch_up_after_edit(path: &str, text: &str) -> (Value, Value, bool) {
+    let files = ["src/lib.js", "src/main.js"];
+    let (world, _) = real_fixture_world("issue444-javascript-calls", &files);
+    let (p, producer) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+    let ids = declaration_ids(&world);
+    write_files(&world.root, &[(path, text)]);
+    let (graph, native_artifact, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let native = world
+        .store
+        .publish_native_recovery_for_tests(
+            &graph,
+            &capture,
+            &native_artifact,
+            &leader,
+            &world.cancel,
+        )
+        .unwrap();
+    drop(leader);
+    assert_ne!(native, p);
+    let caught = world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    assert!(!world.store.semantic_catch_up_pending_for_tests().unwrap());
+    let due = world
+        .store
+        .auto_run_due(&[(producer.as_str(), &["javascript", "typescript"])])
+        .unwrap()
+        .due[&producer];
+    let mut mcp = McpSession::start(&world, 1327);
+    let describe = mcp.success("trellis_workspace_describe", json!({"schemaVersion":1}));
+    let javascript = describe["data"]["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == "javascript")
+        .unwrap()
+        .clone();
+    let outgoing = mcp.success(
+        "trellis_outgoing_calls",
+        json!({"schemaVersion":1,"expectedBasis":caught,"symbolId":ids["caller"]}),
+    );
+    let plain = outgoing["data"]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|call| call["calleeText"] == "plain")
+        .unwrap()
+        .clone();
+    mcp.finish();
+    (javascript, plain, due)
+}
+
+/// #1327 (owner ruling 2026-11-25, freshness rule 2 narrowed to the producer's languages): a head
+/// move that changes only a document of another language (here a Python file, in an existing
+/// directory and in a new one without an ignore file) leaves the JavaScript evidence `fresh` once
+/// S has caught up. Describe keeps it available, a same-document call stays resolved and nothing
+/// is due.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_in_another_language_keeps_evidence_fresh_after_catch_up() {
+    for path in ["src/check.py", "tools/check.py"] {
+        an_edit_in_another_language_keeps_evidence_fresh(path);
+    }
+}
+
+fn an_edit_in_another_language_keeps_evidence_fresh(path: &str) {
+    let (javascript, plain, due) = catch_up_after_edit(path, "def check():\n    return 1\n");
+    assert_eq!(javascript["semantic"]["freshness"], "fresh", "{javascript}");
+    assert_eq!(javascript["semantic"]["available"], true, "{javascript}");
+    assert_eq!(
+        javascript["semantic"]["documentStatus"],
+        json!({"olderBasis":0,"catchingUp":0,"needsReimport":0}),
+        "{javascript}"
+    );
+    assert_eq!(plain["disposition"], "resolved", "{plain}");
+    assert_eq!(plain["boundaryReason"], "none", "{plain}");
+    assert_eq!(plain["freshness"], "fresh", "{plain}");
+    assert!(!due, "{path}");
+}
+
+/// #1327: an edit in the producer's own language still leaves the evidence S carries forward
+/// `possiblyStale`, as before the ruling: calls stop at a stale boundary, describe reports the
+/// language unavailable, and the producer is due so the automatic re-run repairs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_in_the_producers_language_still_leaves_evidence_possibly_stale() {
+    let (javascript, plain, due) =
+        catch_up_after_edit("src/other.js", "export function other() {}\n");
+    assert_eq!(
+        javascript["semantic"]["freshness"], "possiblyStale",
+        "{javascript}"
+    );
+    assert_eq!(javascript["semantic"]["available"], false, "{javascript}");
+    assert_eq!(plain["disposition"], "staleTarget", "{plain}");
+    assert_eq!(plain["boundaryReason"], "stale", "{plain}");
+    assert_eq!(plain["freshness"], "possiblyStale", "{plain}");
+    assert!(due);
+}
+
 /// #1248 PR 2 review: the raw proof's fact digest and the payload's content hash are read as
 /// BLOBs and decoded strictly, so a stored digest of the wrong length fails the tuple read and the
 /// Architecture read as typed corruption, never as a 62-digit string. The corruption is applied
