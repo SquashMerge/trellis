@@ -422,7 +422,6 @@ impl Drop for ArchitectureInput {
         };
         let kept = crate::store::KeptNative::of(
             self.snapshot.pin.index_generation,
-            std::mem::take(&mut self.fingerprints.native_revision),
             std::mem::take(&mut self.snapshot.documents),
             std::mem::take(&mut self.regions),
             std::mem::take(&mut self.tables),

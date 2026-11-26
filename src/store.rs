@@ -1752,7 +1752,6 @@ impl EvidenceResponse {
             mut snapshot,
             regions,
             tables,
-            native_revision,
         } = self.architecture_native_read(pin, kept.as_deref_mut(), check, progress)?;
         match self.architecture_fingerprints(&mut snapshot, &tables, check) {
             Ok(fingerprints) => Ok((snapshot, regions, fingerprints, tables)),
@@ -1762,7 +1761,6 @@ impl EvidenceResponse {
                 if let Some(kept) = kept
                     && let Some(back) = KeptNative::of(
                         snapshot.pin.index_generation,
-                        native_revision,
                         std::mem::take(&mut snapshot.documents),
                         regions,
                         tables,
@@ -2396,17 +2394,12 @@ impl EvidenceResponse {
                 }),
             "store_unavailable: architecture decode inventory"
         );
-        let (kept_revision, mut kept_documents) = kept
-            .map(|kept| {
-                (
-                    std::mem::take(&mut kept.native_revision),
-                    std::mem::take(&mut kept.documents),
-                )
-            })
+        let mut kept_documents = kept
+            .map(|kept| std::mem::take(&mut kept.documents))
             .unwrap_or_default();
         let mut fetched_documents = fetched_documents.into_iter();
         for ((key, decode), table) in pending.into_iter().zip(&tables) {
-            let Some(mut document) = decode
+            let Some(document) = decode
                 .is_none()
                 .then(|| kept_documents.remove(&key))
                 .flatten()
@@ -2424,13 +2417,10 @@ impl EvidenceResponse {
                 });
                 continue;
             };
-            document.rebase(
-                &kept_revision,
-                &native_revision,
-                &table.identity.producer_id,
-            );
-            regions.push(document.regions);
-            documents.push(document.input);
+            let (input, kept_regions) =
+                document.restore(&native_revision, &table.identity.producer_id);
+            regions.push(kept_regions);
+            documents.push(input);
         }
         Ok(NativeRead {
             snapshot: crate::architecture_inputs::Snapshot {
@@ -2443,7 +2433,6 @@ impl EvidenceResponse {
             },
             regions,
             tables,
-            native_revision,
         })
     }
 

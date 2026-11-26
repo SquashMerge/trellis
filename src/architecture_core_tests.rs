@@ -1916,16 +1916,24 @@ fn architecture_kept_read_a_equals_a_full_read_a_at_a_new_revision() {
         "the build holds the documents"
     );
     drop(first);
-    assert_eq!(
-        kept.lock()
-            .unwrap()
-            .native
-            .as_ref()
-            .unwrap()
-            .documents
-            .len(),
-        all.len()
-    );
+    {
+        let kept = kept.lock().unwrap();
+        let native = kept.native.as_ref().unwrap();
+        assert_eq!(native.documents.len(), all.len());
+        // #1313: kept rows hold no copies of their document's key, revision or proof ID; the
+        // reads below refill them.
+        assert!(
+            native
+                .documents
+                .values()
+                .all(|document| !document.holds_row_copies())
+        );
+    }
+    // The same revision again: every kept document restores exactly as a full read decodes it.
+    let again = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    assert!(again.read_documents().is_empty());
+    assert_same_read_a(&again, &native_input(&store));
+    drop(again);
     // A body edit, an added and a deleted document, at a new native revision.
     write(
         root.path(),
