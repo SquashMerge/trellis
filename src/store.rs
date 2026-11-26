@@ -870,6 +870,9 @@ impl std::fmt::Display for ObsoleteIndexFormat {
     }
 }
 impl std::error::Error for ObsoleteIndexFormat {}
+/// The `index_not_ready` reason while an index of an earlier format is recreated (#1324).
+/// The recreate of disposable derived state after an upgrade is ordinary, not a recovery.
+pub const RECREATING_AFTER_UPGRADE: &str = "recreating index after upgrade";
 #[derive(Debug)]
 pub struct PinExpired;
 impl std::fmt::Display for PinExpired {
@@ -12251,6 +12254,8 @@ impl Store {
                     Ordering::Acquire,
                 )
                 .map_err(|_| anyhow::anyhow!("recovery_required: disposition changed under EX"))?;
+            // The index opened, so no earlier format is being replaced (#1324).
+            *self.obsolete_format_marker.lock().unwrap() = None;
             let _publication = self.enter_publication(cancel, Duration::from_millis(250))?;
             let expected = self.publication_index_baseline()?;
             let (capture, spool) = capture_and_spool()?;
@@ -12384,6 +12389,8 @@ impl Store {
             self.recovery_disposition
                 .store(RecoveryDisposition::Ready as u8, Ordering::Release);
             self.recovery_required.store(false, Ordering::Release);
+            // Only after Ready: a refusal while pending still names the upgrade (#1324).
+            *self.obsolete_format_marker.lock().unwrap() = None;
             Ok(pin)
         })();
         if result.is_err() && !stage.published {
@@ -12685,14 +12692,23 @@ impl Store {
         self.recovery_required.load(Ordering::Acquire)
     }
     fn ensure_not_recreate_pending(&self) -> Result<()> {
-        ensure!(
-            !matches!(
-                self.disposition(),
-                RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
-            ),
-            "recovery_required: exceptional index recovery deferred"
-        );
-        Ok(())
+        match self.disposition() {
+            RecoveryDisposition::RecreatePending => Err(self.recreate_pending_refusal()),
+            RecoveryDisposition::RootReplaced => {
+                anyhow::bail!("recovery_required: exceptional index recovery deferred")
+            }
+            _ => Ok(()),
+        }
+    }
+    /// The refusal while recreation is pending. An index of an earlier format, classified at
+    /// open, is being recreated as an upgrade does: the ordinary `index_not_ready` a first
+    /// index gives (#1324). Corruption keeps `recovery_required`.
+    fn recreate_pending_refusal(&self) -> anyhow::Error {
+        if self.obsolete_format_marker.lock().unwrap().is_some() {
+            topology::IndexNotReady::new(RECREATING_AFTER_UPGRADE).into()
+        } else {
+            anyhow::anyhow!("recovery_required: exceptional index recovery deferred")
+        }
     }
     fn classify_admission_error(&self, error: anyhow::Error) -> Result<bool> {
         match self.note_index_failure(&error) {
@@ -13113,9 +13129,7 @@ impl Store {
                     "incompatible_index: reconciliation required after invalid current index"
                 )
             }
-            RecoveryDisposition::RecreatePending => {
-                anyhow::bail!("recovery_required: exceptional index recovery deferred")
-            }
+            RecoveryDisposition::RecreatePending => Err(self.recreate_pending_refusal()),
             RecoveryDisposition::RootReplaced => {
                 anyhow::bail!("recovery_required: replacement-root index recovery deferred")
             }
@@ -13619,6 +13633,9 @@ impl Store {
         .map_err(|error| self.report_index_failure(error))
     }
     fn ensure_evidence_admissible(&self) -> Result<()> {
+        if self.is_recreate_pending() && self.obsolete_format_marker.lock().unwrap().is_some() {
+            return Err(topology::IndexNotReady::new(RECREATING_AFTER_UPGRADE).into());
+        }
         if self.disposition() == RecoveryDisposition::UpgradePending || self.is_recreate_pending() {
             return Err(
                 topology::IndexNotReady::new("exceptional index reconciliation pending").into(),
@@ -21004,6 +21021,8 @@ mod rebaseline_fault_tests;
 mod recreate_capture_point_tests;
 #[cfg(test)]
 mod recreate_spool_tests;
+#[cfg(test)]
+mod recreate_upgrade_marker_tests;
 
 #[cfg(test)]
 mod sqlite_schema_race_tests;

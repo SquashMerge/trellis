@@ -229,10 +229,45 @@ fn elapsed_first_head_wait_is_typed_and_indexing_continues() {
     assert_eq!(status["revision"], settled, "{status}");
 }
 
+/// How a stopped daemon's index is left for the next daemon to recreate.
+#[derive(Clone, Copy)]
+enum Damage {
+    /// The disposable index of an earlier release, as an upgrade leaves it.
+    EarlierSchema,
+    /// A corrupt file: real exceptional recovery.
+    Corrupt,
+}
+
+/// Leave the index of the stopped daemon under `home` for startup to recreate.
+fn damage_index(home: &Path, damage: Damage) {
+    use trellis::store::topology::UseGuard;
+    let dbpath = real_index_db(home);
+    let use_lock = dbpath.parent().unwrap().with_extension("lock");
+    let _exclusive = UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+        .expect("retired daemon retained the index-use lock");
+    match damage {
+        Damage::EarlierSchema => {
+            let db = rusqlite::Connection::open(&dbpath).unwrap();
+            // An obsolete disposable index requires startup recreation.
+            db.execute_batch(
+                "PRAGMA ignore_check_constraints=ON;
+                 UPDATE index_metadata SET schema_version=7;",
+            )
+            .unwrap();
+        }
+        Damage::Corrupt => {
+            use std::io::{Seek, SeekFrom};
+            let mut file = fs::OpenOptions::new().write(true).open(&dbpath).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"not sqlite format").unwrap();
+            file.sync_all().unwrap();
+        }
+    }
+}
+
 /// An old-schema index is recreated by the activation, and the read answers.
 #[test]
 fn old_schema_index_is_recreated_and_the_read_answers() {
-    use trellis::store::topology::UseGuard;
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -241,19 +276,7 @@ fn old_schema_index_is_recreated_and_the_read_answers() {
     let indexed = command(&root, &home, "index").output().unwrap();
     let indexed = crate::child::cli_json(&indexed, "indexed");
     daemon.stop_attested().unwrap();
-    let dbpath = real_index_db(&home);
-    let use_lock = dbpath.parent().unwrap().with_extension("lock");
-    {
-        let _exclusive = UseGuard::acquire_existing_readonly_exclusive(&use_lock)
-            .expect("retired daemon retained the index-use lock");
-        let db = rusqlite::Connection::open(&dbpath).unwrap();
-        // An obsolete disposable index requires startup recreation.
-        db.execute_batch(
-            "PRAGMA ignore_check_constraints=ON;
-             UPDATE index_metadata SET schema_version=7;",
-        )
-        .unwrap();
-    }
+    damage_index(&home, Damage::EarlierSchema);
     let _replacement = FixtureDaemon::new(&home);
     let output = symbols(&root, &home, "firstSymbol").output().unwrap();
     let reply = crate::child::cli_json(&output, "read after the old schema");
@@ -337,4 +360,263 @@ fn prior_head_answers_after_startup_recovery_blocks() {
     let reply = crate::child::cli_json(&output, "prior-head read after the block");
     assert_eq!(reply["catchingUp"], true, "{reply}");
     assert_eq!(names(&reply), ["firstSymbol"], "{reply}");
+}
+
+/// A Git checkout indexed by one daemon, which is then stopped and its index left `damage`d
+/// for the next daemon's startup to recreate. Returns `(home, root)`.
+fn indexed_then_damaged(temp: &Path, damage: Damage) -> (PathBuf, PathBuf) {
+    let home = temp.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let root = fresh_checkout(temp);
+    fs::write(root.join("package.json"), "{\"name\":\"fixture\"}\n").unwrap();
+    let daemon = FixtureDaemon::new(&home);
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    daemon.stop_attested().unwrap();
+    damage_index(&home, damage);
+    (home, root)
+}
+
+/// `producer plan` for scip-typescript, with a fake install of its pinned version on `PATH`.
+fn producer_plan(temp: &Path, home: &Path, root: &Path) -> Command {
+    use crate::support::{fake_npm_install, pinned_version};
+    let bin = fake_npm_install(
+        &temp.join("ts"),
+        "scip-typescript",
+        &pinned_version("scip-typescript"),
+    );
+    let mut plan = isolated_command(home);
+    plan.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["producer", "plan", "--producer", "scip-typescript"])
+        .args(["--trust", "restricted", "--workspace"])
+        .arg(root);
+    plan
+}
+
+/// `producer status`, which reads the head's native revision when there is one.
+fn producer_status(home: &Path, root: &Path) -> Output {
+    isolated_command(home)
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .args(["producer", "status", "--workspace"])
+        .arg(root)
+        .output()
+        .unwrap()
+}
+
+/// One MCP `tools/call` through a `trellis mcp` relay to the running daemon.
+fn mcp_call(home: &Path, root: &Path, name: &str, arguments: Value) -> Value {
+    use std::io::BufRead;
+    let mut child = isolated_command(home)
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .args(["mcp", "--workspace"])
+        .arg(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(
+            fs::File::create(home.join("mcp.stderr")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+        "name":name,"arguments":arguments,
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}}}});
+    writeln!(child.stdin.as_mut().unwrap(), "{call}").unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sent, reply) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = sent.send(line);
+    });
+    let line = reply
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("MCP reply");
+    let _ = child.kill();
+    let _ = child.wait();
+    serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))
+}
+
+/// One browser route through `trellis api`: its exit code and answer.
+fn api_get(home: &Path, target: &str) -> (i32, Value) {
+    let output = isolated_command(home)
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .args(["api", "GET", target])
+        .output()
+        .unwrap();
+    let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "api {target} printed no JSON ({error}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    (output.status.code().unwrap(), value)
+}
+
+/// The browser status route of the only checkout under `home`.
+fn status_route(home: &Path) -> String {
+    let db = real_index_db(home);
+    let key = db.parent().unwrap().file_name().unwrap().to_str().unwrap();
+    format!("/api/checkouts/{key}/status")
+}
+
+/// #1324: while startup recreates the index an upgrade left behind, every surface answers the
+/// ordinary not-ready a first index gives, with the upgrade as its reason, and never
+/// `recovery_required`. Then the recreate completes and the same reads answer.
+#[test]
+fn recreate_after_upgrade_is_not_ready_on_cli_mcp_and_browser() {
+    const REASON: &str = "index_not_ready: recreating index after upgrade";
+    let temp = short_temp();
+    let (home, root) = indexed_then_damaged(temp.path(), Damage::EarlierSchema);
+    let startup_path = home.join("startup.sock");
+    let startup_listener = UnixListener::bind(&startup_path).unwrap();
+    let _replacement = FixtureDaemon::new(&home);
+    // The daemon this status starts holds the recreate and waits briefly for a head.
+    let mut read = command(&root, &home, "status");
+    read.env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
+        .env("TRELLIS_TEST_CLI_FIRST_INDEX_WAIT_MS", "1500");
+    let (mut child, stdout, stderr) = spawn_read(read, temp.path(), "recreating-status");
+    let mut startup = held_startup(&startup_listener);
+    let status = read_output(&mut child, &stdout, &stderr, "status while recreating");
+    let message = String::from_utf8_lossy(&status.stderr);
+    assert_eq!(status.status.code(), Some(1), "{message}");
+    assert!(status.stdout.is_empty(), "partial output");
+    assert!(
+        message.contains("trellis: recreating index after upgrade")
+            && message.contains(&format!("Error: {REASON}")),
+        "status did not report the recreate: {message}"
+    );
+
+    // The CLI read the issue saw fail `recovery_required`.
+    let plan = producer_plan(temp.path(), &home, &root).output().unwrap();
+    let message = String::from_utf8_lossy(&plan.stderr);
+    assert_eq!(plan.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains(&format!("Error: {REASON}")) && !message.contains("recovery_required"),
+        "producer plan did not report the recreate: {message}"
+    );
+    // With no head yet, producer status answers without one, as for a first index.
+    let status = producer_status(&home, &root);
+    let status = crate::child::cli_json(&status, "producer status while recreating");
+    assert!(status["head"].is_null(), "{status}");
+
+    let found = mcp_call(
+        &home,
+        &root,
+        "trellis_find_symbols",
+        serde_json::json!({"schemaVersion": 1, "query": "firstSymbol"}),
+    );
+    let error = &found["result"]["structuredContent"]["error"];
+    assert_eq!(error["code"], "index_not_ready", "{found}");
+    assert_eq!(error["retryable"], true, "{found}");
+
+    let (code, answer) = api_get(&home, &status_route(&home));
+    assert_eq!(code, 1, "{answer}");
+    assert_eq!(answer["error"]["code"], "index_not_ready", "{answer}");
+
+    // Released, the held recreate publishes a fresh index and the reads answer.
+    startup.write_all(&[1]).unwrap();
+    let mut settle = isolated_command(&home);
+    settle.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"));
+    let settled = crate::child::settled(settle, &root, None);
+    assert_eq!(settled["indexRevision"], 1, "{settled}");
+    let (code, answer) = api_get(&home, &status_route(&home));
+    assert_eq!(code, 0, "{answer}");
+    assert_eq!(answer["revision"], settled, "{answer}");
+    let plan = producer_plan(temp.path().join("after").as_path(), &home, &root)
+        .output()
+        .unwrap();
+    let plan = crate::child::cli_json(&plan, "producer plan after the recreate");
+    assert_eq!(plan["producer"]["name"], "scip-typescript", "{plan}");
+}
+
+/// #1324: `producer plan` waits for the recreate as the reads wait for a first head, past the
+/// read budget it had, and answers once the recreate is published.
+#[test]
+fn producer_plan_waits_for_the_recreate_then_answers() {
+    let temp = short_temp();
+    let (home, root) = indexed_then_damaged(temp.path(), Damage::EarlierSchema);
+    let startup_path = home.join("startup.sock");
+    let wait_path = home.join("wait.sock");
+    let startup_listener = UnixListener::bind(&startup_path).unwrap();
+    let wait_listener = UnixListener::bind(&wait_path).unwrap();
+    let _replacement = FixtureDaemon::new(&home);
+    let mut plan = producer_plan(temp.path(), &home, &root);
+    plan.env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
+        .env("TRELLIS_TEST_CLI_READ_WAIT_SOCKET", &wait_path);
+    let (mut child, stdout, stderr) = spawn_read(plan, temp.path(), "waiting-plan");
+    let mut startup = held_startup(&startup_listener);
+    // Before #1324 the plan failed at once instead of waiting: report that, not a hang.
+    wait_listener.set_nonblocking(true).unwrap();
+    let mut accepted = None;
+    trellis::testing::wait_until("producer plan waits for the recreate", || {
+        if child.try_wait().unwrap().is_some() {
+            panic!(
+                "the plan ended instead of waiting: {}",
+                fs::read_to_string(&stderr).unwrap()
+            );
+        }
+        match wait_listener.accept() {
+            Ok((stream, _)) => {
+                accepted = Some(stream);
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("accept the plan's wait: {error}"),
+        }
+    });
+    let mut waiting = accepted.unwrap();
+    waiting.set_nonblocking(false).unwrap();
+    let mut arrived = [0];
+    waiting.read_exact(&mut arrived).unwrap();
+    assert_eq!(arrived, *b"W");
+    // Hold the recreate past the read budget the plan had before #1324.
+    std::thread::sleep(OLD_CLI_READ_WAIT + Duration::from_secs(1));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the plan gave up before the recreate: {}",
+        fs::read_to_string(&stderr).unwrap()
+    );
+    startup.write_all(&[1]).unwrap();
+    let output = read_output(&mut child, &stdout, &stderr, "waiting plan");
+    let plan = crate::child::cli_json(&output, "producer plan");
+    assert_eq!(plan["producer"]["name"], "scip-typescript", "{plan}");
+    let progress = fs::read_to_string(&stderr).unwrap();
+    assert!(
+        progress.contains("trellis: recreating index after upgrade"),
+        "no recreate progress on stderr: {progress}"
+    );
+}
+
+/// #1324: a corrupt index awaiting its exceptional recreate is real recovery. It is never
+/// reported as the upgrade's ordinary recreate, and `producer status`, which reads the store's
+/// head, keeps `recovery_required`.
+#[test]
+fn corrupt_index_awaiting_recreate_keeps_recovery_required() {
+    let temp = short_temp();
+    let (home, root) = indexed_then_damaged(temp.path(), Damage::Corrupt);
+    let startup_path = home.join("startup.sock");
+    let startup_listener = UnixListener::bind(&startup_path).unwrap();
+    let _replacement = FixtureDaemon::new(&home);
+    let mut read = command(&root, &home, "status");
+    read.env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
+        .env("TRELLIS_TEST_CLI_FIRST_INDEX_WAIT_MS", "1500");
+    let (mut child, stdout, stderr) = spawn_read(read, temp.path(), "corrupt-status");
+    let mut startup = held_startup(&startup_listener);
+    let status = read_output(&mut child, &stdout, &stderr, "status while corrupt");
+    let message = String::from_utf8_lossy(&status.stderr);
+    assert_eq!(status.status.code(), Some(1), "{message}");
+    assert!(
+        !message.contains("recreating index after upgrade"),
+        "corruption reported as an upgrade: {message}"
+    );
+    let status = producer_status(&home, &root);
+    let message = String::from_utf8_lossy(&status.stderr);
+    assert_eq!(status.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains("Error: recovery_required: exceptional index recovery deferred"),
+        "corruption lost recovery_required: {message}"
+    );
+    startup.write_all(&[1]).unwrap();
 }
