@@ -62,7 +62,8 @@ Clean up operation-scoped requests on every exit, including dropped futures, wit
   - use repeat loops (about 20 runs under modest CPU load) only for failures that have actually been intermittent.
 
   A failure inside a loop is a defect to report with its log, not something to retry until it passes.
-- **Before submitting,** run `./tools/verify` and `cargo fmt --all -- --check`. Run `cargo clippy --locked --all-targets -- -D warnings` on the toolchain pinned in `rust-toolchain.toml`, which CI also uses. Don't override it with `RUSTUP_TOOLCHAIN` or `+toolchain`.
+- **Before submitting,** run `./tools/verify --lane lint` and the tests for what you changed. The lint lane runs `cargo fmt --all -- --check` and `cargo clippy --locked --all-targets -- -D warnings`, with and without `test-support`, on the toolchain pinned in `rust-toolchain.toml`, which CI also uses. Don't override it with `RUSTUP_TOOLCHAIN` or `+toolchain`.
+- **CI is the full verify.** CI runs every `./tools/verify` lane as its own job on Ubuntu and macOS, against the pull request merged with main. A pull request needs all of its CI jobs green before review and merge. Run the full `./tools/verify` locally only when CI can't run, or when a reviewer asks.
 
 ## Where decisions live
 
