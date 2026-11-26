@@ -653,6 +653,53 @@ fn architecture_incremental_metrics() {
 }
 
 #[test]
+fn architecture_incremental_builds_on_the_retained_base_with_the_fewest_dirty_documents() {
+    // #1313: when the newest retained core is further from the head than the one before
+    // it (a slow semantic catch-up let the intermediate revision's build finish), the build
+    // starts from the closer one. Any base gives the full build's core.
+    let (_state, root, store) = incremental_checkout();
+    let util = "crates/alpha/src/util.rs";
+    let older = store.architecture_build_for_tests(None, None).unwrap();
+    write(root.path(), "idle.rs", "pub fn idle() { let _ = 2; }\n");
+    write(root.path(), util, "pub fn u() { let _ = 2; }\n");
+    publish(&store, root.path());
+    let newer = store
+        .architecture_build_for_tests(Some(&older.core), None)
+        .unwrap();
+    write(root.path(), "idle.rs", "pub fn idle() { let _ = 1; }\n");
+    write(root.path(), util, "pub fn u() {}\n");
+    publish(&store, root.path());
+    let dirty = |built: &ArchitectureBuildForTests| match &built.path {
+        ArchitectureBuildPath::Incremental { dirty, .. } => dirty.len(),
+        path => panic!("{path:?}"),
+    };
+    let on_newer = store
+        .architecture_build_for_tests(Some(&newer.core), None)
+        .unwrap();
+    assert_eq!(dirty(&on_newer), 2);
+    assert_eq!(on_newer.base, Some(newer.core.pin()));
+    let built = store
+        .architecture_build_on_bases_for_tests(&[&newer.core, &older.core], None)
+        .unwrap();
+    assert_eq!(dirty(&built), 0, "the older core matches every document");
+    assert_eq!(built.base, Some(older.core.pin()));
+    let full = store.architecture_build_for_tests(None, None).unwrap();
+    assert_eq!(
+        built.core.canonical().unwrap(),
+        full.core.canonical().unwrap()
+    );
+    assert_eq!(
+        on_newer.core.canonical().unwrap(),
+        full.core.canonical().unwrap()
+    );
+    // Among equally distant bases the newest wins, as with one base.
+    let tied = store
+        .architecture_build_on_bases_for_tests(&[&on_newer.core, &built.core], None)
+        .unwrap();
+    assert_eq!(tied.base, Some(on_newer.core.pin()));
+}
+
+#[test]
 fn architecture_incremental_apps_interfaces() {
     let (_state, root, store) = incremental_checkout();
     let config = crate::rules::parse(RULES).unwrap();
