@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(
             entries[0]["outputSchema"]["oneOf"][0]["properties"]["data"]["properties"]["toolVersion"]
                 ["const"],
-            34
+            35
         );
     }
 
