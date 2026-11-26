@@ -22,6 +22,7 @@ import re
 import select
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -185,7 +186,35 @@ def stop_cohort_daemon(daemon, binary):
                 f"daemon election not released within the remaining budget: {daemon.home}")
         time.sleep(.05)
     V67.stop_home_processes(daemon.home, binary)
+    for lock in daemon.home.rglob("daemon.lock"):
+        remove_killed_daemon_socket(lock.parent.parent)
     V67.record("daemon_stopped", home=str(daemon.home), election_free=True)
+
+
+def remove_killed_daemon_socket(data_root):
+    """Remove a long data root's private socket directory, which a signalled daemon leaves.
+
+    The socket path is the one `trellis::daemon::SocketPaths::new` names: `run/daemon.sock`
+    when it fits `sockaddr_un`, else `/tmp/trellis-<euid>-<sha256(root, euid)[:16]>/`.
+    SIGTERM skips the daemon's own cleanup (#1338). Only the socket and then the empty
+    directory are removed.
+    """
+    normal = data_root / "run" / "daemon.sock"
+    if len(os.fsencode(normal)) <= (103 if sys.platform == "darwin" else 107):
+        return
+    uid = os.geteuid()
+    digest = hashlib.sha256(os.fsencode(data_root) + uid.to_bytes(4, "big")).hexdigest()[:32]
+    private = Path("/tmp") / f"trellis-{uid}-{digest}"
+    socket = private / "daemon.sock"
+    try:
+        if stat.S_ISSOCK(socket.lstat().st_mode):
+            socket.unlink()
+    except OSError:
+        pass
+    try:
+        private.rmdir()
+    except OSError:
+        pass
 
 
 # --- call-site artifact -------------------------------------------------

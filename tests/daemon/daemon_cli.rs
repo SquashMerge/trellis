@@ -1602,6 +1602,9 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
         );
         assert!(paths.socket.as_os_str().as_encoded_bytes().len() <= 103);
     }
+    // A failing run still leaves no private socket directory (#1338): this
+    // guard drops after the owned daemons below are killed.
+    let _cleanup = PrivateSocketDirs(paths.clone());
     let mut owners = Vec::new();
     for (home, paths) in homes.iter().zip(&paths) {
         fs::create_dir_all(home).unwrap();
@@ -1774,6 +1777,35 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
         UnixStream::connect(&paths[1].socket).is_ok(),
         "unrelated HOME was displaced"
     );
+    // A clean stop removes the private socket directory with the socket (#1338).
+    for (home, paths) in homes.iter().zip(&paths) {
+        let output = cli(home).args(["daemon", "stop"]).output().unwrap();
+        crate::child::assert_cli_success(&output, "daemon stop");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["stopped"],
+            true
+        );
+        let private = paths.socket.parent().unwrap();
+        assert!(
+            !private.exists(),
+            "a clean stop left {} behind",
+            private.display()
+        );
+    }
+}
+
+/// Removes long-HOME private socket directories that a killed fixture daemon
+/// could not remove itself. Only this test's own derived paths are touched.
+struct PrivateSocketDirs(Vec<trellis::daemon::SocketPaths>);
+impl Drop for PrivateSocketDirs {
+    fn drop(&mut self) {
+        for paths in &self.0 {
+            let _ = fs::remove_file(&paths.socket);
+            if let Some(private) = paths.socket.parent() {
+                let _ = fs::remove_dir(private);
+            }
+        }
+    }
 }
 
 #[test]

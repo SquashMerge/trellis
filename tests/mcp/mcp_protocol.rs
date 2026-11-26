@@ -208,6 +208,7 @@ fn stop_fixture_daemon(home: &Path) {
     let Some(connection) = owned_daemon_connection(home, pid) else {
         return;
     };
+    let socket = private_socket_under(home);
     let sent = trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap_or(false);
     if !sent {
         return;
@@ -216,6 +217,10 @@ fn stop_fixture_daemon(home: &Path) {
     while std::time::Instant::now() < deadline {
         if owned_daemon_connection(home, pid).is_none() {
             let _ = fs::remove_file(&marker);
+            // SIGTERM skipped the daemon's own socket cleanup (#1338).
+            if let Some(socket) = socket {
+                trellis::testing::remove_killed_daemon_socket(&socket);
+            }
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -507,6 +512,10 @@ fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
     let alive = decoy.try_wait().unwrap().is_none();
     let _ = decoy.kill();
     let _ = decoy.wait();
+    // The killed decoy skipped its own socket cleanup (#1338).
+    if let Some(socket) = private_socket_under(other.path()) {
+        trellis::testing::remove_killed_daemon_socket(&socket);
+    }
     drop(owner);
     assert!(alive, "a different fixture's elected daemon was signaled");
 }

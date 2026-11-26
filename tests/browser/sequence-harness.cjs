@@ -1,6 +1,6 @@
 "use strict";
 const assert = require("node:assert/strict");
-const {existsSync, chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync} = require("node:fs");
+const {existsSync, chmodSync, copyFileSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, rmdirSync, unlinkSync, writeFileSync} = require("node:fs");
 const {tmpdir} = require("node:os");
 const {basename, dirname, join, resolve, sep} = require("node:path");
 const {spawn} = require("node:child_process");
@@ -171,17 +171,34 @@ function findNamed(root, name, found = []) {
   }
   return found;
 }
+// The daemon's socket for a data root, as trellis::daemon::SocketPaths::new names it.
+function socketPathFor(dataRoot) {
+  const normal = join(dataRoot, "run", "daemon.sock");
+  const uid = process.getuid();
+  const uidBytes = Buffer.alloc(4);
+  uidBytes.writeUInt32BE(uid);
+  const digest = createHash("sha256").update(Buffer.from(dataRoot)).update(uidBytes).digest("hex").slice(0,32);
+  return Buffer.byteLength(normal) <= (process.platform === "darwin" ? 103 : 107)
+    ? normal : join("/tmp", `trellis-${uid}-${digest}`, "daemon.sock");
+}
+// A signalled suite daemon skips its own socket cleanup, so a long HOME's private
+// /tmp/trellis-<uid>-<hash> directory would outlive the suite (#1338). Once the
+// daemons are gone, remove its socket and then the directory, only when empty.
+function removeKilledDaemonSockets(homes) {
+  for (const home of homes) {
+    for (const dataRoot of [join(home, "Library", "Application Support", "dev.squashmerge.trellis"),
+      join(dirname(home), "xdg-data", "trellis")]) {
+      const socketPath = socketPathFor(dataRoot);
+      if (dirname(dirname(socketPath)) !== "/tmp") continue;
+      try { if (lstatSync(socketPath).isSocket()) unlinkSync(socketPath); } catch {}
+      try { rmdirSync(dirname(socketPath)); } catch {}
+    }
+  }
+}
 async function listenerDiagnostics(paths) {
   const locks = [...findNamed(paths.home, "daemon.lock"), ...findNamed(paths.xdgData, "daemon.lock")];
   return Promise.all(locks.map(async lock => {
-    const dataRoot = dirname(dirname(lock));
-    const normal = join(dirname(lock), "daemon.sock");
-    const uid = process.getuid();
-    const uidBytes = Buffer.alloc(4);
-    uidBytes.writeUInt32BE(uid);
-    const digest = createHash("sha256").update(Buffer.from(dataRoot)).update(uidBytes).digest("hex").slice(0,32);
-    const socketPath = Buffer.byteLength(normal) <= (process.platform === "darwin" ? 103 : 107)
-      ? normal : join("/tmp", `trellis-${uid}-${digest}`, "daemon.sock");
+    const socketPath = socketPathFor(dirname(dirname(lock)));
     if (!existsSync(socketPath)) return {lock, socketPath, listener:"socket_absent"};
     const listener = await new Promise(resolveListener => {
       const socket = createConnection(socketPath);
@@ -366,6 +383,7 @@ function cleanup() {
       // must not elect another detached daemon after that inventory.
       await Promise.all([...clients].map(child => stopDaemon({child})));
       await stopSuiteDaemons();
+      removeKilledDaemonSockets(fixtureHomes);
       if (suiteBinaryDir) rmSync(suiteBinaryDir,{recursive:true,force:true});
       process.removeListener("SIGINT", onInterrupt);
       process.removeListener("SIGTERM", onTerminate);

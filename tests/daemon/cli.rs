@@ -235,6 +235,8 @@ impl FixtureDaemon {
         while std::time::Instant::now() < deadline {
             if std::os::unix::net::UnixStream::connect(&socket).is_err() {
                 let _ = fs::remove_file(&marker);
+                // SIGTERM skipped the daemon's own socket cleanup (#1338).
+                trellis::testing::remove_killed_daemon_socket(&socket);
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3531,13 +3533,31 @@ fn daemon_publication_is_independent_of_cli_output_file() {
     let output_path = temp.path().join("index.stdout");
     let stderr_path = temp.path().join("index.stderr");
     let daemon_pid = temp.path().join("daemon.pid");
-    struct ElectedDaemon(std::path::PathBuf);
+    struct ElectedDaemon(std::path::PathBuf, std::path::PathBuf);
     impl Drop for ElectedDaemon {
         fn drop(&mut self) {
-            let _ = trellis::testing::signal_daemon_marker(&self.0, libc::SIGTERM);
+            if !trellis::testing::signal_daemon_marker(&self.0, libc::SIGTERM).unwrap_or(false) {
+                return;
+            }
+            // SIGTERM skips the daemon's own socket cleanup (#1338).
+            let data = if cfg!(target_os = "macos") {
+                self.1
+                    .join("Library/Application Support/dev.squashmerge.trellis")
+            } else {
+                self.1.join(".local/share/trellis")
+            };
+            let socket = trellis::daemon::SocketPaths::new(&data).socket;
+            let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+            while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            trellis::testing::remove_killed_daemon_socket(&socket);
         }
     }
-    let _daemon = ElectedDaemon(daemon_pid.clone());
+    let _daemon = ElectedDaemon(daemon_pid.clone(), home.clone());
     let mut child = command(&root, &home, "index")
         .env("TRELLIS_TEST_DAEMON_PID_FILE", &daemon_pid)
         .stdout(Stdio::from(fs::File::create(&output_path).unwrap()))

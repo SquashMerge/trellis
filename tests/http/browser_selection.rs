@@ -173,6 +173,8 @@ impl Drop for FixtureDaemon {
                 if marker_pid.is_some() {
                     let _ = fs::remove_file(&marker);
                 }
+                // SIGTERM skipped the daemon's own socket cleanup (#1338).
+                trellis::testing::remove_killed_daemon_socket(&socket);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));

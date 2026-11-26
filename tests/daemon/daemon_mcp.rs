@@ -191,6 +191,7 @@ fn stop_fixture_daemon(home: &Path) {
     let Some(connection) = owned_daemon_connection(home, pid) else {
         return;
     };
+    let socket = socket_under(home);
     let sent = trellis::testing::signal_daemon_marker(&marker, libc::SIGTERM).unwrap_or(false);
     if !sent {
         return;
@@ -199,6 +200,10 @@ fn stop_fixture_daemon(home: &Path) {
     while Instant::now() < deadline {
         if owned_daemon_connection(home, pid).is_none() {
             let _ = fs::remove_file(&marker);
+            // SIGTERM skipped the daemon's own socket cleanup (#1338).
+            if let Some(socket) = socket {
+                trellis::testing::remove_killed_daemon_socket(&socket);
+            }
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -222,6 +227,13 @@ fn socket_under(home: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+/// A killed daemon skips its own socket cleanup, so remove a long HOME's private
+/// socket directory once it is gone (#1338).
+fn remove_killed_socket(home: &Path) {
+    if let Some(socket) = socket_under(home) {
+        trellis::testing::remove_killed_daemon_socket(&socket);
+    }
 }
 fn socket_ready(home: &Path) -> PathBuf {
     let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
@@ -467,6 +479,7 @@ fn daemon_refuses_missing_or_different_mcp_identity_before_marker_attachment() {
     }
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
 }
 
 #[test]
@@ -501,6 +514,7 @@ fn check_daemon_catalog_mismatch(initial: bool) {
     }
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     let mut dirs = vec![home.path().to_path_buf()];
     let mut data = None;
     while let Some(dir) = dirs.pop() {
@@ -615,6 +629,7 @@ fn daemon_death_interrupts_session_and_next_launch_recovers() {
     );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     assert!(
         client.child.try_wait().unwrap().is_none(),
         "original MCP client exited"
@@ -734,6 +749,7 @@ fn reconnect_handshake_skips_a_replaced_selection_and_keeps_launch_usable() {
     drop(stream);
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
 }
 
 #[test]
@@ -861,6 +877,7 @@ fn reconnect_restores_a_selection_whose_repository_changed() {
     drop(stream);
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
 }
 
 #[test]
@@ -947,6 +964,7 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
     );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     assert!(peer.child.try_wait().unwrap().is_none());
     // Reconnect without selecting again: retained attachments must not change
     // the contract's launch-workspace default.
@@ -1207,6 +1225,7 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
         peer.reaped = true;
         daemon.kill().unwrap();
         daemon.wait().unwrap();
+        remove_killed_socket(home.path());
         fs::remove_file(&phase_path).unwrap();
     }
 }
@@ -1303,6 +1322,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
     peer.finish_unreaped();
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
     assert!(peer.child.wait().unwrap().success());
     peer.reaped = true;
@@ -1359,6 +1379,7 @@ fn stdin_eof_cancels_in_flight_call_without_stdout() {
     );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
     assert!(peer.child.wait().unwrap().success());
     peer.reaped = true;
@@ -1420,6 +1441,7 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
     .unwrap();
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     drop(phase);
     assert!(peer.child.try_wait().unwrap().is_none());
     let reply = peer.ask(5, "tools/list", metadata);
@@ -1486,6 +1508,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
     assert_eq!(peer.ask(4, "tools/list", json!({}))["id"], 4);
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     let mut dirs = vec![home.path().to_path_buf()];
     let mut data = None;
     while let Some(dir) = dirs.pop() {
@@ -1684,6 +1707,7 @@ fn legacy_await_initialized_refuses_tool_after_daemon_death() {
     assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     let rejected = peer.ask(
         2,
         "tools/call",
@@ -1733,6 +1757,7 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
         assert_eq!(peer.ask(1, "server/discover", meta.clone())["id"], 1);
         daemon.kill().unwrap();
         daemon.wait().unwrap();
+        remove_killed_socket(home.path());
         let mut dirs = vec![home.path().to_path_buf()];
         let mut data = None;
         while let Some(dir) = dirs.pop() {
@@ -1863,6 +1888,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let _ = socket_ready(home.path());
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     let mut dirs = vec![home.path().to_path_buf()];
     let mut lock = None;
     while let Some(dir) = dirs.pop() {
@@ -2330,6 +2356,7 @@ fn relay_answers_at_its_deadline_and_drops_the_late_reply() {
     peer.reaped = true;
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(home.path());
     fs::remove_file(&phase_path).unwrap();
 }
 
@@ -2417,6 +2444,7 @@ fn finish_peer(mut peer: Peer, mut daemon: std::process::Child, phase_path: &Pat
     peer.reaped = true;
     daemon.kill().unwrap();
     daemon.wait().unwrap();
+    remove_killed_socket(peer.auto_daemon_pid.parent().unwrap());
     let _ = fs::remove_file(phase_path);
 }
 

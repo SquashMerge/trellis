@@ -136,6 +136,15 @@ struct Fixture {
     jev: PathBuf,
     acp: PathBuf,
 }
+/// Its daemons are killed, so the fixture removes a long HOME's private socket
+/// directory once they are gone (#1338). Every `Process` drops before it.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        trellis::testing::remove_killed_daemon_socket(
+            &trellis::daemon::SocketPaths::new(&self.data).socket,
+        );
+    }
+}
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();

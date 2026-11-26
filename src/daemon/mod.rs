@@ -100,31 +100,39 @@ impl SocketPaths {
                 ));
             }
         }
-        if self.socket.parent() != Some(self.run.as_path()) {
-            let private = self.socket.parent().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "missing private socket directory",
-                )
-            })?;
-            match fs::DirBuilder::new().mode(0o700).create(private) {
-                Ok(()) => (),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-                Err(error) => return Err(error),
-            }
-            let metadata = fs::symlink_metadata(private)?;
-            if !metadata.is_dir()
-                || metadata.file_type().is_symlink()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o777 != 0o700
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "unsafe private socket directory",
-                ));
-            }
-        }
         Ok(())
+    }
+
+    /// The private socket directory a long data root uses, created under the
+    /// election lock. Only the lock holder creates or removes it, so a losing
+    /// candidate never binds into a directory its predecessor just removed.
+    fn prepare_private(&self) -> io::Result<Option<PathBuf>> {
+        if self.socket.parent() == Some(self.run.as_path()) {
+            return Ok(None);
+        }
+        let private = self.socket.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing private socket directory",
+            )
+        })?;
+        match fs::DirBuilder::new().mode(0o700).create(private) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(private)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe private socket directory",
+            ));
+        }
+        Ok(Some(private.to_path_buf()))
     }
 }
 
@@ -133,6 +141,8 @@ pub struct SocketOwner {
     listener: UnixListener,
     socket: PathBuf,
     inode: u64,
+    /// The long-data-root socket directory, removed with the socket (#1338).
+    private_dir: Option<PathBuf>,
 }
 
 impl SocketOwner {
@@ -168,6 +178,7 @@ impl SocketOwner {
                 Err(error)
             };
         }
+        let private_dir = paths.prepare_private()?;
         match fs::symlink_metadata(&paths.socket) {
             Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(&paths.socket)?,
             Ok(_) => {
@@ -187,6 +198,7 @@ impl SocketOwner {
             listener,
             socket: paths.socket.clone(),
             inode,
+            private_dir,
         }))
     }
 
@@ -201,6 +213,11 @@ impl Drop for SocketOwner {
             .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.ino() == self.inode)
         {
             let _ = fs::remove_file(&self.socket);
+        }
+        // Still under the election lock, which drops after this body. Only an
+        // empty directory is removed: one holding another socket stays.
+        if let Some(private_dir) = &self.private_dir {
+            let _ = fs::remove_dir(private_dir);
         }
     }
 }

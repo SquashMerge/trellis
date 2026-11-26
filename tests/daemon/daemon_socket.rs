@@ -243,3 +243,35 @@ fn two_demand_starters_both_connect_after_one_election() {
     assert!(outcomes.contains(&StartOutcome::Started));
     assert!(outcomes.contains(&StartOutcome::ElectionInProgress));
 }
+
+#[test]
+fn long_data_root_owner_removes_its_empty_private_socket_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = SocketPaths::new(&temp.path().join("long-data-root-".repeat(8)));
+    let private = paths.socket.parent().unwrap().to_path_buf();
+    assert_ne!(
+        private, paths.run,
+        "the data root must be too long for run/"
+    );
+    assert!(private.starts_with("/tmp"));
+    let owner = SocketOwner::acquire(&paths).unwrap().unwrap();
+    assert!(private.is_dir());
+    assert!(SocketOwner::acquire(&paths).unwrap().is_none());
+    drop(owner);
+    assert!(
+        !private.exists(),
+        "a clean shutdown left {} behind (#1338)",
+        private.display()
+    );
+
+    // A successor recreates the directory; one that is not empty stays.
+    let owner = SocketOwner::acquire(&paths).unwrap().unwrap();
+    UnixStream::connect(&paths.socket).expect("successor serves the recreated socket");
+    let other = private.join("other");
+    std::fs::write(&other, b"").unwrap();
+    drop(owner);
+    assert!(!paths.socket.exists());
+    assert!(other.exists(), "a non-empty private directory was removed");
+    std::fs::remove_file(other).unwrap();
+    std::fs::remove_dir(private).unwrap();
+}
