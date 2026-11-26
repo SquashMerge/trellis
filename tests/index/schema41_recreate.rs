@@ -208,7 +208,7 @@ fn schema41_marker_recreates_exclusively_and_imports_into_payload_tables() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("recovery_required")
+            .contains("index_not_ready: recreating index after upgrade")
     );
     let (pin, _) = reconcile_workspace(
         &store,

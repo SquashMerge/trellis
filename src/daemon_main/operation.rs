@@ -202,7 +202,20 @@ impl Operation {
                     reply: Chunked,
                 },
             ),
-            Self::ProducerPlan | Self::ProducerStatus => Route::Read(
+            // A plan reads the head's native basis, so it waits for a head as the reads do,
+            // including an index recreated after an upgrade (#1324).
+            Self::ProducerPlan => Route::Read(
+                Checkout,
+                ReadPolicy {
+                    budget: Fixed(CLI_READ_WAIT),
+                    read_scope: true,
+                    marker: ExistingReadOnly,
+                    awaits_first_head: true,
+                    replayable: true,
+                    reply: Chunked,
+                },
+            ),
+            Self::ProducerStatus => Route::Read(
                 Checkout,
                 ReadPolicy {
                     budget: Fixed(CLI_READ_WAIT),
@@ -334,9 +347,16 @@ mod operation_policy_tests {
         } else {
             Marker::Publish
         };
+        // `producer_plan` since #1324.
         let awaits_first_head = matches!(
             operation,
-            "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
+            "status"
+                | "symbols"
+                | "query"
+                | "metrics"
+                | "rules_check"
+                | "references"
+                | "producer_plan"
         );
         let replayable = !matches!(
             operation,

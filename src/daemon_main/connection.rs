@@ -28,7 +28,10 @@ use trellis::{
     indexer::IndexOptions,
     mcp,
     model::ViewQuery,
-    store::topology::{TopologyRoots, WorkspaceIdentity},
+    store::{
+        RECREATING_AFTER_UPGRADE,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    },
 };
 
 /// Scoped to one blocking control handler, including registration/reply errors.
@@ -1058,6 +1061,10 @@ fn await_first_head(
         {
             return Ok(reported.is_some());
         }
+        // An index of an earlier format is being recreated: say so, not "indexing" (#1324).
+        let recreating = probe.as_ref().is_err_and(|error| {
+            error.to_string() == format!("index_not_ready: {RECREATING_AFTER_UPGRADE}")
+        });
         // With no head, a blocked startup recovery will publish none: end the
         // wait with its typed cause, the one `status` reports (#768). Checked
         // on every wake.
@@ -1082,6 +1089,12 @@ fn await_first_head(
         }
         let now = Instant::now();
         if now >= deadline {
+            if recreating {
+                anyhow::bail!(
+                    "index_not_ready: {RECREATING_AFTER_UPGRADE}; \
+                     indexing continues in the daemon, retry shortly"
+                );
+            }
             anyhow::bail!(
                 "index_not_ready: the first index of this checkout is still running; \
                  indexing continues in the daemon, retry shortly"
@@ -1091,7 +1104,12 @@ fn await_first_head(
             Some(at) if now.duration_since(at) < CLI_FIRST_INDEX_PROGRESS => at,
             _ => {
                 progress(format!(
-                    "trellis: indexing this checkout ({}s elapsed, waiting up to {}s)",
+                    "trellis: {} ({}s elapsed, waiting up to {}s)",
+                    if recreating {
+                        RECREATING_AFTER_UPGRADE
+                    } else {
+                        "indexing this checkout"
+                    },
                     now.duration_since(started).as_secs(),
                     deadline.duration_since(started).as_secs()
                 ));

@@ -717,7 +717,9 @@ fn incompatible_index_refuses_without_migrating_durable_data() {
     let deferred = Store::open_for_tests(&state, &workspace).unwrap();
     let refusal = deferred.status().unwrap_err();
     assert!(
-        refusal.to_string().contains("recovery_required"),
+        refusal
+            .to_string()
+            .contains("index_not_ready: recreating index after upgrade"),
         "{refusal:#}"
     );
     assert_eq!(std::fs::read(record).unwrap(), before);

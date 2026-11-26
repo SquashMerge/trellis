@@ -255,6 +255,54 @@ fn preexisting_corrupt_index_is_not_reinitialized() {
     assert!(staged_files(&dir).is_empty());
 }
 
+/// #1324: an index of an earlier schema waiting for its recreate is the ordinary not-ready
+/// state a first index is, with the upgrade as its reason, never `recovery_required`. The
+/// corrupt index above keeps `recovery_required`.
+#[test]
+fn earlier_schema_index_awaiting_recreate_is_typed_not_ready() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions,
+        store::topology::IndexNotReady,
+    };
+    let (state, workspace) = fixture();
+    fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.pragma_update(None, "user_version", 7).unwrap();
+    drop(db);
+
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let refusals = [
+        ("status", store.status().unwrap_err()),
+        ("index baseline", store.index_baseline().unwrap_err()),
+        (
+            "evidence read",
+            store.evidence_response_daemon_local().err().unwrap(),
+        ),
+    ];
+    for (read, refusal) in refusals {
+        assert!(
+            refusal.downcast_ref::<IndexNotReady>().is_some(),
+            "{read}: {refusal:#}"
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "index_not_ready: recreating index after upgrade",
+            "{read}"
+        );
+    }
+}
+
 #[test]
 fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recovery() {
     use std::{
