@@ -2676,8 +2676,10 @@ try:
         r2 = db.execute('SELECT retained_config,config_hash FROM native_revisions WHERE id=?', (prior,)).fetchone()
         original = json.loads(r1[0]); current = json.loads(r2[0])
         extra = [entry for entry in current if entry not in original]
-        assert extra == [{'path': f'rust/g0{n}/{name}', 'type': 'absent'} for n in (1,2,3) for name in ('.gitignore','.ignore')], extra
-        assert r1[1] != r2[1]
+        # The new rust/g0N directories have no ignore files; absent ones are not config
+        # inputs (#1327), so the config and its hash are unchanged.
+        assert extra == [], extra
+        assert r1[1] == r2[1]
         links = db.execute('SELECT m.revision_id,d.id,d.extraction_context,d.content_hash FROM revision_documents m JOIN document_versions d ON d.vid=m.vid WHERE m.revision_id IN (?,?) AND m.path=? ORDER BY m.revision_id', (capture,prior,anchor.as_posix())).fetchall()
         assert len(links)==2 and len({link[1:] for link in links}) == 1, links
     language, relative, kind = m.planned_edit('medium', 'body', 0)

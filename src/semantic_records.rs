@@ -27,6 +27,18 @@ pub enum Language {
     #[serde(rename = "typescript")]
     Typescript,
 }
+impl Language {
+    /// The language's wire name, as a `DocumentKey.language` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Java => "java",
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Javascript => "javascript",
+            Self::Typescript => "typescript",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PositionEncoding {
     #[serde(rename = "utf8")]

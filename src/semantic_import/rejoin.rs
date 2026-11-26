@@ -784,7 +784,17 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         }
     }
     let mut provenance = Vec::new();
-    let destination_manifest_hash = manifest_hash(&destination_native.revision);
+    // Freshness rule 2 (as amended, #1327): only the documents of the producer's languages,
+    // not the revision identity or the source-set-wide manifest, decide `possiblyStale`.
+    let producer_manifest = |revision: &native::Revision| {
+        crate::batch_descriptor::ProducerManifestHasher::of(
+            &revision.source_set_id,
+            &producer.languages,
+            &revision.documents,
+        )
+    };
+    let producer_documents_unchanged = producer_manifest(&captured_native.revision)
+        == producer_manifest(&destination_native.revision);
     let mut ids = BTreeMap::new();
     for (raw_id, kind) in provenance_sources {
         let claim = raw_index
@@ -819,8 +829,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .is_none_or(|old| old.content_hash != dst.content_hash)
         {
             semantic::Freshness::Stale
-        } else if captured_basis.revision_id != destination_native.revision.id
-            || captured_basis.source_manifest_hash != destination_manifest_hash
+        } else if !producer_documents_unchanged
             || captured_basis.toolchain_hash != destination_native.revision.toolchain_hash
             || captured_basis.config_hash != destination_native.revision.config_hash
             || captured_basis.dependency_hash != destination_native.revision.dependency_hash

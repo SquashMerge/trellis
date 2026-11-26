@@ -342,7 +342,7 @@ impl StagedJoin<'_> {
         doc: &native::DocumentKey,
         captured_global: &CompletedGlobal<'_>,
         destination_global: &CompletedGlobal<'_>,
-        destination_manifest_hash: &str,
+        producer_documents_unchanged: bool,
         prepared: Option<super::CapturedJoin>,
     ) -> Result<DocumentOutcome> {
         let encoding = self.admitted_encoding;
@@ -991,7 +991,7 @@ impl StagedJoin<'_> {
                 )?;
             }
         }
-        outcome.provenance = self.provenance(&view, doc, &sources, destination_manifest_hash)?;
+        outcome.provenance = self.provenance(&view, doc, &sources, producer_documents_unchanged)?;
         for value in outcomes.values() {
             match value {
                 1 => outcome.matched += 1,
@@ -1030,7 +1030,7 @@ impl StagedJoin<'_> {
         view: &StagedSide<'_>,
         doc: &native::DocumentKey,
         sources: &BTreeSet<(String, semantic::EvidenceKind)>,
-        destination_manifest_hash: &str,
+        producer_documents_unchanged: bool,
     ) -> Result<Option<String>> {
         if sources.is_empty() {
             return Ok(None);
@@ -1052,9 +1052,8 @@ impl StagedJoin<'_> {
         let header = &self.destination_header.revision;
         let freshness = if captured_hash.is_none_or(|hash| hash != destination.content_hash) {
             semantic::Freshness::Stale
-        } else if (!self.reimport_context_matches
-            && (basis.revision_id != header.id || basis.toolchain_hash != header.toolchain_hash))
-            || basis.source_manifest_hash != destination_manifest_hash
+        } else if (!self.reimport_context_matches && basis.toolchain_hash != header.toolchain_hash)
+            || !producer_documents_unchanged
             || basis.config_hash != header.config_hash
             || basis.dependency_hash != header.dependency_hash
             || basis.producer_version != self.producer.version

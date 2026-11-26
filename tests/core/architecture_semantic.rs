@@ -207,15 +207,22 @@ fn architecture_incremental_import_and_catchup() {
         selection
     );
     // The base is the import's core, at another native revision. The first edit after the
-    // producer run moves every rejoined provenance ID, and catch-up carries the evidence
+    // producer run moves every rejoined provenance ID, and catch-up carries the Rust evidence
     // forward as possibly stale; each core rebases both (#1310), so only the edit is Dirty.
+    // The edit is Rust only, so the TypeScript evidence stays fresh (#1327).
     let caught_up = fixture.native_revision();
     assert_ne!(caught_up, imported);
     let carried = fixture.freshness();
-    for path in ["src/caller.rs", "src/target.rs", "a.ts", "b.ts"] {
+    for path in ["src/caller.rs", "src/target.rs"] {
         assert_ne!(freshness[path], carried[path], "{path}: {carried:?}");
         assert!(
             carried[path].values().all(|value| value == "possiblyStale"),
+            "{path}: {carried:?}"
+        );
+    }
+    for path in ["a.ts", "b.ts"] {
+        assert!(
+            carried[path].values().all(|value| value == "fresh"),
             "{path}: {carried:?}"
         );
     }

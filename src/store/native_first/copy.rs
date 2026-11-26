@@ -17,68 +17,91 @@ use crate::semantic_records as sem;
 
 /// What a copied row takes from the destination native revision.
 pub(crate) struct CopyDestination {
+    key: String,
     native_revision_id: String,
     toolchain_hash: String,
     config_hash: String,
     dependency_hash: String,
-    manifest_hash: String,
+}
+
+/// What freshness rule 2 compares for one producer's copies (as amended, owner ruling
+/// 2026-11-25, #1327): the native revision its selected batch was captured at, and whether the
+/// producer's languages have the same documents there as at the destination.
+pub(crate) struct ProducerScope<'a> {
+    destination: &'a CopyDestination,
+    captured_native_revision_id: String,
+    documents_unchanged: bool,
 }
 
 impl CopyDestination {
-    /// The pending target's native revision and source manifest, as the join's settlement
-    /// reads them (`SourceManifestHasher` over the canonical inventory).
-    pub(crate) fn read(
-        store: &Store,
-        db: &Connection,
-        target: &PendingSemanticTarget,
-    ) -> Result<Self> {
+    /// The pending target's native revision and context, as the join's settlement reads them.
+    pub(crate) fn read(db: &Connection, target: &PendingSemanticTarget) -> Result<Self> {
         let key = semantic_pin_key(target.pin);
-        let (native_revision_id, source_set_id, toolchain_hash, config_hash, dependency_hash): (
-            String,
+        let (native_revision_id, toolchain_hash, config_hash, dependency_hash): (
             String,
             String,
             String,
             String,
         ) = db
             .prepare_cached(
-                "SELECT native_revision_id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",
+                "SELECT native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",
             )?
-            .query_row([&key], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?;
+            .query_row([&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
         selected_ensure!(
             native_revision_id == target.native_revision_id,
             "incompatible_index: copy destination differs from the pending target"
         );
-        let read = ReadRevision::new(target.pin, key);
-        let reader = NativeReader {
-            store,
-            db,
-            selected: &read,
-        };
-        let mut manifest = crate::batch_descriptor::SourceManifestHasher::new(&source_set_id);
-        let mut cursor = CanonicalInventoryCursor::default();
-        loop {
-            let page = reader.canonical_inventory_page(&mut cursor, 256)?;
-            if page.is_empty() {
-                break;
-            }
-            for document in &page {
-                manifest.push(
-                    &document.key.language,
-                    &document.key.path,
-                    &document.content_hash,
-                );
-            }
-        }
         Ok(Self {
+            key,
             native_revision_id,
             toolchain_hash,
             config_hash,
             dependency_hash,
-            manifest_hash: manifest.finish(),
         })
     }
+
+    /// `producer`'s scope for copies whose selected batch was captured at `captured`.
+    pub(crate) fn producer_scope(
+        &self,
+        db: &Connection,
+        captured: IndexPin,
+        producer: &sem::Producer,
+    ) -> Result<ProducerScope<'_>> {
+        let captured = semantic_pin_key(captured);
+        let captured_native_revision_id: String = db
+            .prepare_cached("SELECT native_revision_id FROM native_revisions WHERE id=?1")?
+            .query_row([&captured], |r| r.get(0))?;
+        let documents_unchanged = captured_native_revision_id == self.native_revision_id
+            || producer_manifest(db, &captured, producer)?
+                == producer_manifest(db, &self.key, producer)?;
+        Ok(ProducerScope {
+            destination: self,
+            captured_native_revision_id,
+            documents_unchanged,
+        })
+    }
+}
+
+/// The producer manifest of revision `key`: its documents of `producer`'s languages, in
+/// canonical order.
+fn producer_manifest(db: &Connection, key: &str, producer: &sem::Producer) -> Result<String> {
+    let source_set_id: String = db
+        .prepare_cached("SELECT source_set_id FROM native_revisions WHERE id=?1")?
+        .query_row([key], |r| r.get(0))?;
+    let mut manifest =
+        crate::batch_descriptor::ProducerManifestHasher::new(&source_set_id, &producer.languages);
+    let mut statement = db.prepare_cached(
+        "SELECT d.language,d.path,v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 ORDER BY d.ordinal",
+    )?;
+    let mut rows = statement.query([key])?;
+    while let Some(row) = rows.next()? {
+        manifest.push(
+            &row.get::<_, String>(0)?,
+            &row.get::<_, String>(1)?,
+            &row.get::<_, String>(2)?,
+        );
+    }
+    Ok(manifest.finish())
 }
 
 /// The basis pin key and tuple of `document` when S copies it for `producer`: the
@@ -168,28 +191,30 @@ impl CopyFilter {
 /// The freshness each basis of a copied payload has at the destination, exactly as the
 /// witnessed settlement would emit it for an unchanged document: its captured and destination
 /// bytes agree (which the witness checked before choosing the copy), so only a basis the
-/// destination no longer shares is possibly stale. Keyed by `basis_id`: a copy shares the
-/// basis payload's bases.
+/// destination no longer shares is possibly stale. Rule 2 compares the producer's own
+/// languages' documents (`scope`), not the revision identity or the whole manifest (#1327).
+/// Keyed by `basis_id`: a copy shares the basis payload's bases.
 pub(crate) fn reuse_freshness(
     db: &Connection,
     payload: i64,
     producer: &sem::Producer,
-    destination: &CopyDestination,
+    scope: &ProducerScope<'_>,
 ) -> Result<BTreeMap<i64, sem::Freshness>> {
+    let destination = scope.destination;
     let mut rows = db.prepare_cached(
-        "SELECT basis_id,captured_native_revision_id,toolchain_hash,source_manifest_hash,config_hash,dependency_hash,producer_version,producer_hash,language FROM semantic_basis WHERE payload_id=?1",
+        "SELECT basis_id,captured_native_revision_id,toolchain_hash,config_hash,dependency_hash,producer_version,producer_hash,language FROM semantic_basis WHERE payload_id=?1",
     )?;
     let mut rows = rows.query([payload])?;
     let mut out = BTreeMap::new();
     while let Some(row) = rows.next()? {
-        let language: sem::Language = semantic_enum(row.get::<_, String>(8)?)?;
-        let fresh = row.get::<_, String>(1)? == destination.native_revision_id
+        let language: sem::Language = semantic_enum(row.get::<_, String>(7)?)?;
+        let fresh = scope.documents_unchanged
+            && row.get::<_, String>(1)? == scope.captured_native_revision_id
             && row.get::<_, String>(2)? == destination.toolchain_hash
-            && row.get::<_, String>(3)? == destination.manifest_hash
-            && row.get::<_, String>(4)? == destination.config_hash
-            && row.get::<_, String>(5)? == destination.dependency_hash
-            && row.get::<_, String>(6)? == producer.version
-            && row.get::<_, String>(7)? == producer.executable_hash
+            && row.get::<_, String>(3)? == destination.config_hash
+            && row.get::<_, String>(4)? == destination.dependency_hash
+            && row.get::<_, String>(5)? == producer.version
+            && row.get::<_, String>(6)? == producer.executable_hash
             && producer.languages.contains(&language);
         out.insert(
             row.get(0)?,
@@ -254,7 +279,7 @@ pub(crate) fn copied_document(
     target: &PendingSemanticTarget,
     selection: &PendingSemanticSelection,
     producer: &sem::Producer,
-    destination: &CopyDestination,
+    scope: &ProducerScope<'_>,
     join_inputs: &str,
     document: &DocumentKey,
 ) -> Result<sem::SemanticPublication> {
@@ -275,7 +300,7 @@ pub(crate) fn copied_document(
         |row| row.get(0),
     )?;
     let freshness = match payload {
-        Some(payload) => reuse_freshness(db, payload, producer, destination)?,
+        Some(payload) => reuse_freshness(db, payload, producer, scope)?,
         None => BTreeMap::new(),
     };
     let source_set: String = db.query_row(
@@ -294,7 +319,7 @@ pub(crate) fn copied_document(
         source_set,
         Some(ReadAs {
             revision: &semantic_pin_key(target.pin),
-            native: &destination.native_revision_id,
+            native: &scope.destination.native_revision_id,
             freshness: &freshness,
         }),
     )?;

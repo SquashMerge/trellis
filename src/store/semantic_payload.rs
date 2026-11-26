@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn writer_rejects_dependency_endpoint_missing_from_revision() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V50).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -1003,7 +1003,7 @@ mod tests {
     #[test]
     fn unbatched_payload_records_null_terms_and_no_targets() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V50).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute("INSERT INTO native_revisions VALUES('key','set',?1,?1,?1,'native','[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',1)", ["a".repeat(64)]).unwrap();
         let (_, mut publication) = every_endpoint();
@@ -1048,7 +1048,7 @@ mod tests {
     }
 
     fn payload_with_children(db: &Connection, key: Option<&str>, symbols: usize) {
-        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V50).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         db.execute(
             "INSERT INTO semantic_payloads(payload_id,payload_key,producer_id,producer_version,language,path,version_id,batch_id) VALUES(1,?1,'p','1','javascript','a.js','v',1)",
@@ -1190,7 +1190,7 @@ mod tests {
     /// hash `1…` at `same` and `2…` at `edited`.
     fn bound_call(bound: bool, captured: Option<&str>) -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V49).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V50).unwrap();
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
         for (tuple, revision) in [(1, "same"), (2, "edited")] {
             db.execute("INSERT INTO native_revisions VALUES(?1,'set',?2,?2,?2,?1,'[]','[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?3)", params![revision, "a".repeat(64), tuple]).unwrap();

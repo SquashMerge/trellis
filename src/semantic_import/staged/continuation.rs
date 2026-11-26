@@ -48,8 +48,12 @@ pub(crate) struct JoinContinuation {
     identical_joins: bool,
     witnessed: bool,
     tallies: BTreeMap<semantic::Language, LanguageTally>,
-    manifest: Option<SourceManifestHasher>,
-    manifest_hash: String,
+    /// The producer manifest being hashed, a page a unit, and the captured side's finished one
+    /// (freshness rule 2 as amended, #1327).
+    manifest: Option<ProducerManifestHasher>,
+    captured_manifest: Option<String>,
+    /// Whether the producer's languages have the same documents at both pins, once known.
+    producer_documents_unchanged: Option<bool>,
     captured_pin: Option<IndexPin>,
     descriptor_sha256: Option<String>,
 }
@@ -78,7 +82,8 @@ impl JoinContinuation {
             witnessed: false,
             tallies: BTreeMap::new(),
             manifest: None,
-            manifest_hash: String::new(),
+            captured_manifest: None,
+            producer_documents_unchanged: None,
             captured_pin: None,
             descriptor_sha256: None,
         }
@@ -225,9 +230,11 @@ impl JoinContinuation {
             Phase::Eligibility => self.step_eligibility(join, shared)?,
             Phase::DestinationTargets | Phase::CapturedTargets => self.step_targets(join)?,
             Phase::WitnessTargets => self.step_witness_targets(join)?,
-            // The manifest is a separate bounded inventory pass. Never rescan the whole
-            // inventory for every settlement document.
-            Phase::Settlement if self.manifest_hash.is_empty() => self.step_manifest(join)?,
+            // The producer manifests are a separate bounded inventory pass. Never rescan the
+            // whole inventory for every settlement document.
+            Phase::Settlement if self.producer_documents_unchanged.is_none() => {
+                self.step_manifest(join)?
+            }
             Phase::Settlement => self.step_settlement(join, shared)?,
             Phase::Closure => self.step_closure(join)?,
             Phase::OutputClosure => self.step_output_closure(join)?,
@@ -361,7 +368,7 @@ impl JoinContinuation {
         if exists(conn, "SELECT 1 FROM nat_done WHERE rev=?1", &[&rev])? {
             self.transition(self.after_inventory(shared, rev));
             if shared {
-                self.manifest = Some(SourceManifestHasher::new(side.source_set_id()));
+                self.manifest = None;
             }
         } else {
             let page = side
@@ -392,7 +399,7 @@ impl JoinContinuation {
                 }
                 conn.execute("INSERT INTO nat_done VALUES(?1)", [rev])?;
                 self.transition(self.after_inventory(shared, rev));
-                self.manifest = Some(SourceManifestHasher::new(join.destination.source_set_id()));
+                self.manifest = None;
             }
         }
         Ok(())
@@ -538,13 +545,24 @@ impl JoinContinuation {
         Ok(())
     }
 
-    /// The first units of settlement: the destination's source manifest hash, a page a call.
+    /// The first units of settlement: the producer manifests of the captured and then the
+    /// destination inventory, a page a call, and whether they agree (freshness rule 2 as
+    /// amended, owner ruling 2026-11-25, #1327). A shared pin is one inventory.
     fn step_manifest(&mut self, join: &StagedJoin<'_>) -> Result<()> {
+        if join.captured.rev == join.destination.rev {
+            self.producer_documents_unchanged = Some(true);
+            return Ok(());
+        }
+        let side = if self.captured_manifest.is_none() {
+            &join.captured
+        } else {
+            &join.destination
+        };
         let conn = join.conn();
         let mut statement = conn.prepare_cached(
             "SELECT ord,language,path,content_hash FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 128")?;
         let page = statement
-            .query_map(params![join.destination.rev, self.last], |row| {
+            .query_map(params![side.rev, self.last], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -553,16 +571,22 @@ impl JoinContinuation {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let manifest = self
-            .manifest
-            .get_or_insert_with(|| SourceManifestHasher::new(join.destination.source_set_id()));
+        let manifest = self.manifest.get_or_insert_with(|| {
+            ProducerManifestHasher::new(side.source_set_id(), &join.producer.languages)
+        });
         for (ord, language, path, hash) in &page {
             manifest.push(language, path, hash);
             self.last = *ord;
         }
         if page.is_empty() {
-            self.manifest_hash = self.manifest.take().expect("manifest initialized").finish();
+            let finished = self.manifest.take().expect("manifest initialized").finish();
             self.last = -1;
+            match self.captured_manifest.take() {
+                None => self.captured_manifest = Some(finished),
+                Some(captured) => {
+                    self.producer_documents_unchanged = Some(captured == finished);
+                }
+            }
         }
         Ok(())
     }
@@ -594,7 +618,8 @@ impl JoinContinuation {
                     &document,
                     &captured,
                     &destination,
-                    &self.manifest_hash,
+                    self.producer_documents_unchanged
+                        .context("producer manifests not compared")?,
                     None,
                 )?
             } else {
@@ -915,6 +940,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn yielded_join_matches_full_and_reopens_every_snapshot() {
+        use crate::semantic_batch::descriptor::SourceManifestHasher;
         use crate::{
             indexer::{IndexOptions, index_workspace_bundle},
             semantic_batch::{StageInput, StageOwner, stage_batch, testing},
@@ -1117,7 +1143,8 @@ mod tests {
             staged_manifest.push(&language, &path, &hash);
         }
         assert_eq!(staged_manifest.finish(), canonical_manifest);
-        assert_eq!(cursor.manifest_hash, canonical_manifest);
+        // One shared pin: the producer's documents are trivially the same at both ends.
+        assert_eq!(cursor.producer_documents_unchanged, Some(true));
         assert!(
             phases.contains("CapturedDiscovery")
                 && phases.contains("Eligibility")

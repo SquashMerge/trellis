@@ -125,8 +125,11 @@ fn native_components(
     let mut config = dependencies.clone();
     config.extend(INPUTS[26..].iter().map(|name| entry(name)));
     config.push(json!({"nativeAdmission":{"maxFileBytes":max_file_bytes}}));
+    // Only present ignore files are config inputs (#1327).
     for name in [".gitignore", ".ignore"] {
-        config.push(entry(name));
+        if root.join(name).is_file() {
+            config.push(entry(name));
+        }
     }
     let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":entry(INPUTS[26]),"rootRustToolchainToml":entry(INPUTS[27])});
     (toolchain, config, dependencies)

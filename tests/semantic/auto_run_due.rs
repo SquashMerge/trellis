@@ -189,6 +189,67 @@ fn a_change_in_another_language_is_not_due() {
     assert!(world.due(&["python"]));
 }
 
+/// #1327 (owner ruling 2026-11-25): a change only to a dependency manifest changes an input
+/// freshness compares, so the producer's evidence is possibly stale and it is due.
+#[test]
+fn a_manifest_only_change_is_due() {
+    let world = World::new(FILES);
+    world.import_javascript();
+    assert!(!world.due(JAVASCRIPT));
+    world.write("package-lock.json", "{\"lockfileVersion\":3}\n");
+    world.reindex();
+    assert!(world.due(JAVASCRIPT));
+}
+
+impl World {
+    /// The head revision's config hash.
+    fn config_hash(&self) -> String {
+        let head = self.store.index_baseline().unwrap();
+        let key = format!("pin:v1:{}:{}", head.index_generation, head.index_revision);
+        Connection::open(&self.index_db)
+            .unwrap()
+            .query_row(
+                "SELECT config_hash FROM native_revisions WHERE id=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// #1327 (owner ruling 2026-11-25): a directory without an ignore file records no config
+/// input, so a Python file in a new directory changes neither the config hash nor whether the
+/// JavaScript producer is due.
+#[test]
+fn a_file_in_a_new_directory_is_not_due() {
+    let world = World::new(FILES);
+    world.import_javascript();
+    let config = world.config_hash();
+    fs::create_dir(world.root.join("tools")).unwrap();
+    world.write("tools/check.py", "def check(): return 1\n");
+    world.reindex();
+    assert_eq!(world.config_hash(), config);
+    assert!(!world.due(JAVASCRIPT));
+}
+
+/// #1327: a real ignore file is still a config input. Adding one changes the config hash, so the
+/// producer is due; removing it changes the hash again.
+#[test]
+fn an_added_or_removed_ignore_file_changes_the_config_hash() {
+    let world = World::new(FILES);
+    world.import_javascript();
+    let config = world.config_hash();
+    world.write("src/.gitignore", "*.tmp\n");
+    world.reindex();
+    let added = world.config_hash();
+    assert_ne!(added, config);
+    assert!(world.due(JAVASCRIPT));
+    fs::remove_file(world.root.join("src/.gitignore")).unwrap();
+    world.reindex();
+    assert_ne!(world.config_hash(), added);
+    assert_eq!(world.config_hash(), config);
+}
+
 #[test]
 fn a_deleted_document_is_due() {
     let world = World::new(FILES);

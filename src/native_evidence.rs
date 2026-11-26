@@ -283,8 +283,13 @@ pub(crate) fn captured_components(
         json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
     );
     for (p, b) in capture.admitted_inputs() {
-        if p.file_name()
-            .is_some_and(|n| n == ".gitignore" || n == ".ignore")
+        // Present ignore files only (owner ruling 2026-11-25, #1327): a directory without one
+        // records no config entry, so adding a file in a new directory leaves the config hash,
+        // and every producer's freshness, unchanged. Adding, editing or removing an ignore file
+        // still changes it. Admission still observes the absent ones.
+        if b.is_some()
+            && p.file_name()
+                .is_some_and(|n| n == ".gitignore" || n == ".ignore")
             && p.starts_with(root)
         {
             config.push(entry(root, p, b)?);
