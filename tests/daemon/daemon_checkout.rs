@@ -4231,7 +4231,7 @@ fn registry_forgets_an_idle_entry_whose_root_is_gone() {
     let (session_root, session) = checkout("session");
     let (browser_root, browser) = checkout("browser");
     let (pending_root, pending) = checkout("pending");
-    let (live_root, live) = checkout("live");
+    let (_live_root, live) = checkout("live");
     let replaced_root = base.path().join("replaced");
     fs::create_dir(&replaced_root).unwrap();
     let replaced_id = identity(&replaced_root);
