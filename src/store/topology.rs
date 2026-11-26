@@ -1132,7 +1132,33 @@ pub struct DerivedReport {
     pub reason: &'static str,
 }
 
+/// What one GC pass collected and what it skipped, with why (`trellis gc --run`).
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcRunReport {
+    pub collected: Vec<DerivedReport>,
+    pub skipped: Vec<DerivedReport>,
+}
+impl GcRunReport {
+    fn skip(&mut self, root_key: String, reason: &'static str) {
+        self.skipped.push(DerivedReport {
+            root_key,
+            status: "skipped",
+            reason,
+        });
+    }
+}
+
 const GC_AGE_SECONDS: i64 = 30 * 24 * 60 * 60;
+/// The automatic pass runs at most hourly after a completed scan (owner, 2026-11-25).
+const GC_INTERVAL_SECONDS: i64 = 60 * 60;
+/// A started pass fences the next attempt for this long, so a pass that crashes
+/// the daemon cannot run again at every restart.
+const GC_ATTEMPT_FENCE_SECONDS: i64 = 60 * 60;
+/// Written only after a completed scan.
+const GC_COMPLETED_STAMP: &str = "gc-last-run";
+/// Written before a scan starts.
+const GC_ATTEMPT_STAMP: &str = "gc-last-attempt";
 const MAX_TRUSTED_SECONDS: i64 = 9_007_199_254_740_991;
 
 /// A persisted open age is trusted only when positive and no later than this report's clock.
@@ -1261,12 +1287,34 @@ fn inspect_index_with_open_hook(
     if version != i64::from(super::DATABASE_SCHEMA_VERSION) {
         return Ok(("unknown", "unknown_index_schema"));
     }
+    // The cheap root and age test runs first (#1316): an entry it keeps needs no
+    // shape, supersession or integrity proof. Only an eligible verdict, or one the
+    // metadata cannot give, goes on to every validation below.
+    if let Ok(verdict) = root_age_verdict(db, key, now_secs)
+        && verdict.0 != "eligible"
+    {
+        return Ok(verdict);
+    }
     if super::validate_cache_shape(db).is_err() {
         return Ok(("unknown", "unknown_index_shape"));
     }
     if super::validate_supersessions(db).is_err() {
         return Ok(("unknown", "invalid_supersession_inventory"));
     }
+    let verdict = root_age_verdict(db, key, now_secs)?;
+    let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    ensure!(integrity == "ok", "incompatible index integrity");
+    Ok(verdict)
+}
+
+/// The recorded root identity and open age of a current-schema index, read from
+/// its metadata row alone. It proves nothing about the rest of the file.
+fn root_age_verdict(
+    db: &rusqlite::Connection,
+    key: &str,
+    now_secs: i64,
+) -> Result<(&'static str, &'static str)> {
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
     ensure!(count == 1, "incompatible index metadata cardinality");
     let (schema, extractor, spelling, dev, ino, age): (i64, String, String, String, String, rusqlite::types::Value) = db.query_row(
@@ -1279,8 +1327,6 @@ fn inspect_index_with_open_hook(
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"
     );
-    let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    ensure!(integrity == "ok", "incompatible index integrity");
     let device: u64 = dev.parse()?;
     let inode: u64 = ino.parse()?;
     ensure!(device > 0 && inode > 0, "invalid root identity");
@@ -1335,6 +1381,87 @@ fn old_index_schema(version: i64) -> bool {
     (1..i64::from(super::DATABASE_SCHEMA_VERSION)).contains(&version)
 }
 
+/// A recreation's private stage, `index.db.tmp-<uuid>`, or one of that stage's own
+/// SQLite sidecars. Returns the stage database's name. Only the checkout's writer
+/// creates one, and it is never published under that name (#1316).
+pub(crate) fn index_stage_name(name: &str) -> Option<&str> {
+    const PREFIX: &str = "index.db.tmp-";
+    let rest = name.strip_prefix(PREFIX)?;
+    let id = ["-journal", "-wal", "-shm"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))
+        .unwrap_or(rest);
+    let canonical = Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id);
+    canonical.then(|| &name[..PREFIX.len() + id.len()])
+}
+
+/// A derived index directory's entries as GC sees them. Besides `index.db` and
+/// `requests.db`, only dead recreation stages and semantic batch stages can be
+/// collected with an eligible index: under its verified EX use lock no worker
+/// can hold either (#1316, owner 2026-11-25).
+#[derive(Default)]
+struct GcInventory {
+    requests: bool,
+    stages: Vec<String>,
+    semantic: Vec<String>,
+}
+
+/// The shared inventory rule of GC and `gc --report` (#1316). A sidecar of
+/// `index.db` or `requests.db` is a hot journal (Decision 0006 §2) and any other
+/// unknown name is a skip; so is a directory without `index.db`.
+fn gc_inventory(dir: &Path) -> Result<std::result::Result<GcInventory, &'static str>> {
+    let mut inventory = GcInventory::default();
+    let mut index = false;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            return Ok(Err("unknown_index_entry"));
+        };
+        let kind = entry.file_type()?;
+        match name.as_str() {
+            "index.db" => index = true,
+            "requests.db" => inventory.requests = true,
+            "index.db-journal"
+            | "index.db-wal"
+            | "index.db-shm"
+            | "requests.db-journal"
+            | "requests.db-wal"
+            | "requests.db-shm" => return Ok(Err("hot_journal")),
+            _ if kind.is_file() && index_stage_name(&name).is_some() => {
+                inventory.stages.push(name);
+            }
+            _ if kind.is_dir() && name.starts_with(super::staging::STAGE_PREFIX) => {
+                inventory.semantic.push(name);
+            }
+            _ => return Ok(Err("unknown_index_entry")),
+        }
+    }
+    if !index {
+        return Ok(Err("incomplete_index"));
+    }
+    Ok(Ok(inventory))
+}
+
+/// Whether GC's inventory rule admits a directory the inspection found eligible.
+fn gc_inventory_skip(dir: &Path) -> Option<&'static str> {
+    match gc_inventory(dir) {
+        Err(_) => Some("metadata_unreadable"),
+        Ok(Err(reason)) => Some(reason),
+        Ok(Ok(_)) => None,
+    }
+}
+
+/// The eligibility a candidate was collected under, or why it was skipped.
+pub type GcVerdict = std::result::Result<&'static str, &'static str>;
+
+struct GcAdmitted {
+    reason: &'static str,
+    dbs: Vec<(PathBuf, (u64, u64))>,
+    stages: Vec<(PathBuf, (u64, u64))>,
+    semantic: Vec<PathBuf>,
+    expected: Vec<String>,
+}
+
 /// Only an earlier schema or the exact current layout can reach the unlink boundary.
 /// Validation failures skip the candidate. An unlink/sync failure is returned
 /// as an error, including when an earlier derived file was already removed.
@@ -1348,12 +1475,12 @@ fn gc_remove_candidate(
     current: &WorkspaceIdentity,
     writer: &WriterGuard,
     hook: &mut dyn FnMut(GcStage) -> Result<()>,
-) -> Result<bool> {
+) -> Result<GcVerdict> {
     if guard
         .verify_exclusive_path(&dir.with_extension("lock"))
         .is_err()
     {
-        return Ok(false);
+        return Ok(Err("unsafe_use_lock"));
     }
     let paths = vec![dir.join("index.db"), dir.join("requests.db")];
     let suspended = {
@@ -1375,7 +1502,7 @@ fn gc_remove_candidate(
         suspended,
     };
     let producer_state = cache.join("producers").join(key);
-    let admit = (|| -> Result<Vec<(PathBuf, (u64, u64))>> {
+    let admit = (|| -> Result<std::result::Result<GcAdmitted, &'static str>> {
         guard.verify_exclusive_path(&dir.with_extension("lock"))?;
         private_dir(dir)?;
         // Unsafe producer state is never removed: skip the candidate.
@@ -1384,30 +1511,30 @@ fn gc_remove_candidate(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        let mut names = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("non-UTF8 GC entry"))?;
-            ensure!(
-                matches!(name.as_str(), "index.db" | "requests.db"),
-                "unknown derived index entry"
-            );
-            names.push(name);
-        }
-        ensure!(names.iter().any(|n| n == "index.db"), "incomplete GC index");
+        let inventory = match gc_inventory(dir)? {
+            Ok(inventory) => inventory,
+            Err(reason) => return Ok(Err(reason)),
+        };
         let mut index = readonly_index_db(&dir.join("index.db"))?;
         let tx = index.transaction()?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if !old_index_schema(version) {
-            ensure!(
-                version == i64::from(super::DATABASE_SCHEMA_VERSION),
-                "unknown GC schema"
-            );
-            super::validate_cache_shape(&tx)?;
-            super::validate_supersessions(&tx)?;
+        let reason = if !old_index_schema(version) {
+            if version != i64::from(super::DATABASE_SCHEMA_VERSION) {
+                return Ok(Err("unknown_index_schema"));
+            }
+            // The cheap root and age test first (#1316); every check below still
+            // runs before an eligible candidate is unlinked.
+            if let Ok((status, reason)) = root_age_verdict(&tx, key, now)
+                && status != "eligible"
+            {
+                return Ok(Err(reason));
+            }
+            if super::validate_cache_shape(&tx).is_err() {
+                return Ok(Err("unknown_index_shape"));
+            }
+            if super::validate_supersessions(&tx).is_err() {
+                return Ok(Err("invalid_supersession_inventory"));
+            }
             let (generation, revision, stats, diagnostics): (String, i64, String, String) = tx.query_row(
             "SELECT index_generation,index_revision,stats,diagnostics FROM index_metadata WHERE singleton=1",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -1431,11 +1558,11 @@ fn gc_remove_candidate(
             drop(tx);
             drop(index);
             // This inspection is fresh under EX.
-            ensure!(
-                inspect_index(dir, key, now)?.0 == "eligible",
-                "GC index is live or unknown"
-            );
-            if names.iter().any(|n| n == "requests.db") {
+            let (status, reason) = inspect_index(dir, key, now)?;
+            if status != "eligible" {
+                return Ok(Err(reason));
+            }
+            if inventory.requests {
                 let mut queue = readonly_index_db(&dir.join("requests.db"))?;
                 let tx = queue.transaction()?;
                 let index = readonly_index_db(&dir.join("index.db"))?;
@@ -1449,30 +1576,59 @@ fn gc_remove_candidate(
                 drop(tx);
                 drop(queue);
             }
+            reason
         } else {
             // Close SQLite before the witness loop opens its own handles: closing
             // any other descriptor on a live SQLite file drops its POSIX locks.
             drop(tx);
             drop(index);
-            if names.iter().any(|n| n == "requests.db") {
+            if inventory.requests {
                 // Opening registers the queue's witness for the unlink checks.
                 drop(readonly_index_db(&dir.join("requests.db"))?);
             }
-        }
+            "old_schema"
+        };
         let mut dbs = Vec::new();
-        for name in ["index.db", "requests.db"] {
-            if !names.iter().any(|n| n == name) {
-                continue;
-            }
+        let mut expected = vec!["index.db".to_owned()];
+        if inventory.requests {
+            expected.push("requests.db".to_owned());
+        }
+        for name in &expected {
             let path = dir.join(name);
             let file = open_file_readonly(&path)?;
             let meta = file.metadata()?;
             dbs.push((path, (meta.dev(), meta.ino())));
         }
+        // A stage may still be a live SQLite file of this process: identify it by
+        // name only and never open (or close) a descriptor on it.
+        let mut stages = Vec::new();
+        for name in &inventory.stages {
+            let path = dir.join(name);
+            let meta = fs::symlink_metadata(&path)?;
+            stages.push((path, (meta.dev(), meta.ino())));
+            expected.push(name.clone());
+        }
+        let semantic = inventory
+            .semantic
+            .iter()
+            .map(|name| dir.join(name))
+            .collect();
+        expected.extend(inventory.semantic);
+        expected.sort();
         guard.verify()?;
-        Ok(dbs)
+        Ok(Ok(GcAdmitted {
+            reason,
+            dbs,
+            stages,
+            semantic,
+            expected,
+        }))
     })();
-    let Ok(dbs) = admit else { return Ok(false) };
+    let admitted = match admit {
+        Ok(Ok(admitted)) => admitted,
+        Ok(Err(reason)) => return Ok(Err(reason)),
+        Err(_) => return Ok(Err("unreadable")),
+    };
     // Recheck the *entire* directory inventory after SQLite closes, before the
     // first unlink. A new hot journal or unknown entry is always a skip.
     let actual = (|| -> Result<Vec<String>> {
@@ -1488,29 +1644,32 @@ fn gc_remove_candidate(
         names.sort();
         Ok(names)
     })();
-    let Ok(actual) = actual else { return Ok(false) };
-    let mut expected = vec!["index.db".to_owned()];
-    if dbs.len() == 2 {
-        expected.push("requests.db".to_owned());
-    }
-    expected.sort();
-    if actual != expected {
-        return Ok(false);
+    if actual.ok().as_ref() != Some(&admitted.expected) {
+        return Ok(Err("inventory_changed"));
     }
     guard.verify()?;
     hook(GcStage::BeforeCandidateUnlink)?;
     current.verify()?;
     writer.verify()?;
     guard.verify()?;
-    if !super::gc_unlink_sqlite(&dbs, &guard, current, writer, &mut || {
-        hook(GcStage::AfterFirstDbUnlink)
-    })? {
-        return Ok(false);
+    if !super::gc_unlink_sqlite(
+        &admitted.dbs,
+        &admitted.stages,
+        &guard,
+        current,
+        writer,
+        &mut || hook(GcStage::AfterFirstDbUnlink),
+    )? {
+        return Ok(Err("sqlite_busy"));
     }
     // Past this boundary every I/O or authority failure is reported; never
     // claim a skip after even one derived inode has been removed.
     current.verify()?;
     writer.verify()?;
+    for stage in &admitted.semantic {
+        guard.verify()?;
+        fs::remove_dir_all(stage)?;
+    }
     current.verify()?;
     writer.verify()?;
     fs::remove_dir(dir)?;
@@ -1523,13 +1682,14 @@ fn gc_remove_candidate(
     // Lock path is the final name removed, after the directory is gone.
     drop(witnesses);
     guard.remove_last()?;
-    Ok(true)
+    Ok(Ok(admitted.reason))
 }
 
 impl TopologyRoots {
     /// The advisory report is never a deletion permit. A verified writer records
-    /// its bounded daily attempt before opening any candidate. Every candidate
-    /// gets its own nonblocking EX and an independent current-schema inspection.
+    /// its attempt fence before opening any candidate, and its completion only
+    /// after the whole scan. Every candidate gets its own nonblocking EX and an
+    /// independent current-schema inspection.
     pub fn automatic_gc_at(
         &self,
         current: &WorkspaceIdentity,
@@ -1539,6 +1699,11 @@ impl TopologyRoots {
         self.automatic_gc_at_with_hook(current, writer, now_secs, &mut |_| Ok(()))
     }
 
+    /// The hourly automatic pass (#1316, owner ruling 2026-11-25). It runs when
+    /// the last completed scan (`gc-last-run`) and the last attempt
+    /// (`gc-last-attempt`, the crash fence) are both at least an hour old. A pass
+    /// that yields or fails records no completion, so the next hourly tick
+    /// resumes it.
     #[doc(hidden)]
     pub fn automatic_gc_at_with_hook(
         &self,
@@ -1547,6 +1712,67 @@ impl TopologyRoots {
         now_secs: i64,
         hook: &mut dyn FnMut(GcStage) -> Result<()>,
     ) -> Result<usize> {
+        self.gc_admit(current, writer, now_secs)?;
+        let schedule = UseGuard::acquire(&self.cache.join("gc-schedule.lock"), true, true)?;
+        let (completed_file, completed) = self.read_gc_stamp(GC_COMPLETED_STAMP, now_secs)?;
+        if completed.is_some_and(|last| now_secs - last < GC_INTERVAL_SECONDS) {
+            return Ok(0);
+        }
+        let (attempt_file, attempt) = self.read_gc_stamp(GC_ATTEMPT_STAMP, now_secs)?;
+        if attempt.is_some_and(|last| now_secs - last < GC_ATTEMPT_FENCE_SECONDS) {
+            return Ok(0);
+        }
+        self.write_gc_stamp(
+            GC_ATTEMPT_STAMP,
+            attempt_file.as_ref(),
+            now_secs,
+            &schedule,
+            current,
+            writer,
+            hook,
+        )?;
+        let report = self.gc_pass(current, writer, now_secs, &schedule, hook)?;
+        self.write_gc_stamp(
+            GC_COMPLETED_STAMP,
+            completed_file.as_ref(),
+            now_secs,
+            &schedule,
+            current,
+            writer,
+            hook,
+        )?;
+        Ok(report.collected.len())
+    }
+
+    /// `trellis gc --run` (#1316): one pass now, whatever the schedule stamps say,
+    /// and with every per-candidate check of the automatic pass. It reads and
+    /// writes no stamp, and still excludes a concurrent pass.
+    #[doc(hidden)]
+    pub fn gc_run_at_with_hook(
+        &self,
+        current: &WorkspaceIdentity,
+        writer: &WriterGuard,
+        now_secs: i64,
+        hook: &mut dyn FnMut(GcStage) -> Result<()>,
+    ) -> Result<GcRunReport> {
+        self.gc_admit(current, writer, now_secs)?;
+        let schedule = UseGuard::acquire(&self.cache.join("gc-schedule.lock"), true, true)
+            .map_err(|error| {
+                if error.is::<StorageBusy>() {
+                    anyhow::anyhow!("storage_busy: another GC pass is running")
+                } else {
+                    error
+                }
+            })?;
+        self.gc_pass(current, writer, now_secs, &schedule, hook)
+    }
+
+    fn gc_admit(
+        &self,
+        current: &WorkspaceIdentity,
+        writer: &WriterGuard,
+        now_secs: i64,
+    ) -> Result<()> {
         current.verify()?;
         writer.verify()?;
         ensure!(
@@ -1558,37 +1784,49 @@ impl TopologyRoots {
             now_secs > 0 && now_secs <= MAX_TRUSTED_SECONDS,
             "invalid GC clock"
         );
-        private_dir(&self.cache)?;
-        let schedule = UseGuard::acquire(&self.cache.join("gc-schedule.lock"), true, true)?;
-        let stamp = self.cache.join("gc-last-run");
+        private_dir(&self.cache)
+    }
+
+    /// A schedule stamp's open file and its time, if it exists. A malformed
+    /// stamp or one later than `now_secs` (a clock rollback) is an error.
+    fn read_gc_stamp(&self, name: &str, now_secs: i64) -> Result<(Option<File>, Option<i64>)> {
+        let stamp = self.cache.join(name);
         let prior = match fs::symlink_metadata(&stamp) {
-            Ok(_) => Some(open_file_readonly(&stamp)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(_) => open_file_readonly(&stamp)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
             Err(error) => return Err(error.into()),
         };
-        if let Some(prior) = &prior {
-            let mut bytes = Vec::new();
-            prior.take(32).read_to_end(&mut bytes)?;
-            ensure!(!bytes.is_empty(), "invalid GC stamp: empty existing marker");
-            let text = std::str::from_utf8(&bytes)?;
-            let last: i64 = text
-                .strip_suffix('\n')
-                .context("invalid GC stamp")?
-                .parse()?;
-            ensure!(
-                last > 0 && last <= now_secs,
-                "invalid GC stamp or clock rollback"
-            );
-            if now_secs - last < 24 * 60 * 60 {
-                return Ok(0);
-            }
-        }
-        // Never truncate the old attempt. A crash before rename leaves its
-        // original inode and 24-hour fence intact; a crash after rename sees
-        // either the old or the fsynced new stamp.
-        let stage = self
-            .cache
-            .join(format!("gc-last-run.tmp-{}", Uuid::new_v4()));
+        let mut bytes = Vec::new();
+        (&prior).take(32).read_to_end(&mut bytes)?;
+        ensure!(!bytes.is_empty(), "invalid GC stamp: empty existing marker");
+        let text = std::str::from_utf8(&bytes)?;
+        let last: i64 = text
+            .strip_suffix('\n')
+            .context("invalid GC stamp")?
+            .parse()?;
+        ensure!(
+            last > 0 && last <= now_secs,
+            "invalid GC stamp or clock rollback"
+        );
+        Ok((Some(prior), Some(last)))
+    }
+
+    /// Never truncate the old stamp. A crash before rename leaves its original
+    /// inode and fence intact; a crash after rename sees either the old or the
+    /// fsynced new stamp.
+    #[allow(clippy::too_many_arguments)]
+    fn write_gc_stamp(
+        &self,
+        name: &str,
+        prior: Option<&File>,
+        now_secs: i64,
+        schedule: &UseGuard,
+        current: &WorkspaceIdentity,
+        writer: &WriterGuard,
+        hook: &mut dyn FnMut(GcStage) -> Result<()>,
+    ) -> Result<()> {
+        let stamp = self.cache.join(name);
+        let stage = self.cache.join(format!("{name}.tmp-{}", Uuid::new_v4()));
         let stage_result = (|| -> Result<()> {
             let mut staged = OpenOptions::new()
                 .write(true)
@@ -1603,7 +1841,7 @@ impl TopologyRoots {
             current.verify()?;
             writer.verify()?;
             hook(GcStage::BeforeStampRename)?;
-            match &prior {
+            match prior {
                 Some(prior) => private_file(&stamp, prior)?,
                 None => ensure!(
                     fs::symlink_metadata(&stamp)
@@ -1622,12 +1860,23 @@ impl TopologyRoots {
             let _ = fs::remove_file(&stage);
             let _ = sync_directory(&self.cache);
         }
-        stage_result?;
+        stage_result
+    }
+
+    /// One scan of every other derived index, under the held schedule lock.
+    fn gc_pass(
+        &self,
+        current: &WorkspaceIdentity,
+        writer: &WriterGuard,
+        now_secs: i64,
+        schedule: &UseGuard,
+        hook: &mut dyn FnMut(GcStage) -> Result<()>,
+    ) -> Result<GcRunReport> {
         schedule.verify()?;
+        let mut report = GcRunReport::default();
         let Some(parent) = managed_existing(&self.cache, "indexes")? else {
-            return Ok(0);
+            return Ok(report);
         };
-        let mut removed = 0;
         for entry in fs::read_dir(&parent)? {
             writer.verify()?;
             current.verify()?;
@@ -1635,7 +1884,11 @@ impl TopologyRoots {
             let Ok(key) = entry.file_name().into_string() else {
                 continue;
             };
-            if !lower_hex(&key, 64) || key == current.root_key {
+            if !lower_hex(&key, 64) {
+                continue;
+            }
+            if key == current.root_key {
+                report.skip(key, "current_checkout");
                 continue;
             }
             hook(GcStage::BeforeCandidate)?;
@@ -1643,10 +1896,17 @@ impl TopologyRoots {
             let guard =
                 match UseGuard::acquire_existing(&parent.join(format!("{key}.lock")), true, true) {
                     Ok(guard) => guard,
-                    Err(_) => continue,
+                    Err(error) if error.is::<StorageBusy>() => {
+                        report.skip(key, "use_lock_busy");
+                        continue;
+                    }
+                    Err(_) => {
+                        report.skip(key, "unsafe_use_lock");
+                        continue;
+                    }
                 };
             // Refuse unknown and unsafe entries without creating or recovering files.
-            if gc_remove_candidate(
+            match gc_remove_candidate(
                 &path,
                 &self.cache,
                 &key,
@@ -1656,11 +1916,18 @@ impl TopologyRoots {
                 writer,
                 hook,
             )? {
-                removed += 1;
+                Ok(reason) => report.collected.push(DerivedReport {
+                    root_key: key,
+                    status: "collected",
+                    reason,
+                }),
+                Err(reason) => report.skip(key, reason),
             }
         }
         self.collect_orphan_producer_state(current, writer)?;
-        Ok(removed)
+        report.collected.sort_by(|a, b| a.root_key.cmp(&b.root_key));
+        report.skipped.sort_by(|a, b| a.root_key.cmp(&b.root_key));
+        Ok(report)
     }
     /// Producer state whose index is gone: a crash after the index was removed,
     /// or a removal failure past the unlink boundary. The current key is never
@@ -1737,6 +2004,12 @@ impl TopologyRoots {
                         };
                         let result = inspect_index(&entry.path(), &name, now_secs)
                             .unwrap_or(("unknown", "metadata_unreadable"));
+                        // Eligible only if GC's inventory rule would admit it too (#1316).
+                        let result = match result {
+                            ("eligible", _) => gc_inventory_skip(&entry.path())
+                                .map_or(result, |skip| ("unknown", skip)),
+                            _ => result,
+                        };
                         if guard.verify().is_err() {
                             ("unknown", "unsafe_use_lock")
                         } else {
@@ -1821,6 +2094,14 @@ mod gc_schema_race_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
+        // Eligible by age, so the shape check (after the cheap test, #1316) decides.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE index_metadata SET last_opened_at=?1",
+                [now - 30 * 24 * 60 * 60],
+            )
+            .unwrap();
         let after_external = RefCell::new(None);
         let refused = inspect_index_with_open_hook(
             &roots.index_dir(&identity),
@@ -1938,19 +2219,78 @@ mod gc_schema_race_tests {
                 // A borrowed SQLite inode blocks deletion.
                 let borrowed =
                     crate::store::retained_sqlite_file(&path, false, false, false).unwrap();
-                assert!(!remove(), "borrowed witness must block v{version} deletion");
+                assert_eq!(
+                    remove(),
+                    Err("sqlite_busy"),
+                    "borrowed witness must block v{version} deletion"
+                );
                 drop(borrowed);
                 // So does a hot journal: the directory inventory is not exact.
                 let journal = path.with_file_name("index.db-journal");
                 fs::write(&journal, b"hot-journal-sentinel").unwrap();
-                assert!(!remove(), "journal must block v{version} deletion");
+                assert_eq!(
+                    remove(),
+                    Err("hot_journal"),
+                    "journal must block v{version} deletion"
+                );
                 assert_eq!(fs::read(&journal).unwrap(), b"hot-journal-sentinel");
                 fs::remove_file(journal).unwrap();
                 assert_eq!(fs::read(&path).unwrap(), before);
             }
-            assert!(remove(), "v{version}");
+            assert_eq!(remove(), Ok("old_schema"), "v{version}");
             assert!(!path.exists() && !dir.exists(), "v{version}");
         }
+    }
+
+    /// #1316: a stage this process still holds (a witness) makes the candidate
+    /// skip before any unlink; a dead one is collected (tests/core/topology.rs).
+    #[test]
+    fn held_recreation_stage_blocks_collection() {
+        let now = 1_800_000_000_i64;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        drop(roots.index_use(&identity).unwrap());
+        let dir = roots.index_dir(&identity);
+        let path = roots.index_db(&identity);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 7_i64).unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let stage = dir.join(format!("index.db.tmp-{}", Uuid::new_v4()));
+        fs::write(&stage, b"stage").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        drop(crate::store::Store::open_for_tests(state.path(), other.path()).unwrap());
+        let current = WorkspaceIdentity::discover(Some(other.path()), other.path()).unwrap();
+        let writer = roots
+            .writer(Arc::new(current.verified_clone().unwrap()))
+            .unwrap();
+        let remove = || {
+            let guard =
+                UseGuard::acquire_existing(&roots.index_use_lock(&identity), true, true).unwrap();
+            gc_remove_candidate(
+                &dir,
+                &roots.cache,
+                &identity.root_key,
+                now,
+                guard,
+                &current,
+                &writer,
+                &mut |_| Ok(()),
+            )
+            .unwrap()
+        };
+        // A witness stays registered while its owner holds the stage; only
+        // the owner's own cleanup releases it.
+        drop(crate::store::retained_sqlite_file(&stage, false, false, false).unwrap());
+        let before = fs::read(&path).unwrap();
+        assert_eq!(remove(), Err("sqlite_busy"));
+        assert_eq!(fs::read(&stage).unwrap(), b"stage");
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -2029,8 +2369,8 @@ mod gc_schema_race_tests {
         fs::write(&journal, b"hot-journal-sentinel").unwrap();
         let guard =
             UseGuard::acquire_existing(&roots.index_use_lock(&candidate), true, true).unwrap();
-        assert!(
-            !gc_remove_candidate(
+        assert_eq!(
+            gc_remove_candidate(
                 &dir,
                 &roots.cache,
                 &candidate.root_key,
@@ -2040,7 +2380,8 @@ mod gc_schema_race_tests {
                 &writer,
                 &mut |_| Ok(())
             )
-            .unwrap()
+            .unwrap(),
+            Err("hot_journal")
         );
         assert!(path.exists());
         fs::remove_file(journal).unwrap();
@@ -2050,8 +2391,8 @@ mod gc_schema_race_tests {
         drop(db);
         let guard =
             UseGuard::acquire_existing(&roots.index_use_lock(&candidate), true, true).unwrap();
-        assert!(
-            !gc_remove_candidate(
+        assert_eq!(
+            gc_remove_candidate(
                 &dir,
                 &roots.cache,
                 &candidate.root_key,
@@ -2061,7 +2402,8 @@ mod gc_schema_race_tests {
                 &writer,
                 &mut |_| Ok(())
             )
-            .unwrap()
+            .unwrap(),
+            Err("unknown_index_shape")
         );
         assert_eq!(
             inspect_index(&dir, &candidate.root_key, now).unwrap(),

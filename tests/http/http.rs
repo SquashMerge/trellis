@@ -1177,7 +1177,10 @@ async fn browser_claimed_unchanged_completes_done_at_head_without_new_manifest()
 }
 
 #[test]
-fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
+/// #1316: a pass that yields to queued work records no completed scan, so the
+/// next hourly tick resumes it rather than waiting a day. The attempt fence
+/// still refuses a rescan within the hour.
+fn gc_queued_before_candidate_yields_and_resumes_at_the_next_hourly_tick() {
     use trellis::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
     let dir = tempfile::tempdir().unwrap();
     let current_root = dir.path().join("current");
@@ -1232,34 +1235,56 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
         candidate_db.exists(),
         "no candidate was unlinked after queue priority"
     );
-    let mut same_day = 0;
+    let stamps = roots.cache.clone();
+    assert!(
+        !stamps.join("gc-last-run").exists(),
+        "a yielded pass is not a completed scan"
+    );
     assert_eq!(
-        roots
-            .automatic_gc_at_with_hook(&current, session.writer_guard().unwrap(), now, &mut |_| {
-                same_day += 1;
+        std::fs::read_to_string(stamps.join("gc-last-attempt")).unwrap(),
+        format!("{now}\n")
+    );
+    for at in [now, now + 3_599] {
+        let mut scanned = 0;
+        assert_eq!(
+            roots
+                .automatic_gc_at_with_hook(
+                    &current,
+                    session.writer_guard().unwrap(),
+                    at,
+                    &mut |_| {
+                        scanned += 1;
+                        Ok(())
+                    }
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(scanned, 0, "the attempt fence refuses a rescan at {at}");
+    }
+    let mut resumed = 0;
+    let collected = roots
+        .automatic_gc_at_with_hook(
+            &current,
+            session.writer_guard().unwrap(),
+            now + 3_600,
+            &mut |stage| {
+                if stage == GcStage::BeforeCandidate {
+                    resumed += 1;
+                }
                 Ok(())
-            })
-            .unwrap(),
-        0
+            },
+        )
+        .unwrap();
+    assert_eq!(resumed, 1, "the next hourly tick resumes the yielded pass");
+    assert_eq!(collected, 1);
+    assert!(
+        !candidate_db.exists(),
+        "the resumed pass collects the candidate"
     );
-    assert_eq!(same_day, 0, "durable daily stamp forbids same-day rescan");
-    let mut next_day = 0;
-    let next = roots.automatic_gc_at_with_hook(
-        &current,
-        session.writer_guard().unwrap(),
-        now + 86_400,
-        &mut |stage| {
-            if stage == GcStage::BeforeCandidate {
-                next_day += 1;
-                anyhow::bail!("defer again");
-            }
-            Ok(())
-        },
-    );
-    assert!(next.unwrap_err().to_string().contains("defer again"));
     assert_eq!(
-        next_day, 1,
-        "unscanned candidate is retried only next eligible day"
+        std::fs::read_to_string(stamps.join("gc-last-run")).unwrap(),
+        format!("{}\n", now + 3_600)
     );
 }
 

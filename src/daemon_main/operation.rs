@@ -11,6 +11,7 @@ pub(super) enum Operation {
     Mcp,
     Api,
     GcReport,
+    GcRun,
     Serve,
     Status,
     Symbols,
@@ -111,6 +112,7 @@ impl Operation {
             "mcp" => Self::Mcp,
             "api" => Self::Api,
             "gc_report" => Self::GcReport,
+            "gc_run" => Self::GcRun,
             "serve" => Self::Serve,
             "status" => Self::Status,
             "symbols" => Self::Symbols,
@@ -212,6 +214,7 @@ impl Operation {
                 },
             ),
             Self::Index
+            | Self::GcRun
             | Self::SemanticImport
             | Self::ProducerPickup
             | Self::ProducerRun
@@ -246,11 +249,12 @@ impl Operation {
 mod operation_policy_tests {
     use super::*;
 
-    const KNOWN: [&str; 19] = [
+    const KNOWN: [&str; 20] = [
         "daemon_stop",
         "mcp",
         "api",
         "gc_report",
+        "gc_run",
         "serve",
         "status",
         "symbols",
@@ -286,6 +290,7 @@ mod operation_policy_tests {
                 | "symbols"
                 | "query"
                 | "index"
+                | "gc_run"
                 | "semantic_import"
                 | "metrics"
                 | "rules_check"
@@ -335,7 +340,12 @@ mod operation_policy_tests {
         );
         let replayable = !matches!(
             operation,
-            "index" | "semantic_import" | "producer_pickup" | "producer_run" | "producer_cancel"
+            "index"
+                | "gc_run"
+                | "semantic_import"
+                | "producer_pickup"
+                | "producer_run"
+                | "producer_cancel"
         );
         let reply = if operation == "metrics" {
             ReplyTransfer::DeadlineBounded

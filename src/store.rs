@@ -2879,8 +2879,14 @@ fn replace_index_and_release_obsolete(
 /// Destructive GC holds the candidate's verified EX use lock and the opener
 /// mutex across the final witness check and unlink. No protected connection or
 /// borrowed witness may outlive the removed inode in this process.
+///
+/// `stages` are dead recreation stages (`index.db.tmp-<uuid>` and its sidecars,
+/// #1316). The EX use lock excludes every other process, and the opener mutex
+/// proves no connection or witness of this process holds the stage database, so
+/// they are removed after the databases.
 pub(crate) fn gc_unlink_sqlite(
     paths: &[(std::path::PathBuf, (u64, u64))],
+    stages: &[(std::path::PathBuf, (u64, u64))],
     exclusive: &topology::UseGuard,
     current: &topology::WorkspaceIdentity,
     leader: &topology::WriterGuard,
@@ -2929,6 +2935,29 @@ pub(crate) fn gc_unlink_sqlite(
                 "storage_busy: GC SQLite witness borrowed or changed"
             );
         }
+        for (path, inode) in stages {
+            let stage = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(topology::index_stage_name)
+                .context("unsafe_index: GC stage path")?;
+            let parent = path.parent().context("GC index parent missing")?;
+            exclusive.verify_exclusive_path(&parent.with_extension("lock"))?;
+            let named = std::fs::symlink_metadata(path)?;
+            ensure!(
+                named.is_file()
+                    && !named.file_type().is_symlink()
+                    && (named.dev(), named.ino()) == *inode
+                    && named.nlink() == 1,
+                "unsafe_index: GC stage inode changed"
+            );
+            let database = parent.join(stage);
+            ensure!(
+                registry.live.keys().all(|(name, _, _)| *name != database)
+                    && !registry.by_path.contains_key(&database),
+                "storage_busy: GC stage still held"
+            );
+        }
         Ok(())
     })();
     if preflight.is_err() {
@@ -2949,6 +2978,12 @@ pub(crate) fn gc_unlink_sqlite(
         if number == 0 {
             after_first_unlink()?;
         }
+    }
+    for (path, _) in stages {
+        current.verify()?;
+        leader.verify()?;
+        exclusive.verify()?;
+        std::fs::remove_file(path)?;
     }
     Ok(true)
 }
@@ -11523,6 +11558,9 @@ impl Store {
         if hot_index_journal_present(&store.roots.index_db(&store.identity))? {
             store.recover_hot_index_journal()?;
         }
+        // Best effort: contention or an I/O error leaves the residue for a later
+        // activation, and never stops this one.
+        let _ = store.remove_dead_index_stages();
         let admission = match admit() {
             // A daemon killed mid-COMMIT leaves a hot journal that a read-only
             // connection cannot roll back. Recover it, then admit normally.
@@ -12531,6 +12569,47 @@ impl Store {
         self.published_admission.invalidate();
         drop(exclusive);
         Ok(())
+    }
+    /// A failed or killed recreation can leave its private `index.db.tmp-<uuid>`
+    /// stage and that stage's own journal (#1316). Under this index's exclusive use
+    /// no other process can hold one, and the opener mutex proves this process
+    /// holds none, so each is removed. A held shared use defers the removal.
+    fn remove_dead_index_stages(&self) -> Result<usize> {
+        let dir = self.roots.index_dir(&self.identity);
+        let names: Vec<String> = std::fs::read_dir(&dir)?
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| topology::index_stage_name(name).is_some())
+            .collect();
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let exclusive = self.index_use_exclusive()?;
+        let registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+        let mut removed = 0;
+        for name in names {
+            let stage = dir.join(topology::index_stage_name(&name).expect("a stage name"));
+            if registry.live.keys().any(|(held, _, _)| *held == stage)
+                || registry.by_path.contains_key(&stage)
+            {
+                continue;
+            }
+            exclusive.verify()?;
+            let path = dir.join(&name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(named) if named.is_file() && !named.file_type().is_symlink() => {
+                    std::fs::remove_file(&path)?;
+                    removed += 1;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        drop(registry);
+        if removed > 0 {
+            std::fs::File::open(&dir)?.sync_all()?;
+        }
+        Ok(removed)
     }
     /// Exclusive use of this checkout's index. A held S read connection (#671) closes
     /// first, so a connection kept across yields never blocks recreation or recovery.
@@ -18166,7 +18245,7 @@ impl Store {
     }
 
     /// Leader-owned, best-effort derived GC. The caller chooses the hourly
-    /// check cadence; the shared cache stamp enforces the daily scan limit.
+    /// check cadence; the shared cache stamps enforce the hourly scan limit.
     pub fn automatic_gc(&self, leader: &topology::WriterGuard) -> Result<usize> {
         let now = publication_second()?;
         self.automatic_gc_at(leader, now)
@@ -18182,6 +18261,17 @@ impl Store {
         self.identity.verify()?;
         self.roots
             .automatic_gc_at_with_hook(&self.identity, leader, publication_second()?, hook)
+    }
+
+    /// `trellis gc --run`: one pass now, with every per-candidate check (#1316).
+    pub fn gc_run(&self, leader: &topology::WriterGuard) -> Result<topology::GcRunReport> {
+        leader.belongs_to(&self.identity)?;
+        leader.verify()?;
+        self.identity.verify()?;
+        self.roots
+            .gc_run_at_with_hook(&self.identity, leader, publication_second()?, &mut |_| {
+                Ok(())
+            })
     }
 
     #[doc(hidden)]

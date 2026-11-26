@@ -346,6 +346,10 @@ pub struct DaemonState {
     watcher_health: Arc<crate::watch::WatcherHealth>,
     retention_last_run: Mutex<Instant>,
     gc_last_check: Mutex<Instant>,
+    /// The one pending `trellis gc --run` request (#1316). Its waiter submits it;
+    /// only the worker takes and answers it.
+    gc_run: Mutex<Option<state::GcRunTicket>>,
+    gc_run_next: AtomicU64,
     #[cfg(test)]
     test_queue_before_stream: crate::store::TestOneShotHook,
     #[cfg(test)]

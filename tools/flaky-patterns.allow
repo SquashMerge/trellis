@@ -82,6 +82,7 @@ store-open src/store/sqlite_deleted_witness_tests.rs foreign_replacement_stage_r
 store-open src/store/topology.rs extra_view_after_readonly_open_before_snapshot_never_attests_gc_or_deletion -- single process on a private state dir; no Trellis child, daemon or scheduler
 store-open src/store/topology.rs old_schema_index_is_collected_regardless_of_layout_root_or_age -- single process on a private state dir; no Trellis child, daemon or scheduler
 store-open src/store/topology.rs old_schema_report_is_eligible_and_writes_nothing -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open src/store/topology.rs held_recreation_stage_blocks_collection -- single process on a private state dir; no Trellis child, daemon or scheduler
 store-open src/store/topology.rs exact_v20_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear -- single process on a private state dir; no Trellis child, daemon or scheduler
 store-open src/store/topology.rs stale_v8_extractor_marker_is_refused_without_gc_writes_or_deletion -- single process on a private state dir; no Trellis child, daemon or scheduler
 store-open src/store/topology.rs automatic_gc_retries_after_borrowed_witness_is_released -- single process on a private state dir; no Trellis child, daemon or scheduler
@@ -143,7 +144,7 @@ store-open tests/daemon/watch.rs failed_ack_keeps_periodic_inventory_due_until_c
 store-open tests/http/class_diagram_http.rs incompatible_index_refuses_without_migrating_durable_data -- sync test: http::new started no worker, and the router is dropped before this open
 store-open tests/http/http.rs queued_request_is_durable_and_non_cancellable_during_lock_contention -- its first open precedes http::new; the reopen beside the worker uses retry_admission
 store-open tests/http/http.rs corrupt_recovery_fixture -- both opens precede http::new
-store-open tests/http/http.rs gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan -- single process on a private state dir; no Trellis child, daemon or scheduler
+store-open tests/http/http.rs gc_queued_before_candidate_yields_and_resumes_at_the_next_hourly_tick -- single process on a private state dir; no Trellis child, daemon or scheduler
 store-open tests/http/navigation_http.rs cached_java_source_budget_and_unproven_member_shape_do_not_guess -- no request here starts the checkout worker (no index POST or retained session), so no scheduler thread runs
 store-open tests/http/navigation_http.rs retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_projection -- no request here starts the checkout worker (no index POST or retained session), so no scheduler thread runs
 store-open tests/index/sqlite_witness.rs live_index_writer_survives_transient_verification_and_status -- opens before its raw-SQLite contender child, which never opens a Store

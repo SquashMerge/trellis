@@ -1076,8 +1076,12 @@ fn gc_classifies_current_schema_but_refuses_spoofed_shapes() {
     let index = roots.index_db(&identity);
     let now = 1_800_000_000_i64;
     let db = rusqlite::Connection::open(&index).unwrap();
-    db.execute("UPDATE index_metadata SET last_opened_at=?1", [now])
-        .unwrap();
+    // Old enough to be eligible, so every shape check below decides the verdict.
+    db.execute(
+        "UPDATE index_metadata SET last_opened_at=?1",
+        [now - 30 * 86_400],
+    )
+    .unwrap();
     let inspect = || {
         let before = gc_manifest(temp.path());
         let entry = roots.gc_report_at(now).unwrap().derived.remove(0);
@@ -1090,7 +1094,8 @@ fn gc_classifies_current_schema_but_refuses_spoofed_shapes() {
         );
         (entry.status, entry.reason)
     };
-    assert_eq!(inspect(), ("unknown", "recent_open"));
+    let eligible = ("eligible", "age_30_days");
+    assert_eq!(inspect(), eligible);
     // The current CHECK forbids spoofing an old extractor on the current layout.
     assert!(
         db.execute(
@@ -1099,10 +1104,20 @@ fn gc_classifies_current_schema_but_refuses_spoofed_shapes() {
         )
         .is_err()
     );
-    assert_eq!(inspect(), ("unknown", "recent_open"));
+    assert_eq!(inspect(), eligible);
     db.execute_batch("CREATE TABLE unsupported(id INTEGER)")
         .unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
+    // #1316: the cheap root and age test runs first. A recent, live entry is
+    // kept without its shape being validated.
+    db.execute("UPDATE index_metadata SET last_opened_at=?1", [now])
+        .unwrap();
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    db.execute(
+        "UPDATE index_metadata SET last_opened_at=?1",
+        [now - 30 * 86_400],
+    )
+    .unwrap();
     db.execute_batch("DROP TABLE unsupported").unwrap();
     db.execute_batch("CREATE VIEW unapproved_view AS SELECT 1")
         .unwrap();
@@ -1112,7 +1127,7 @@ fn gc_classifies_current_schema_but_refuses_spoofed_shapes() {
         .unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
-    assert_eq!(inspect(), ("unknown", "recent_open"));
+    assert_eq!(inspect(), eligible);
     // Any earlier schema is collectable whatever its layout, root or age (#253).
     for version in [
         1, 7, 9, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
@@ -1126,7 +1141,7 @@ fn gc_classifies_current_schema_but_refuses_spoofed_shapes() {
     db.pragma_update(None, "user_version", 51).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
     db.pragma_update(None, "user_version", 50).unwrap();
-    assert_eq!(inspect(), ("unknown", "recent_open"));
+    assert_eq!(inspect(), eligible);
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
     assert_eq!(inspect(), ("eligible", "root_replaced"));
@@ -1167,11 +1182,15 @@ fn gc_report_accepts_current_schema_but_rejects_bad_inventory() {
     drop(store);
     let db = rusqlite::Connection::open(roots.index_db(&identity)).unwrap();
     let now = 1_800_000_000_i64;
-    db.execute("UPDATE index_metadata SET last_opened_at=?1", [now])
-        .unwrap();
+    // Eligible by age, so the supersession inventory decides (#1316: cheap test first).
+    db.execute(
+        "UPDATE index_metadata SET last_opened_at=?1",
+        [now - 30 * 86_400],
+    )
+    .unwrap();
     let inspect = || roots.gc_report_at(now).unwrap().derived.remove(0);
     let good = inspect();
-    assert_eq!((good.status, good.reason), ("unknown", "recent_open"));
+    assert_eq!((good.status, good.reason), ("eligible", "age_30_days"));
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
         "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state) VALUES('missing',0,'retained')",
@@ -1185,7 +1204,7 @@ fn gc_report_accepts_current_schema_but_rejects_bad_inventory() {
     );
     db.execute("DELETE FROM native_revision_supersessions", [])
         .unwrap();
-    assert_eq!(inspect().reason, "recent_open");
+    assert_eq!(inspect().reason, "age_30_days");
 }
 
 /// APFS renumbers `st_dev` across reboots (#813): GC keeps an index whose recorded root
@@ -1410,9 +1429,17 @@ fn automatic_gc_only_eligible_exact_private_indexes() {
         0
     );
     assert!(roots.index_dir(&recent_id).exists());
+    // That pass completed, so the next one runs an hour later (#1316).
     assert_eq!(
         current_store
-            .automatic_gc_at(&writer, now + 86_400)
+            .automatic_gc_at(&writer, now + 86_399 + 3_599)
+            .unwrap(),
+        0
+    );
+    assert!(roots.index_dir(&recent_id).exists(), "hourly fence");
+    assert_eq!(
+        current_store
+            .automatic_gc_at(&writer, now + 86_399 + 3_600)
             .unwrap(),
         1
     );
@@ -1745,12 +1772,313 @@ fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
     assert_eq!(
         fs::read(&stamp).unwrap(),
         before,
-        "crash must retain old daily fence"
+        "crash must retain the completed-scan stamp"
     );
     assert_eq!(
-        roots.automatic_gc_at(&id, &writer, now + 86_399).unwrap(),
-        0
+        fs::read_to_string(roots.cache.join("gc-last-attempt")).unwrap(),
+        format!("{now}\n"),
+        "crash before the attempt rename keeps the old attempt fence"
     );
+}
+
+/// A derived index whose recorded root is gone (or, for `version`, an earlier
+/// schema with no metadata at all), provisioned like a checkout's.
+#[cfg(feature = "test-support")]
+fn gc_candidate(
+    temp: &Path,
+    roots: &trellis::store::topology::TopologyRoots,
+    name: &str,
+    old_schema: bool,
+) -> WorkspaceIdentity {
+    let workspace = temp.join(name);
+    fs::create_dir(&workspace).unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
+    if old_schema {
+        use std::os::unix::fs::PermissionsExt;
+        drop(roots.index_use(&identity).unwrap());
+        let path = roots.index_db(&identity);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE anything(x)").unwrap();
+        db.pragma_update(None, "user_version", 7_i64).unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    } else {
+        drop(common::open_store(temp, &workspace).unwrap());
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+    identity
+}
+
+/// A dead recreation stage and its own journal, as a killed recreation leaves them.
+#[cfg(feature = "test-support")]
+fn leave_dead_stage(dir: &Path) -> Vec<std::path::PathBuf> {
+    let stage = dir.join(format!("index.db.tmp-{}", uuid::Uuid::new_v4()));
+    let journal = stage.with_file_name(format!(
+        "{}-journal",
+        stage.file_name().unwrap().to_str().unwrap()
+    ));
+    fs::write(&stage, b"SQLite format 3\0 partial stage").unwrap();
+    fs::write(&journal, b"stage journal").unwrap();
+    vec![stage, journal]
+}
+
+#[cfg(feature = "test-support")]
+fn gc_current(
+    temp: &Path,
+    roots: &trellis::store::topology::TopologyRoots,
+) -> (
+    WorkspaceIdentity,
+    trellis::store::topology::WriterGuard,
+    trellis::store::Store,
+) {
+    let current = temp.join("current-gc");
+    fs::create_dir(&current).unwrap();
+    let store = common::open_store(temp, &current).unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            identity.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
+    (identity, writer, store)
+}
+
+/// #1316 (owner ruling 2026-11-25): the automatic pass runs hourly. A completed
+/// scan fences the next one for an hour, not a day.
+#[cfg(feature = "test-support")]
+#[test]
+fn automatic_gc_runs_hourly_after_a_completed_scan() {
+    use trellis::store::topology::GcStage;
+    let (temp, roots) = common::fixture();
+    let (current, writer, _store) = gc_current(temp.path(), &roots);
+    // A recent, live candidate: scanned every pass, never collected.
+    let kept = temp.path().join("kept");
+    fs::create_dir(&kept).unwrap();
+    drop(common::open_store(temp.path(), &kept).unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let scans = |at: i64| {
+        let mut scanned = 0;
+        let removed = roots
+            .automatic_gc_at_with_hook(&current, &writer, at, &mut |stage| {
+                if stage == GcStage::BeforeCandidate {
+                    scanned += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(removed, 0);
+        scanned
+    };
+    assert_eq!(scans(now), 1);
+    let stamp = |name: &str| fs::read_to_string(roots.cache.join(name)).unwrap();
+    assert_eq!(stamp("gc-last-run"), format!("{now}\n"));
+    assert_eq!(stamp("gc-last-attempt"), format!("{now}\n"));
+    assert_eq!(scans(now + 3_599), 0, "within the hour nothing is scanned");
+    assert_eq!(
+        scans(now + 3_600),
+        1,
+        "an hour after the last scan, it runs"
+    );
+    assert_eq!(stamp("gc-last-run"), format!("{}\n", now + 3_600));
+}
+
+/// #1316, Decision 0006 §2: an earlier schema is collected whatever its layout,
+/// including the dead recreation stages and semantic stages it holds.
+#[cfg(feature = "test-support")]
+#[test]
+fn old_schema_index_with_stage_residue_is_collected() {
+    let (temp, roots) = common::fixture();
+    let (current, writer, _store) = gc_current(temp.path(), &roots);
+    let old = gc_candidate(temp.path(), &roots, "old-with-residue", true);
+    let dir = roots.index_dir(&old);
+    leave_dead_stage(&dir);
+    let semantic = dir.join("semantic-stage-r-1-c-2");
+    fs::create_dir(&semantic).unwrap();
+    fs::write(semantic.join("stage.db"), b"semantic stage").unwrap();
+    let entry = roots.gc_report_at(1_800_000_000).unwrap().derived;
+    let entry = entry.iter().find(|e| e.root_key == old.root_key).unwrap();
+    assert_eq!((entry.status, entry.reason), ("eligible", "old_schema"));
+    assert_eq!(
+        roots
+            .automatic_gc_at(&current, &writer, 1_800_000_000)
+            .unwrap(),
+        1
+    );
+    assert!(
+        !dir.exists(),
+        "the old-schema index and its residue are gone"
+    );
+    assert!(!roots.index_use_lock(&old).exists());
+}
+
+/// #1316: a current-schema eligible index is collected with its dead recreation
+/// stage, or with semantic stage residue (owner 2026-11-25). Residue never makes
+/// an index eligible: a live, recent one with residue is kept. Hot journals still
+/// make GC skip (Decision 0006 §2), and `gc --report` says so instead of "eligible".
+#[cfg(feature = "test-support")]
+#[test]
+fn gc_report_and_gc_agree_on_index_residue() {
+    let (temp, roots) = common::fixture();
+    let (current, writer, _store) = gc_current(temp.path(), &roots);
+    let staged = gc_candidate(temp.path(), &roots, "dead-stage", false);
+    leave_dead_stage(&roots.index_dir(&staged));
+    let semantic = gc_candidate(temp.path(), &roots, "semantic-residue", false);
+    let semantic_stage = roots.index_dir(&semantic).join("semantic-stage-r-1-c-2");
+    fs::create_dir(&semantic_stage).unwrap();
+    fs::write(semantic_stage.join("stage.db"), b"semantic stage").unwrap();
+    let live_root = temp.path().join("live-residue");
+    fs::create_dir(&live_root).unwrap();
+    drop(common::open_store(temp.path(), &live_root).unwrap());
+    let live = WorkspaceIdentity::discover(Some(&live_root), &live_root).unwrap();
+    let live_stage = roots.index_dir(&live).join("semantic-stage-r-2-c-3");
+    fs::create_dir(&live_stage).unwrap();
+    let hot = gc_candidate(temp.path(), &roots, "hot-queue", false);
+    fs::write(roots.index_dir(&hot).join("requests.db-journal"), b"hot").unwrap();
+    let old_hot = gc_candidate(temp.path(), &roots, "old-hot", true);
+    fs::write(roots.index_dir(&old_hot).join("index.db-journal"), b"hot").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let report = roots.gc_report_at(now).unwrap().derived;
+    let verdict = |identity: &WorkspaceIdentity| {
+        let entry = report
+            .iter()
+            .find(|entry| entry.root_key == identity.root_key)
+            .unwrap();
+        (entry.status, entry.reason)
+    };
+    assert_eq!(verdict(&staged), ("eligible", "root_missing"));
+    assert_eq!(verdict(&semantic), ("eligible", "root_missing"));
+    assert_eq!(verdict(&live), ("unknown", "recent_open"));
+    assert_eq!(verdict(&hot), ("unknown", "hot_journal"));
+    assert_eq!(verdict(&old_hot), ("unknown", "metadata_unreadable"));
+    let run = roots
+        .gc_run_at_with_hook(&current, &writer, now, &mut |_| Ok(()))
+        .unwrap();
+    let mut collected: Vec<_> = run
+        .collected
+        .iter()
+        .map(|entry| (entry.root_key.clone(), entry.reason))
+        .collect();
+    let mut expected = vec![
+        (staged.root_key.clone(), "root_missing"),
+        (semantic.root_key.clone(), "root_missing"),
+    ];
+    collected.sort();
+    expected.sort();
+    assert_eq!(collected, expected);
+    assert!(!roots.index_dir(&semantic).exists(), "residue goes with it");
+    assert!(live_stage.exists(), "a kept index keeps its residue");
+    for (identity, reason) in [
+        (&live, "recent_open"),
+        (&hot, "hot_journal"),
+        (&old_hot, "hot_journal"),
+    ] {
+        let skipped = run
+            .skipped
+            .iter()
+            .find(|entry| entry.root_key == identity.root_key)
+            .unwrap();
+        assert_eq!(skipped.reason, reason);
+        assert!(roots.index_dir(identity).exists(), "{reason}");
+    }
+    assert!(!roots.index_dir(&staged).exists());
+}
+
+/// #1316: `gc --run` ignores the schedule stamps, writes none, keeps every
+/// per-candidate check and reports why each other index was skipped.
+#[cfg(feature = "test-support")]
+#[test]
+fn gc_run_ignores_the_schedule_and_reports_each_candidate() {
+    let (temp, roots) = common::fixture();
+    let (current, writer, _store) = gc_current(temp.path(), &roots);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 0);
+    let stamps = (
+        fs::read(roots.cache.join("gc-last-run")).unwrap(),
+        fs::read(roots.cache.join("gc-last-attempt")).unwrap(),
+    );
+    let gone = gc_candidate(temp.path(), &roots, "gone", false);
+    let old = gc_candidate(temp.path(), &roots, "old", true);
+    let busy = gc_candidate(temp.path(), &roots, "busy", false);
+    let held = UseGuard::acquire_existing(&roots.index_use_lock(&busy), false, true).unwrap();
+    let recent = temp.path().join("recent");
+    fs::create_dir(&recent).unwrap();
+    drop(common::open_store(temp.path(), &recent).unwrap());
+    let recent = WorkspaceIdentity::discover(Some(&recent), &recent).unwrap();
+    assert_eq!(
+        roots.automatic_gc_at(&current, &writer, now + 60).unwrap(),
+        0,
+        "the hourly schedule still fences the automatic pass"
+    );
+    let report = roots
+        .gc_run_at_with_hook(&current, &writer, now + 60, &mut |_| Ok(()))
+        .unwrap();
+    let mut collected: Vec<_> = report
+        .collected
+        .iter()
+        .map(|entry| (entry.root_key.clone(), entry.status, entry.reason))
+        .collect();
+    let mut expected = vec![
+        (gone.root_key.clone(), "collected", "root_missing"),
+        (old.root_key.clone(), "collected", "old_schema"),
+    ];
+    collected.sort();
+    expected.sort();
+    assert_eq!(collected, expected);
+    let mut skipped: Vec<_> = report
+        .skipped
+        .iter()
+        .map(|entry| (entry.root_key.clone(), entry.status, entry.reason))
+        .collect();
+    let mut expected = vec![
+        (busy.root_key.clone(), "skipped", "use_lock_busy"),
+        (recent.root_key.clone(), "skipped", "recent_open"),
+        (current.root_key.clone(), "skipped", "current_checkout"),
+    ];
+    skipped.sort();
+    expected.sort();
+    assert_eq!(skipped, expected);
+    assert!(!roots.index_dir(&gone).exists() && !roots.index_dir(&old).exists());
+    assert!(roots.index_db(&busy).exists() && roots.index_db(&recent).exists());
+    assert_eq!(
+        (
+            fs::read(roots.cache.join("gc-last-run")).unwrap(),
+            fs::read(roots.cache.join("gc-last-attempt")).unwrap(),
+        ),
+        stamps,
+        "gc --run writes no schedule stamp"
+    );
+    drop(held);
+}
+
+/// #1316: a live index's dead recreation stages are removed at activation, under
+/// its exclusive use. A held shared use defers that to a later activation.
+#[cfg(feature = "test-support")]
+#[test]
+fn activation_removes_dead_index_stages_unless_the_index_is_in_use() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    drop(common::open_store(temp.path(), &work).unwrap());
+    let residue = leave_dead_stage(&roots.index_dir(&identity));
+    let held = UseGuard::acquire_existing(&roots.index_use_lock(&identity), false, true).unwrap();
+    drop(common::open_store(temp.path(), &work).unwrap());
+    assert!(
+        residue.iter().all(|path| path.exists()),
+        "a shared use defers the removal"
+    );
+    drop(held);
+    drop(common::open_store(temp.path(), &work).unwrap());
+    assert!(residue.iter().all(|path| !path.exists()));
+    assert!(roots.index_db(&identity).exists());
 }
 
 #[test]

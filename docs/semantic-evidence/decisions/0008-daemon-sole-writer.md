@@ -34,7 +34,7 @@ PR #117 shows the cost: cross-process ownership transitions contributed substant
 ### 1. One writer
 
 - **The user daemon is the only process that writes** a checkout's derived index (`index.db`) and request queue (`requests.db`). It is also the only process that runs watchers, mandatory H, publication, retention, release and GC.
-- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `trellis mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, `gc --report`, and browser indexing requests.
+- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `trellis mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, `gc --report`, `gc --run` (#1316, owner 2026-11-25: one GC pass now, run by the named checkout's worker), and browser indexing requests.
 - **There is no standalone fallback**, for reads or writes, so there is one read path.
   - Connect-or-start is bounded. If the daemon can't be reached or started within that bound, the command fails with a typed `daemon_unavailable` error. It never opens the index itself.
   - Commands that touch no index data, such as `--help` and `--version`, don't start the daemon.

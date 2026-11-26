@@ -223,8 +223,14 @@ struct GitReadArgs {
 #[derive(Args)]
 struct GcArgs {
     /// Print the read-only cleanup inventory.
-    #[arg(long, required = true)]
+    #[arg(long, required_unless_present = "run", conflicts_with = "run")]
     report: bool,
+    /// Run one GC pass now in the daemon, as the checkout's worker, and print what
+    /// it collected and skipped. It uses the cwd checkout or `--workspace`.
+    #[arg(long)]
+    run: bool,
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
 }
 #[derive(Args, Clone)]
 struct WorkspaceArgs {
@@ -566,11 +572,16 @@ async fn main() -> Result<()> {
             action: ProducerAction::Install(args),
         }) => producer_install(&args)?,
         Command::Api(args) => std::process::exit(api_command(&args)),
-        Command::Gc(_) => {
+        Command::Gc(args) if !args.run => {
+            ensure!(
+                args.workspace.workspace.is_none(),
+                "invalid_argument: --workspace applies to gc --run"
+            );
             let request = daemon_request("gc_report", serde_json::json!({}));
             print_json(&send_daemon(&request, true)?)?;
         }
         command @ (Command::Index(_)
+        | Command::Gc(_)
         | Command::Semantic(_)
         | Command::Producer(_)
         | Command::Status(_)

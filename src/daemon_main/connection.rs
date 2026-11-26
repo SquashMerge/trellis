@@ -749,6 +749,7 @@ impl SelectedRead<'_> {
                 cli_metrics_read(checkout, options, request_deadline)
             }
             Operation::Index => cli_index(checkout, identity, args),
+            Operation::GcRun => checkout.cli_gc_run(),
             Operation::SemanticImport => {
                 let options: trellis::store::requests::SemanticImportOptions =
                     serde_json::from_value(args.clone())

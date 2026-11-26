@@ -195,6 +195,8 @@ pub fn new_with_config(
         watcher_health: Arc::new(crate::watch::WatcherHealth::default()),
         retention_last_run: Mutex::new(Instant::now()),
         gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
+        gc_run: Mutex::new(None),
+        gc_run_next: AtomicU64::new(0),
         #[cfg(test)]
         test_queue_before_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
@@ -799,13 +801,71 @@ impl DaemonState {
                 started.elapsed().as_micros()
             ),
         );
-        // A daily attempt stamp may already have committed. Any remaining
-        // candidate waits until the next authorized daily attempt after yield.
+        // A yield records no completed scan (#1316): the next hourly tick, past
+        // the attempt fence, resumes the remaining candidates.
         *self.gc_last_check.lock().unwrap() = Instant::now();
         match result {
             Ok(_) => Ok(()),
             Err(error) if error.is::<GcPriorityYield>() => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    /// `trellis gc --run` (#1316): submit one GC pass to this checkout's worker,
+    /// the only GC runner, and wait up to `wait` for its report. One request is
+    /// pending at a time. The waiter withdraws only its own ticket, on every exit.
+    pub fn run_gc_now(
+        &self,
+        wait: Duration,
+    ) -> anyhow::Result<crate::store::topology::GcRunReport> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        let id = self.gc_run_next.fetch_add(1, Ordering::AcqRel);
+        {
+            let mut slot = self.gc_run.lock().unwrap();
+            anyhow::ensure!(
+                slot.is_none(),
+                "storage_busy: another gc --run request is pending"
+            );
+            *slot = Some(GcRunTicket { id, reply });
+        }
+        let _withdraw = WithdrawGcRun {
+            slot: &self.gc_run,
+            id,
+        };
+        self.inbox.wake();
+        match answer.recv_timeout(wait) {
+            Ok(report) => report,
+            Err(_) => anyhow::bail!("deadline_exceeded: the checkout worker did not run gc --run"),
+        }
+    }
+
+    /// Run a submitted `gc --run` pass, on the worker between steps, once the
+    /// runtime is Ready. It holds the step like any unit and never yields: the
+    /// user asked for this pass.
+    pub(super) fn run_requested_gc(&self) {
+        let session = match &*self.runtime.lock().unwrap() {
+            RuntimeState::Ready(session) => session.clone(),
+            _ => return,
+        };
+        let Some(ticket) = self.gc_run.lock().unwrap().take() else {
+            return;
+        };
+        let _step = self.step_lock.lock().unwrap();
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.store.gc_run(session.writer_guard()?)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("worker_join: gc --run panicked")));
+        // The waiter may have given up; its ticket is answered either way.
+        let _ = ticket.reply.try_send(report);
+    }
+
+    /// A retiring worker answers a pending `gc --run` rather than leaving it to
+    /// its waiter's deadline.
+    pub(super) fn fail_requested_gc(&self) {
+        if let Some(ticket) = self.gc_run.lock().unwrap().take() {
+            let _ = ticket
+                .reply
+                .try_send(Err(anyhow::anyhow!("index_not_ready: checkout released")));
         }
     }
 
@@ -1771,5 +1831,25 @@ impl DaemonState {
             .unwrap()
             .cancel
             .store(true, Ordering::Release);
+    }
+}
+
+/// One submitted `trellis gc --run` pass and where its report goes (#1316).
+pub(super) struct GcRunTicket {
+    id: u64,
+    reply: std::sync::mpsc::SyncSender<anyhow::Result<crate::store::topology::GcRunReport>>,
+}
+
+/// Clears the pending ticket only if it is still the waiter's own.
+struct WithdrawGcRun<'a> {
+    slot: &'a Mutex<Option<GcRunTicket>>,
+    id: u64,
+}
+impl Drop for WithdrawGcRun<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        if slot.as_ref().is_some_and(|ticket| ticket.id == self.id) {
+            *slot = None;
+        }
     }
 }

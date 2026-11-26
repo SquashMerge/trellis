@@ -1180,12 +1180,16 @@ fn worker_loop_with_wait(
         wait(deadline);
         crate::index_coordinator::diagnostic_marker("-", "worker_wake", "");
         if inbox.shutdown.load(Ordering::Acquire) {
+            if let Some(state) = weak.upgrade() {
+                state.fail_requested_gc();
+            }
             return;
         }
         let Some(state) = weak.upgrade() else {
             return;
         };
         if matches!(*state.runtime.lock().unwrap(), RuntimeState::Retired) {
+            state.fail_requested_gc();
             return;
         }
         semantic.before_foreground(&state);
@@ -1195,6 +1199,8 @@ fn worker_loop_with_wait(
         }
         deadline = match step {
             Ok(Ok(())) => {
+                // A submitted `gc --run` follows the foreground step (#1316).
+                state.run_requested_gc();
                 let semantic_due = if state.maintenance_ready() {
                     state.run_maintenance_unit();
                     // A retention unit is a real selection boundary too.
