@@ -978,7 +978,8 @@ rows (up to 50 sampled sites per edge, calls first), rule rows, metric rows and 
 retains a DocumentKey-sorted dependency index: native and semantic input fingerprints, declaration
 ID sets, complete endpoint documents, per-source Work and pre-sampling site counts, semantic
 admission counts, and bounded ordered resolver charge plans. Global fingerprints cover manifests,
-root configuration, producers, raw selections and the Rust catalog.
+root configuration, producers, raw selections and the Rust, Python, JavaScript/TypeScript and Java
+catalogs.
 
 A checkout keeps at most two results: the head's, and the one it replaced or an older retained
 revision a page is showing. The base is its newest eligible earlier successful core in the same
@@ -1035,22 +1036,24 @@ threshold or production-size measurement is claimed here.
 
 The ordered full-build gates are: no base; a changed document set (including add, delete or
 rename); changed captured manifests; changed root tsconfig/jsconfig fallback; changed producer
-set/identity or requested descriptors/languages; changed stable raw selections; a native change
-outside Rust; strictly more than half the documents Dirty; a changed semantic Rust catalog;
-and insufficient reference Work margin. Manifest provenance-only changes do not trigger the
-manifest gate. The Rust digest normalizes positions to per-document ranks while preserving
+set/identity or requested descriptors/languages; changed stable raw selections; strictly more
+than half the documents Dirty; when any document changed natively, a changed Rust, then Python,
+then JavaScript/TypeScript, then Java catalog (#1314); and insufficient reference Work margin.
+Every reference language has a catalog digest, so a native change in any language can build
+incrementally. Manifest provenance-only changes do not trigger the manifest gate, and the
+JavaScript/TypeScript digest likewise leaves out its package descriptors' native revision and
+dependency hash. Each digest normalizes positions to per-document ranks while preserving
 coincident positions and all resolution-semantic fields.
 
 A semantic import changes stable producer or raw-selection identity and therefore builds in
 full. A native N→semantic S catch-up preserves the raw selection and the native revision, and is
-not an import; it is eligible for incremental computation. From a base built at N it reuses
-every source whose semantic state did not change. From an older base at another native
-revision, its sources with revision-derived provenance are also Dirty, so until #1310 semantic
-checkouts may build near-full or full after an edit, while native-only checkouts and same-revision
-catch-up still build incrementally. Projected documents remain semantic Dirty even when
-their raw selection is unchanged: their full projection DTO and historical basis are preserved,
-not rewritten to force reuse. The first edit after a producer run can therefore be near-full
-or full under the same gates.
+not an import; it is eligible for incremental computation. From any eligible base, at N or at an
+older native revision, it reuses every source whose semantic state and endpoints did not change,
+and rebases their revision-scoped metadata as above (#1310). A projected document is Dirty only
+when its own semantic state changes or a retained endpoint's projection under its producer
+changes; a new `currentPin` alone does not make it Dirty. The first edit after a producer run
+turns copied evidence from `fresh` to `possiblyStale`, which is not a semantic change, so it
+builds incrementally under the same gates.
 
 An ordinary incremental failure retries the independent original full computation at the same
 pin, preserving its success or kept failure, code and message. Reference margin fallback also
