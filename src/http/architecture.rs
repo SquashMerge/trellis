@@ -743,12 +743,13 @@ impl DaemonState {
     }
 
     /// After an admitted read found `building`'s core still being computed and ended (#1252):
-    /// wait at most `wait` on the owner, holding no lease or read. `None` when a new read
-    /// should be admitted, because the core or its kept failure is published or `check`
-    /// failed; otherwise a core is still building, with its progress now. When the owner
-    /// passed the pin (the head moved), that is the core of the head it moved to, with the
-    /// same rules, so the caller can wait for it in turn instead of admitting a read that
-    /// would only find it building too (#1329).
+    /// wait at most `wait` on the owner, holding no lease or read. When the owner has passed
+    /// the pin (the head moved), the answer is the core of the head it moved to, with the
+    /// same rules, whatever was published for the passed pin meanwhile: the caller waits for
+    /// that core in turn instead of admitting a read that would only find it building too
+    /// (#1329). Otherwise `None` when a new read should be admitted, because the core or its
+    /// kept failure is published or `check` failed, and else the core still building, with
+    /// its progress now.
     pub(crate) fn architecture_still_building(
         self: &Arc<Self>,
         building: &ArchitectureBuilding,
@@ -757,13 +758,12 @@ impl DaemonState {
     ) -> Option<ArchitectureBuilding> {
         let pin = building.pin;
         let rules = building.rules.core_rules();
-        let error = self
-            .architecture_outcome(pin, rules, wait, check, false)
-            .err()?;
-        let still = error.downcast::<ArchitectureBuilding>().ok()?;
+        let outcome = self.architecture_outcome(pin, rules, wait, check, false);
+        // The passed pin first: its own outcome, published before the head moved, answers
+        // no read the caller could be admitted for now.
         let state = self.architecture.0.state.lock().unwrap();
-        match state.head.filter(|_| state.passed(pin)) {
-            Some(head) => Some(ArchitectureBuilding {
+        if let Some(head) = state.head.filter(|_| state.passed(pin)) {
+            return Some(ArchitectureBuilding {
                 pin: head,
                 progress: state
                     .running
@@ -773,9 +773,10 @@ impl DaemonState {
                     })
                     .and_then(|running| running.progress),
                 rules: building.rules.clone(),
-            }),
-            None => Some(still),
+            });
         }
+        drop(state);
+        outcome.err()?.downcast::<ArchitectureBuilding>().ok()
     }
 
     fn architecture_outcome(
