@@ -1004,8 +1004,9 @@ mod engine {
             measure,
             progress,
             trace,
-            #[cfg(feature = "test-support")]
-                work_limit: _,
+            // The test-support `work_limit`, applied above. An attribute on the
+            // field would be a syntax error to tree-sitter-rust 0.24.2 (#1328).
+            ..
         } = plan.read_a;
         let Some(prepared) = plan.references else {
             let limit = crate::references::work::reference_limit(

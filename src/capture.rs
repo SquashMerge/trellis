@@ -1971,3 +1971,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "capture_partial_files_tests.rs"]
+mod partial_files_tests;
