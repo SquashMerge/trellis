@@ -139,7 +139,7 @@ fn describe_closed_ready_and_missing_head() {
     );
     assert_eq!(ready["evidenceBasis"], basis);
     assert_eq!(ready["data"]["watcherDegraded"], true);
-    assert_eq!(ready["data"]["toolVersion"], 35);
+    assert_eq!(ready["data"]["toolVersion"], 36);
     assert_eq!(
         ready["data"]["languages"][1]["coverage"],
         json!({

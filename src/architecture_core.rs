@@ -849,13 +849,15 @@ pub enum FullReason {
     IncrementalFailure,
 }
 
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) use engine::prepare_architecture;
 #[cfg(feature = "test-support")]
 pub use engine::{
     ArchitectureBuildForTests, ArchitectureCoreHandle, ArchitectureCoreWeak, ArchitectureSharing,
 };
 pub(crate) use engine::{
     ArchitectureBuildPlan, ArchitectureReadA, ArchitectureReadB, ReferenceWorkMargin,
-    finish_architecture, prepare_architecture,
+    finish_architecture, prepare_architecture_from,
 };
 
 #[cfg(feature = "test-support")]
@@ -912,9 +914,24 @@ mod engine {
     }
     impl std::error::Error for ReferenceWorkMargin {}
 
+    /// [`prepare_architecture_from`] with at most one base.
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn prepare_architecture<'a>(
-        mut read_a: ArchitectureReadA<'a>,
+        read_a: ArchitectureReadA<'a>,
         base: Option<Arc<ArchitectureCore>>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<super::ArchitectureBuildPlan<'a>> {
+        prepare_architecture_from(read_a, base.into_iter().collect(), check)
+    }
+
+    /// Plans a build on whichever retained base leaves the fewest documents dirty (#1313),
+    /// the newest first among equals. Every base gives the same result (the verify oracle
+    /// compares each with a full build); a better base only does less work. When a slow
+    /// semantic catch-up let the intermediate native revision's full build finish, its
+    /// catch-up revision rebases on the core before the edit, not on that build.
+    pub(crate) fn prepare_architecture_from<'a>(
+        mut read_a: ArchitectureReadA<'a>,
+        bases: Vec<Arc<ArchitectureCore>>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<super::ArchitectureBuildPlan<'a>> {
         #[cfg(feature = "test-support")]
@@ -925,17 +942,16 @@ mod engine {
             completed: 0,
             total: read_a.input.snapshot.documents.len(),
         });
-        let decision = dependencies::changed_documents(
-            &read_a.input.snapshot,
-            &read_a.input.fingerprints,
-            base.as_ref().map(|base| &base.dependencies),
-        )?;
+        // Bases are newest first. The newest base the build can go incremental on is built
+        // on: an older one is compared only when every newer one needs a full build, so the
+        // ordinary edit compares against one base, as with one retained core. When none can
+        // be built on, the newest base's own full reason stands.
         let mut plan = ArchitectureBuildPlan {
             path: ArchitectureBuildPath::Full(FullReason::NoBase),
             changed: dependencies::ChangedDocuments::default(),
             references: None,
             all_semantic: true,
-            base,
+            base: bases.first().cloned(),
             read_a: {
                 // Clean payloads will not be read, but producer selection, projection
                 // counts and the complete declaration eligibility index must be current.
@@ -956,63 +972,90 @@ mod engine {
                 read_a
             },
         };
-        let changed = match decision {
-            Ok(changed) => changed,
-            Err(reason) => {
-                plan.path = ArchitectureBuildPath::Full(reason);
-                return Ok(plan);
-            }
-        };
-        let syntax = plan.read_a.input.kept.as_ref().and_then(|slot| {
-            slot.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .syntax
-                .clone()
-        });
-        let versions = plan.read_a.input.kept_versions();
-        let mut references = crate::references::prepare_incremental(
-            &plan.read_a.input.snapshot,
-            versions
-                .as_deref()
-                .map(|versions| crate::references::KeptRead {
-                    syntax: syntax.as_deref(),
-                    versions,
-                    dirty: &changed.dirty,
-                }),
-            check,
-        )?;
-        drop(syntax);
-        plan.read_a.input.keep_syntax(references.kept.take());
-        let base = plan.base.as_ref().expect("incremental decision has a base");
-        if !changed.native.is_empty() {
-            for (current, old, reason) in [
-                (
-                    references.rust_digest,
-                    base.dependencies.rust_catalog,
-                    FullReason::RustCatalogChanged,
-                ),
-                (
-                    references.python_digest,
-                    base.dependencies.python_catalog,
-                    FullReason::PythonCatalogChanged,
-                ),
-                (
-                    references.javascript_digest,
-                    base.dependencies.javascript_catalog,
-                    FullReason::JavascriptCatalogChanged,
-                ),
-                (
-                    references.java_digest,
-                    base.dependencies.java_catalog,
-                    FullReason::JavaCatalogChanged,
-                ),
-            ] {
-                if current != old {
-                    plan.path = ArchitectureBuildPath::Full(reason);
-                    return Ok(plan);
+        // The first catalog that differs from a base's, in the gates' order.
+        let catalog_change =
+            |base: &ArchitectureCore,
+             changed: &dependencies::ChangedDocuments,
+             references: &crate::references::ReferencePreparation| {
+                if changed.native.is_empty() {
+                    return None;
+                }
+                [
+                    (
+                        references.rust_digest,
+                        base.dependencies.rust_catalog,
+                        FullReason::RustCatalogChanged,
+                    ),
+                    (
+                        references.python_digest,
+                        base.dependencies.python_catalog,
+                        FullReason::PythonCatalogChanged,
+                    ),
+                    (
+                        references.javascript_digest,
+                        base.dependencies.javascript_catalog,
+                        FullReason::JavascriptCatalogChanged,
+                    ),
+                    (
+                        references.java_digest,
+                        base.dependencies.java_catalog,
+                        FullReason::JavaCatalogChanged,
+                    ),
+                ]
+                .into_iter()
+                .find_map(|(current, old, reason)| (current != old).then_some(reason))
+            };
+        let mut newest_reason = None;
+        let mut chosen = None;
+        for (i, base) in bases.iter().enumerate() {
+            let changed = match dependencies::changed_documents(
+                &plan.read_a.input.snapshot,
+                &plan.read_a.input.fingerprints,
+                Some(&base.dependencies),
+            )? {
+                Ok(changed) => changed,
+                Err(reason) => {
+                    newest_reason.get_or_insert(reason);
+                    continue;
+                }
+            };
+            let syntax = plan.read_a.input.kept.as_ref().and_then(|slot| {
+                slot.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .syntax
+                    .clone()
+            });
+            let versions = plan.read_a.input.kept_versions();
+            let mut references = crate::references::prepare_incremental(
+                &plan.read_a.input.snapshot,
+                versions
+                    .as_deref()
+                    .map(|versions| crate::references::KeptRead {
+                        syntax: syntax.as_deref(),
+                        versions,
+                        dirty: &changed.dirty,
+                    }),
+                check,
+            )?;
+            drop(syntax);
+            plan.read_a.input.keep_syntax(references.kept.take());
+            match catalog_change(base, &changed, &references) {
+                Some(reason) => {
+                    newest_reason.get_or_insert(reason);
+                }
+                None => {
+                    chosen = Some((i, changed, references));
+                    break;
                 }
             }
         }
+        let Some((chosen, changed, references)) = chosen else {
+            if let Some(reason) = newest_reason {
+                plan.path = ArchitectureBuildPath::Full(reason);
+            }
+            return Ok(plan);
+        };
+        plan.base = Some(bases[chosen].clone());
         plan.all_semantic = plan.read_a.config.is_some_and(Config::has_rules)
             && plan
                 .read_a
@@ -1042,6 +1085,11 @@ mod engine {
     }
 
     impl ArchitectureBuildPlan<'_> {
+        /// The pin of the retained core this plan builds on, if any.
+        pub(crate) fn base_pin(&self) -> Option<IndexPin> {
+            self.base.as_ref().map(|base| base.pin)
+        }
+
         pub(crate) fn semantic_keys(&self) -> Vec<DocumentKey> {
             if self.all_semantic {
                 self.read_a
@@ -1285,6 +1333,8 @@ mod engine {
         pub measured_sources: Vec<DocumentKey>,
         pub progress: Vec<ArchitectureProgress>,
         pub references: crate::references::ReferenceReplayTrace,
+        /// The supplied base the plan built on, if any.
+        pub base: Option<IndexPin>,
     }
 
     #[cfg(feature = "test-support")]
@@ -1300,6 +1350,17 @@ mod engine {
         pub fn architecture_build_for_tests(
             &self,
             base: Option<&super::ArchitectureCoreHandle>,
+            config: Option<&Config>,
+        ) -> Result<super::ArchitectureBuildForTests> {
+            self.architecture_build_on_bases_for_tests(base.as_slice(), config)
+        }
+
+        /// The same adapter with several supplied bases, newest first, as the owner passes
+        /// its retained cores (#1313).
+        #[doc(hidden)]
+        pub fn architecture_build_on_bases_for_tests(
+            &self,
+            bases: &[&super::ArchitectureCoreHandle],
             config: Option<&Config>,
         ) -> Result<super::ArchitectureBuildForTests> {
             let work_limit = crate::references::ReferenceWorkLimitForTests::capture();
@@ -1321,9 +1382,10 @@ mod engine {
             let input = response.finish(input)?;
             drop(response);
             let mut path = None;
+            let mut chosen = None;
             let mut semantic_sources = Vec::new();
             let computed = (|| {
-                let mut plan = super::prepare_architecture(
+                let mut plan = super::prepare_architecture_from(
                     super::ArchitectureReadA {
                         input,
                         store: self,
@@ -1333,9 +1395,10 @@ mod engine {
                         trace: &trace,
                         work_limit,
                     },
-                    base.map(|handle| handle.0.clone()),
+                    bases.iter().map(|handle| handle.0.clone()).collect(),
                     &mut || Ok(()),
                 )?;
+                chosen = plan.base_pin();
                 path = Some(plan.path.clone());
                 semantic_sources = plan.semantic_keys();
                 let response = self.evidence_response()?;
@@ -1348,7 +1411,7 @@ mod engine {
             let core = match computed {
                 Ok(core) => core,
                 Err(error)
-                    if base.is_some()
+                    if !bases.is_empty()
                         && path.as_ref().is_none_or(|path| {
                             matches!(path, ArchitectureBuildPath::Incremental { .. })
                         })
@@ -1403,6 +1466,7 @@ mod engine {
                 measured_sources: execution.measured_sources,
                 progress: progress.into_inner().unwrap_or_else(|e| e.into_inner()),
                 references,
+                base: chosen,
             })
         }
     }

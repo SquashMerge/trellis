@@ -5365,6 +5365,42 @@ struct StreamedDocument {
     extractions: BTreeMap<String, crate::model::FileExtraction>,
 }
 
+/// The raw spool bytes one prepared publication batch may hold (#1313). A batch takes
+/// documents until it holds `batch_len` of them or this many bytes, whichever comes
+/// first, and always at least one. Two batches are decoded at once (one written while the
+/// next is prepared), so this bounds the first index's decode working set. At 8 MiB the
+/// medium synthetic cohort's first-index peak halved (1.2 to 0.6 GiB) for about 2% more
+/// time.
+const STREAM_BATCH_RAW_BYTES: usize = 8 << 20;
+
+/// The next prepared batch from `order` at `cursor`: documents in order, read with `read`
+/// (which also gives each one's raw bytes), until the batch holds `max_documents`, or its
+/// bytes reach `max_bytes` after at least one document. Advances `cursor` past them.
+fn next_stream_batch<T>(
+    order: &[usize],
+    cursor: &mut usize,
+    max_documents: usize,
+    max_bytes: usize,
+    mut read: impl FnMut(usize) -> (T, usize),
+) -> Vec<(usize, T)> {
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    while *cursor < order.len()
+        && batch.len() < max_documents
+        && (batch.is_empty() || bytes < max_bytes)
+    {
+        let index = order[*cursor];
+        let (item, size) = read(index);
+        bytes = bytes.saturating_add(size);
+        batch.push((index, item));
+        *cursor += 1;
+    }
+    batch
+}
+
+#[cfg(test)]
+mod stream_batch_tests;
+
 /// What preparing a streamed batch reads; all of it is shared with worker threads.
 struct StreamBatchContext<'a> {
     decoder: &'a dyn SpoolDecoder,
@@ -17420,7 +17456,7 @@ impl Store {
                 let batch_len = crate::parallel::default_workers() * 16;
                 let owner_paths = relation_owner_paths(&classes);
                 let decoder = spool.decoder();
-                let prepare = |batch_index: usize, raws: Vec<(usize, RawSpoolDocument)>| {
+                let prepare = |ordinal_start: usize, raws: Vec<(usize, RawSpoolDocument)>| {
                     prepare_stream_batch(
                         StreamBatchContext {
                             decoder,
@@ -17432,7 +17468,7 @@ impl Store {
                             max_graph_json_bytes,
                             cancel,
                         },
-                        batch_index * batch_len,
+                        ordinal_start,
                         raws,
                     )
                 };
@@ -17441,13 +17477,23 @@ impl Store {
                 #[cfg(test)]
                 let fault = crate::native_records::extraction_auth_fault_snapshot();
                 std::thread::scope(|scope| -> Result<()> {
-                    let mut batches = stream_order.chunks(batch_len).enumerate();
+                    let mut cursor = 0usize;
                     let mut start_next = || {
-                        batches.next().map(|(batch_index, batch)| {
-                            let raws = batch
-                                .iter()
-                                .map(|&index| (index, spool.read_raw(index)))
-                                .collect::<Vec<_>>();
+                        (cursor < stream_order.len()).then(|| {
+                            let ordinal_start = cursor;
+                            let raws = next_stream_batch(
+                                &stream_order,
+                                &mut cursor,
+                                batch_len,
+                                STREAM_BATCH_RAW_BYTES,
+                                |index| {
+                                    let raw = spool.read_raw(index);
+                                    let bytes =
+                                        raw.document.as_ref().map_or(0, |(a, b)| a.len() + b.len())
+                                            + raw.extraction.as_ref().map_or(0, Vec::len);
+                                    (raw, bytes)
+                                },
+                            );
                             #[cfg(test)]
                             let fault = &fault;
                             let prepare = &prepare;
@@ -17455,7 +17501,7 @@ impl Store {
                                 #[cfg(test)]
                                 let _fault =
                                     crate::native_records::enter_extraction_auth_fault(fault);
-                                prepare(batch_index, raws)
+                                prepare(ordinal_start, raws)
                             })
                         })
                     };
