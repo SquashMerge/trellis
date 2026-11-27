@@ -12733,6 +12733,275 @@ async fn a_read_waits_again_when_the_head_moves_during_its_wait() {
     session.join().unwrap().unwrap();
 }
 
+/// #1329: outside catch-up, an ordinary head move during a rules check's wait for the owner
+/// passes the read's revision. The read waits for the owner's build of the new head instead
+/// of admitting another read that would only find it building too, and answers `building`
+/// from the owner's state with the admitted read's basis. Here the head moves near the end of
+/// the call and another admission costs more than the time left, as on a loaded host or
+/// behind the next publication's COMMIT: the call answered `deadline_exceeded` before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_whose_revision_is_passed_answers_building_for_the_new_head() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("a.js", "import './b.js';\n"),
+            ("b.js", "export const b = 1;\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1329, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    runtime.await_architecture_for_tests();
+    let (waiting, reader_waits) = std::sync::mpsc::channel();
+    let (entered, reached) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let armed = AtomicBool::new(false);
+    scheduler.set_architecture_hook_for_tests(std::sync::Arc::new(move |point| match point {
+        "architecture_read_waiting" => {
+            let _ = waiting.send(());
+        }
+        "architecture_build_started" => armed.store(true, Ordering::Release),
+        // Each build holds once, mid-way and past its read, until the test releases it.
+        "resolving" if armed.swap(false, Ordering::AcqRel) => {
+            let _ = entered.send(());
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+        _ => {}
+    }));
+    // A rules edit starts a build at this revision that the read below waits for.
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.other]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    scheduler.architecture_hint();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    // The first admission is free; any later one costs more than the call has left.
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let slow = std::sync::Arc::downgrade(&runtime);
+    let counted = admissions.clone();
+    runtime.set_mcp_admitted_gate_for_tests(std::sync::Arc::new(move || {
+        if counted.fetch_add(1, Ordering::AcqRel) > 0
+            && let Some(runtime) = slow.upgrade()
+        {
+            runtime.advance_mcp_clock_for_tests(Duration::from_secs(10));
+        }
+    }));
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) =
+        socket_session(&identity, &registry, 1329, Some(Duration::from_secs(60)));
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    // The admitted read found the core building and ended; the call waits on the owner.
+    reader_waits
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let before = runtime
+        .evidence_response()
+        .unwrap()
+        .0
+        .status()
+        .unwrap()
+        .revision;
+    // Five seconds of the call's clock are left when the head moves.
+    runtime.advance_mcp_clock_for_tests(Duration::from_secs(55));
+    fs::write(identity.root.join("c.js"), "export const c = 2;\n").unwrap();
+    let indexing = runtime.clone();
+    let root = identity.root.clone();
+    tokio::task::spawn_blocking(move || {
+        indexing.cli_index(&trellis::indexer::IndexOptions::new(root))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    scheduler.architecture_hint();
+    // The held build gives way to the new head, whose build holds in turn.
+    release.send(()).unwrap();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let reply = next_reply(&mut reader);
+    tool(&reply, Some("building"), true);
+    let error = &reply["result"]["structuredContent"]["error"];
+    assert_eq!(error["retryable"], true, "{reply}");
+    assert_eq!(error["retryAfterMs"], 250, "{reply}");
+    assert_eq!(
+        error["currentBasis"]["indexRevision"], before.index_revision,
+        "{reply}"
+    );
+    validate_structured_content(&[json!({"name":"trellis_rules_check",
+        "structuredContent":reply["result"]["structuredContent"]})]);
+    // The answer came from the owner's state: the one admitted read found the old head.
+    assert_eq!(admissions.load(Ordering::Acquire), 1);
+    drop(release);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #1329: the passed revision's own core can be published before its waiter looks. The read
+/// found the old head building and ended; before the call waits on the owner, that build
+/// publishes, the head moves and the new head's build starts. The call still waits for the
+/// new head's build and answers `building`, instead of admitting a read that would only find
+/// it building too, here with less time left than that admission costs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_passed_revision_published_before_the_wait_still_answers_building() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("a.js", "import './b.js';\n"),
+            ("b.js", "export const b = 1;\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(13291, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    runtime.await_architecture_for_tests();
+    let (entered, reached) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let armed = AtomicBool::new(false);
+    scheduler.set_architecture_hook_for_tests(std::sync::Arc::new(move |point| match point {
+        "architecture_build_started" => armed.store(true, Ordering::Release),
+        // Each build holds once, mid-way and past its read, until the test releases it.
+        "resolving" if armed.swap(false, Ordering::AcqRel) => {
+            let _ = entered.send(());
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+        _ => {}
+    }));
+    // A rules edit starts a build at this revision that the read below finds running.
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.other]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    scheduler.architecture_hint();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    // The first admission is free; any later one costs more than the call has left.
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let slow = std::sync::Arc::downgrade(&runtime);
+    let counted = admissions.clone();
+    runtime.set_mcp_admitted_gate_for_tests(std::sync::Arc::new(move || {
+        if counted.fetch_add(1, Ordering::AcqRel) > 0
+            && let Some(runtime) = slow.upgrade()
+        {
+            runtime.advance_mcp_clock_for_tests(Duration::from_secs(10));
+        }
+    }));
+    // The call pauses after its read found the core building, before it waits on the owner.
+    let (found, found_building) = std::sync::mpsc::channel();
+    let (resume, paused) = std::sync::mpsc::channel::<()>();
+    let paused = std::sync::Mutex::new(paused);
+    runtime.set_mcp_building_gate_for_tests(std::sync::Arc::new(move || {
+        let _ = found.send(());
+        let _ = paused
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP);
+    }));
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) =
+        socket_session(&identity, &registry, 13291, Some(Duration::from_secs(60)));
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    found_building
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let before = runtime
+        .evidence_response()
+        .unwrap()
+        .0
+        .status()
+        .unwrap()
+        .revision;
+    // The old head's build finishes and publishes its core.
+    release.send(()).unwrap();
+    runtime.await_architecture_for_tests();
+    // Then the head moves, and the new head's build starts and holds.
+    fs::write(identity.root.join("c.js"), "export const c = 2;\n").unwrap();
+    let indexing = runtime.clone();
+    let root = identity.root.clone();
+    tokio::task::spawn_blocking(move || {
+        indexing.cli_index(&trellis::indexer::IndexOptions::new(root))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    scheduler.architecture_hint();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    // Five seconds of the call's clock are left when it goes on.
+    runtime.advance_mcp_clock_for_tests(Duration::from_secs(55));
+    resume.send(()).unwrap();
+    let reply = next_reply(&mut reader);
+    tool(&reply, Some("building"), true);
+    let error = &reply["result"]["structuredContent"]["error"];
+    assert_eq!(error["retryable"], true, "{reply}");
+    assert_eq!(error["retryAfterMs"], 250, "{reply}");
+    assert_eq!(error["progress"]["phase"], "resolving", "{reply}");
+    assert_eq!(
+        error["currentBasis"]["indexRevision"], before.index_revision,
+        "{reply}"
+    );
+    validate_structured_content(&[json!({"name":"trellis_rules_check",
+        "structuredContent":reply["result"]["structuredContent"]})]);
+    assert_eq!(admissions.load(Ordering::Acquire), 1);
+    drop(release);
+    drop(resume);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// #448: a rules check scoped to one file with hundreds of unknown sites failed
 /// `response_too_large`; it now samples evidence per instance and pages, while
 /// counts and `referenceCount` stay exact and equal the CLI's.
