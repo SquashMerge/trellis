@@ -1,22 +1,17 @@
 //! Ordered charge replay against fresh catalogs, retaining only completed source output.
 use super::*;
-use shared::{ChargeSite, SemanticChargeOutcome};
-
-#[derive(Clone, Serialize)]
-pub(crate) struct SourceChargePlan {
-    pub(crate) prepared_work: usize,
-    pub(crate) sites: Vec<ChargeSite>,
-}
+use shared::SemanticChargeOutcome;
 
 #[derive(Clone, Default)]
 pub(crate) struct SourceFacts {
     pub(crate) plan: Option<Arc<SourceChargePlan>>,
     pub(crate) work: usize,
     pub(crate) sites: usize,
-    pub(crate) endpoints: Vec<u32>,
+    /// Shared with the dependency index, and between cores while unchanged (#1313).
+    pub(crate) endpoints: Arc<[u32]>,
     /// A projected source's semantic endpoint documents: those whose eligibility its Read B
     /// reads under its producer at the current pin (#934, #1310). Empty for a current source.
-    pub(crate) eligibility: Vec<u32>,
+    pub(crate) eligibility: Arc<[u32]>,
 }
 
 /// Build-local owned state. All document borrows and request callbacks are made on the
@@ -637,8 +632,9 @@ pub(super) fn replay_source_charges(
     merge_work(&mut catalogs.rust_execution.work, plan.prepared_work, check)?;
     let mut packages = SourcePackageDescriptors::new();
     let mut sites = 0;
-    for retained in &plan.sites {
+    for retained in plan.sites() {
         check()?;
+        let retained = &retained;
         // Replay's locate accepts normalized indices; full construction's accepts snapshot
         // indices. Both use the complete current declaration eligibility index.
         let outcome = match retained.semantic.as_ref().map(|semantic| &semantic.outcome) {
@@ -788,7 +784,7 @@ impl SourceFacts {
             endpoints,
             eligibility,
         } = self;
-        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints, "eligibility": eligibility })
+        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints.as_ref(), "eligibility": eligibility.as_ref() })
     }
 }
 
@@ -876,20 +872,6 @@ pub(super) fn normalize_document(read: ReadContext<'_, '_>, document: usize) -> 
         .copied()
         .unwrap_or(read.docs.len());
     Ok(u32::try_from(sorted)?)
-}
-
-impl SourceChargePlan {
-    pub(super) fn push(&mut self, read: ReadContext<'_, '_>, mut site: ChargeSite) -> Result<()> {
-        if let Some(shared::SemanticCharge {
-            outcome: SemanticChargeOutcome::Internal { document, sid: _ },
-            historical: _,
-        }) = &mut site.semantic
-        {
-            *document = normalize_document(read, *document as usize)?;
-        }
-        self.sites.push(site);
-        Ok(())
-    }
 }
 
 pub(super) fn resolution_endpoints(endpoints: &mut BTreeSet<usize>, charged: &shared::ChargedSite) {

@@ -110,7 +110,11 @@ fn architecture_incremental_canonical_index() {
         assert_eq!(dependency.fingerprint.as_ref(), &inputs.documents[key]);
         assert_eq!(dependency.references.work, facts.work);
         assert_eq!(dependency.references.sites, facts.sites);
-        assert_eq!(dependency.references.endpoints.as_ref(), facts.endpoints);
+        assert_eq!(dependency.references.endpoints, facts.endpoints);
+        assert!(Arc::ptr_eq(
+            &dependency.references.endpoints,
+            &facts.endpoints
+        ));
         assert!(facts.endpoints.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(
             facts
@@ -200,9 +204,7 @@ fn architecture_incremental_canonical_index() {
                 2 => references.endpoints = Arc::from([]),
                 3 => references.plan = None,
                 4 => Arc::make_mut(references.plan.as_mut().unwrap()).prepared_work += 1,
-                _ => Arc::make_mut(references.plan.as_mut().unwrap())
-                    .sites
-                    .clear(),
+                _ => Arc::make_mut(references.plan.as_mut().unwrap()).clear_for_tests(),
             }
         });
     }
@@ -1916,16 +1918,24 @@ fn architecture_kept_read_a_equals_a_full_read_a_at_a_new_revision() {
         "the build holds the documents"
     );
     drop(first);
-    assert_eq!(
-        kept.lock()
-            .unwrap()
-            .native
-            .as_ref()
-            .unwrap()
-            .documents
-            .len(),
-        all.len()
-    );
+    {
+        let kept = kept.lock().unwrap();
+        let native = kept.native.as_ref().unwrap();
+        assert_eq!(native.documents.len(), all.len());
+        // #1313: kept rows hold no copies of their document's key, revision or proof ID; the
+        // reads below refill them.
+        assert!(
+            native
+                .documents
+                .values()
+                .all(|document| !document.holds_row_copies())
+        );
+    }
+    // The same revision again: every kept document restores exactly as a full read decodes it.
+    let again = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    assert!(again.read_documents().is_empty());
+    assert_same_read_a(&again, &native_input(&store));
+    drop(again);
     // A body edit, an added and a deleted document, at a new native revision.
     write(
         root.path(),

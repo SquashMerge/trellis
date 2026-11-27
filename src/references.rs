@@ -14,6 +14,7 @@ pub(crate) mod callers;
 mod canonical;
 mod cargo_workspace;
 mod catalog_digest;
+mod charge_plan;
 pub mod external;
 mod java;
 mod javascript;
@@ -23,11 +24,12 @@ use package_parts::{ExternalPackageTable, SourcePackageDescriptors};
 mod incremental;
 #[cfg(all(test, feature = "test-support"))]
 mod incremental_tests;
+pub(crate) use charge_plan::SourceChargePlan;
 pub use incremental::ReferenceReplayTrace;
+pub(crate) use incremental::SourceFacts;
 pub(crate) use incremental::{
     KeptRead, KeptSyntax, ReferencePreparation, finish_incremental, prepare_incremental,
 };
-pub(crate) use incremental::{SourceChargePlan, SourceFacts};
 #[cfg(feature = "test-support")]
 pub use work::{
     ReferenceWorkLimitForTests, ReferenceWorkLimitGuardForTests, set_reference_work_limit_for_tests,
@@ -1413,19 +1415,16 @@ fn file_references<'a>(
     )?;
     request.check()?;
     let (before_work, before_sites) = (catalogs.rust_execution.work.used, *site_count);
-    let mut plan = SourceChargePlan {
-        prepared_work: work.used,
-        sites: Vec::new(),
-    };
+    let mut plan = charge_plan::ChargePlanBuilder::new(work.used);
     let mut endpoints = incremental::semantic_endpoints(read, source)?;
     // Only a projected source reads its semantic endpoints' eligibility (#934, #1310).
-    let eligibility = if doc.semantic.projection.is_some() {
+    let eligibility: Arc<[u32]> = if doc.semantic.projection.is_some() {
         endpoints
             .iter()
             .map(|&endpoint| u32::try_from(endpoint))
             .collect::<std::result::Result<_, _>>()?
     } else {
-        Vec::new()
+        Arc::default()
     };
     merge_work(&mut catalogs.rust_execution.work, work.used, check)?;
     let mut found = SourceReferences {
@@ -1534,7 +1533,7 @@ fn file_references<'a>(
         found,
         packages: source_packages,
         facts: SourceFacts {
-            plan: Some(Arc::new(plan)),
+            plan: Some(Arc::new(plan.finish())),
             work: catalogs.rust_execution.work.used - before_work,
             sites: *site_count - before_sites,
             endpoints: endpoints
