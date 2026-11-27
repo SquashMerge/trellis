@@ -134,6 +134,10 @@ fn send_daemon_once(
     stop_wait: Option<&client::StopWait>,
 ) -> Result<protocol::Reply> {
     let socket = socket_path()?;
+    // An expired stop wait connects nothing and sends nothing (#1293).
+    if stop_wait.is_some_and(client::StopWait::expired) {
+        anyhow::bail!("daemon_unavailable");
+    }
     let budget = stop_wait.map(client::StopWait::remaining);
     // Read afresh at every connect, so a retry inside the attempt gets only what is left.
     let within = |bound: Duration| stop_wait.map_or(bound, |wait| bound.min(wait.remaining()));

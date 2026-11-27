@@ -205,15 +205,28 @@ pub fn call_until(
     deadline: Option<Instant>,
 ) -> Result<Reply, CallError> {
     let attempts = if read_only { 2 } else { 1 };
+    // Past the deadline nothing is connected or written: the request was not
+    // sent, so even a mutation reports `daemon_unavailable`, never a replay.
+    let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
     for attempt in 0..attempts {
+        if expired() {
+            return Err(CallError::DaemonUnavailable);
+        }
         let mut stream = match connect() {
             Ok(stream) => stream,
             Err(_) if attempt + 1 < attempts => continue,
             Err(_) => return Err(CallError::DaemonUnavailable),
         };
+        if expired() {
+            return Err(CallError::DaemonUnavailable);
+        }
         // A partially written request can still have reached the server. Never replay
         // a mutation after attempting its write, including when the reply is lost.
-        if protocol::write_frame(&mut stream, request).is_err() {
+        let written = match deadline {
+            Some(deadline) => protocol::write_frame_until(&mut stream, request, deadline),
+            None => protocol::write_frame(&mut stream, request),
+        };
+        if written.is_err() {
             if read_only && attempt + 1 < attempts {
                 continue;
             }
@@ -1834,6 +1847,47 @@ mod cancellation_tests {
     }
 
     /// #1288: a cancellation may carry an object `_meta`, which is ignored.
+    /// #1293 review: a stop wait's deadline that has passed stops the attempt before it
+    /// connects or writes, so not even a mutation is sent after the bound.
+    #[test]
+    fn an_expired_deadline_neither_connects_nor_writes() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let request = Request {
+            id: 7,
+            operation: "index".into(),
+            payload: serde_json::json!({}),
+        };
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        let mut client = Some(client);
+        let connected = AtomicBool::new(false);
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let result = call_until(
+            &request,
+            false,
+            || {
+                connected.store(true, Ordering::SeqCst);
+                client
+                    .take()
+                    .ok_or_else(|| io::Error::other("one connection"))
+            },
+            Some(deadline),
+        );
+        assert_eq!(result.unwrap_err(), CallError::DaemonUnavailable);
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "connected after the deadline"
+        );
+        // Nothing reached the peer: its end reads nothing, not a request.
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert!(
+            std::io::Read::read(&mut peer, &mut byte)
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock),
+            "a request was written after the deadline"
+        );
+    }
+
     #[test]
     fn a_cancellation_with_meta_names_its_request() {
         assert_eq!(cancel(r#"{"requestId":3}"#), Some(serde_json::json!(3)));
