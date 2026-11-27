@@ -1408,15 +1408,15 @@ cohort at the limit may peak near 8 GiB. Past the limit, the revision is refused
 
 Every `bounded_work` refusal names the bound it hit (owner ruling 2026-11-26,
 [#1321](https://github.com/SquashMerge/trellis/issues/1321), option A). The snapshot's byte
-bounds also report the observed value: `architecture document source: <path> is <N> bytes,
-over the 2 MiB limit` for the first such document in key order, `architecture stored total:
-<N> bytes, over the 2 GiB limit`, and `architecture retained input: <path> is <N> bytes, over
-the 16 MiB limit` for a present retained manifest or config input (capture's own input bound). A document over its bound is refused when it is
-reached. The stored total is the whole revision's: once it is over its limit, the read
-fetches no more rows, frees those it fetched, and charges every remaining document and the
-retained inputs' stored lengths before it refuses. For every
-`bounded_work`, MCP and the browser answer the refusal's text after `Architecture projection
-work bound exceeded: `, and the CLI the error itself.
+bounds also report the observed value: `architecture stored total: <N> bytes, over the 2 GiB
+limit`, and `architecture retained input: <path> is <N> bytes, over the 16 MiB limit` for a
+present retained manifest or config input (capture's own input bound). A document over the
+2 MiB document bound is not refused: it is kept as its file module, `partialFiles` reason
+`oversized` (below). The stored total is the whole revision's: once it is over its limit, the
+read fetches no more rows, frees those it fetched, and charges every remaining document and
+the retained inputs' stored lengths before it refuses. For every `bounded_work`, MCP and the
+browser answer the refusal's text after `Architecture projection work bound exceeded: `, and
+the CLI the error itself.
 
 Syntax walks are bounded per document, to 128 levels and 1,000,000 visits, but one
 pathological file doesn't refuse the result (#554), and neither does a file with a syntax
@@ -1475,6 +1475,12 @@ never parses one for longer than indexing did.
 known, so it proves less than a file with a syntax error: every rule above for a broken file
 applies, a Rust file below it has no proved crate whatever its name, and a Java file's package
 is unknown, which leaves every package of its source set unknown.
+
+`oversized` also names a source over the snapshot's 2 MiB document bound (owner ruling
+2026-11-26, [#1321](https://github.com/SquashMerge/trellis/issues/1321)). A source that size is
+indexed only under a raised `--max-file-bytes`. The snapshot keeps only its file module,
+never parses it, and reads on: the revision is not refused. `range` is the whole file and
+`subtrees` is 0, and every rule above for a source that wasn't read applies.
 
 Reference work has one request-wide allowance of
 `min(100_000_000, 5_000_000 + 20_000*N + 512*K)` units. Rules use a separate

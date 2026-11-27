@@ -859,7 +859,9 @@ fn admit_snapshot<'a>(
             .checked_add(doc.file.text.len())
             .context("bounded_work: reference bytes")?;
         ensure!(
-            doc.file.text.len() <= SOURCE_BYTES && total_bytes <= TOTAL_BYTES,
+            // A document the snapshot never parses (#1300, #1321) is not a parse input.
+            (doc.file.text.len() <= SOURCE_BYTES || snapshot.unparsed.contains(&doc.key))
+                && total_bytes <= TOTAL_BYTES,
             "bounded_work: reference source bytes"
         );
     }

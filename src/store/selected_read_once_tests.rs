@@ -312,19 +312,22 @@ fn rust_lookup_keys_reuse_the_checked_source_for_sid_answers() {
 }
 
 #[test]
-fn architecture_read_a_names_the_document_over_its_source_bound() {
-    // #1321: a document over the per-document bound is named, with its size.
+fn architecture_read_a_keeps_a_document_over_its_source_bound_as_its_file_module() {
+    // Owner ruling 2026-11-26 (#1321): a source over the snapshot's 2 MiB document bound is
+    // kept as its file module, as capture keeps one over `--max-file-bytes`, instead of
+    // refusing the revision. It is never parsed, and `partialFiles` names it `oversized`.
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     for n in 0..3 {
         fs::write(
             root.path().join(format!("f{n}.js")),
-            format!("function f{n}(x) {{ return x; }}\n"),
+            format!("function f{n}(x) {{ return g(x); }}\n"),
         )
         .unwrap();
     }
-    // Sorted last, and past Read A's per-document bound. Indexing admits it.
-    let mut large = String::from("// ");
+    // Past the per-document bound, with declarations and calls of its own. Indexing admits
+    // it under a raised `--max-file-bytes`.
+    let mut large = String::from("function big() { return g(1); }\n// ");
     large.push_str(&"x".repeat(2 * 1024 * 1024));
     fs::write(root.path().join("z.js"), large).unwrap();
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -333,6 +336,15 @@ fn architecture_read_a_names_the_document_over_its_source_bound() {
     options.max_file_bytes = 4 * 1024 * 1024;
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let indexed = native
+        .declarations
+        .iter()
+        .filter(|row| row.document.path == "z.js")
+        .count();
+    assert!(
+        indexed > 1,
+        "indexing kept the large document's declarations"
+    );
     store
         .publish_native(
             &graph,
@@ -343,30 +355,43 @@ fn architecture_read_a_names_the_document_over_its_source_bound() {
             &cancel,
         )
         .unwrap();
-    let progress = std::sync::Mutex::new(Vec::new());
     let response = store.evidence_response().unwrap();
-    let (read, counts) = whole_request(|| {
-        response
-            .architecture_native_regions(None, &mut || Ok(()), &|done, total| {
-                progress.lock().unwrap().push((done, total))
-            })
-            .map(|_| ())
-    });
-    let error = read.unwrap_err();
-    // #1321: the refusal names the limit, the document and its size.
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "bounded_work: architecture document source: z.js is {} bytes, over the 2 MiB limit",
-            2 * 1024 * 1024 + 3
-        )
-    );
-    assert_eq!(counts.document_reads, 4);
-    assert_eq!(
-        progress.lock().unwrap().len(),
-        3,
-        "the documents before it were read"
-    );
+    let (snapshot, regions) = response
+        .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
+        .unwrap();
+    let position = |path: &str| {
+        snapshot
+            .documents
+            .iter()
+            .position(|document| document.key.path == path)
+            .unwrap()
+    };
+    let large = &snapshot.documents[position("z.js")];
+    assert_eq!(snapshot.evidence_gaps.get(&large.key), Some(&"oversized"));
+    assert!(snapshot.unparsed.contains(&large.key));
+    assert_eq!(large.declarations.len(), 1);
+    assert!(large.declarations[0].kind == "module" && large.declarations[0].ancestors.is_empty());
+    assert!(large.calls.is_empty());
+    assert!(regions[position("z.js")].is_empty());
+    let small = &snapshot.documents[position("f0.js")];
+    assert!(!snapshot.evidence_gaps.contains_key(&small.key));
+    assert!(small.declarations.len() > 1 && !small.calls.is_empty());
+    // The projection reads the revision and names the document, without parsing it.
+    let projection =
+        crate::references::project_where(&snapshot, &[], None, None, &[], 5, &mut || Ok(()))
+            .unwrap();
+    let partial: Vec<_> = projection.data["partialFiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap(),
+                file["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(partial, [("z.js", "oversized")]);
 }
 
 /// Read A of `store`'s head under `limits`, with the counts of the whole request.
