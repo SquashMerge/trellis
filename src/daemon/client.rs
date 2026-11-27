@@ -25,32 +25,55 @@ impl CallError {
 /// How long a CLI, `serve` or `trellis mcp` attach waits out an explicit
 /// daemon stop before it fails (#1293, owner ruling 2026-11-26).
 pub const STOP_WAIT: Duration = Duration::from_secs(60);
+/// The connect and the attach reply of one MCP attach, each at most this long.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a waiting CLI reports on stderr, as the first-index wait does (#842).
 const STOP_WAIT_PROGRESS: Duration = Duration::from_secs(10);
 
 /// A client's wait for a stopping daemon to exit. Each `daemon_stopping`
 /// answer pauses briefly, then the client connects again; once the old owner
 /// has released, that connect re-runs the election and reaches the successor.
+///
+/// One deadline covers the whole wait: each attempt inside it gets only the
+/// [`remaining`](Self::remaining) budget for its connect and its reply, so no
+/// attempt outlives the bound.
 pub struct StopWait {
     started: Instant,
-    bound: Duration,
+    deadline: Instant,
     reported: Option<Instant>,
 }
 
 impl StopWait {
     pub fn new(bound: Duration) -> Self {
+        Self::until(Instant::now() + bound)
+    }
+
+    /// A wait that ends at `deadline`, such as a command's own whole-call bound.
+    pub fn until(deadline: Instant) -> Self {
         Self {
             started: Instant::now(),
-            bound,
+            deadline,
             reported: None,
         }
+    }
+
+    /// What is left of the wait, at least 1 ms so it can bound a socket timeout.
+    pub fn remaining(&self) -> Duration {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1))
+    }
+
+    /// Whether the wait's deadline has passed.
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.deadline
     }
 
     /// False once the bound has passed. Otherwise report progress (at most
     /// every 10 s) and pause before the next attempt.
     pub fn pause(&mut self, progress: &mut dyn FnMut(String)) -> bool {
         let now = Instant::now();
-        let deadline = self.started + self.bound;
+        let deadline = self.deadline;
         if now >= deadline {
             return false;
         }
@@ -61,7 +84,7 @@ impl StopWait {
             progress(format!(
                 "trellis: the daemon is stopping; waiting to reach its successor ({}s elapsed, waiting up to {}s)",
                 now.duration_since(self.started).as_secs(),
-                self.bound.as_secs()
+                deadline.duration_since(self.started).as_secs()
             ));
             self.reported = Some(now);
         }
@@ -333,6 +356,7 @@ fn attach_mcp(
     mut stream: UnixStream,
     workspace: &crate::store::topology::WorkspaceIdentity,
     attachments: &[protocol::McpAttachment],
+    timeout: Duration,
 ) -> io::Result<UnixStream> {
     let request = Request {
         id: 1,
@@ -347,8 +371,8 @@ fn attach_mcp(
             "attachments": attachments,
         }),
     };
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     protocol::write_frame(&mut stream, &request)?;
     let reply: Reply = protocol::read_frame(&mut stream)?;
     if reply.id != request.id {
@@ -1612,7 +1636,7 @@ impl<W: std::io::Write> Relay<'_, W> {
 pub fn relay_stdio(
     stream: UnixStream,
     workspace: &crate::store::topology::WorkspaceIdentity,
-    mut reconnect: impl FnMut() -> io::Result<UnixStream>,
+    mut reconnect: impl FnMut(Duration) -> io::Result<UnixStream>,
 ) -> io::Result<()> {
     let doorbell = std::sync::Arc::new(Doorbell::default());
     let (receiver, stdin) = spawn_ringing_frame_reader(0, Some(doorbell.clone()))?;
@@ -1621,9 +1645,10 @@ pub fn relay_stdio(
         let doorbell = doorbell.clone();
         move |stream: io::Result<UnixStream>,
               generation: u64,
-              attachments: &[protocol::McpAttachment]|
+              attachments: &[protocol::McpAttachment],
+              timeout: Duration|
               -> io::Result<DaemonConnection> {
-            let stream = attach_mcp(stream?, workspace, attachments)?;
+            let stream = attach_mcp(stream?, workspace, attachments, timeout)?;
             stream.set_read_timeout(None)?;
             spawn_reply_reader(&stream, generation, reply_sender.clone(), doorbell.clone())?;
             Ok(DaemonConnection { stream, generation })
@@ -1632,7 +1657,7 @@ pub fn relay_stdio(
     // The launch attach waits out an explicit daemon stop (#1293), bounded,
     // then reaches the successor; any other failure is typed, never a raw
     // I/O error such as a read timeout's EAGAIN.
-    let mut attached = open(Ok(stream), 0, &[]);
+    let mut attached = open(Ok(stream), 0, &[], ATTACH_TIMEOUT);
     let mut stop_wait: Option<StopWait> = None;
     loop {
         let waiting = match &attached {
@@ -1652,7 +1677,11 @@ pub fn relay_stdio(
         {
             break;
         }
-        attached = open(reconnect(), 0, &[]);
+        // Each attempt gets only what is left of the wait.
+        let budget = stop_wait
+            .as_ref()
+            .map_or(ATTACH_TIMEOUT, |wait| wait.remaining().min(ATTACH_TIMEOUT));
+        attached = open(reconnect(budget), 0, &[], budget);
     }
     let (first, restart_required) = match attached {
         Ok(first) => (Some(first), false),
@@ -1689,7 +1718,12 @@ pub fn relay_stdio(
         restart_required,
         stopping: false,
         connect: Box::new(move |generation, attachments| {
-            open(reconnect(), generation, attachments)
+            open(
+                reconnect(ATTACH_TIMEOUT),
+                generation,
+                attachments,
+                ATTACH_TIMEOUT,
+            )
         }),
         attachments: Default::default(),
         legacy_init: None,
@@ -2098,7 +2132,7 @@ mod reply_gate_tests {
                     .recv_timeout(crate::testing::HANG_BACKSTOP)
                     .unwrap();
             });
-            let result = attach_mcp(client, &fixture.workspace, &[]);
+            let result = attach_mcp(client, &fixture.workspace, &[], ATTACH_TIMEOUT);
             if expected {
                 assert!(result.is_ok(), "{result:?}");
             } else {

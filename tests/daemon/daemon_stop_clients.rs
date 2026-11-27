@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use trellis::testing::HANG_BACKSTOP;
 
 /// A daemon whose stop is held open: `index` activated the checkout, its
@@ -286,4 +286,103 @@ fn a_bare_daemon_that_loses_to_a_stopping_owner_says_so() {
         "{}",
         bare.stderr()
     );
+}
+
+/// A stand-in for a stopping daemon at the fixture's socket: it answers its first
+/// connection `daemon_stopping` after `first`, and every later one after `later`, or
+/// never (`None`, holding the connection open), as an attempt that would outlive its
+/// wait meets.
+struct StoppingDaemon {
+    _socket: std::path::PathBuf,
+}
+
+impl StoppingDaemon {
+    fn bind(socket: &std::path::Path, first: Duration, later: Option<Duration>) -> Self {
+        use trellis::daemon::protocol;
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                let delay = if index == 0 { Some(first) } else { later };
+                let Some(delay) = delay else {
+                    held.push(stream);
+                    continue;
+                };
+                std::thread::spawn(move || {
+                    let Ok(request) = protocol::read_frame::<protocol::Request>(&mut stream) else {
+                        return;
+                    };
+                    std::thread::sleep(delay);
+                    let _ = protocol::write_frame(
+                        &mut stream,
+                        &protocol::Reply {
+                            id: request.id,
+                            payload: serde_json::json!({"error": protocol::DAEMON_STOPPING_MESSAGE}),
+                        },
+                    );
+                });
+            }
+        });
+        Self {
+            _socket: socket.to_path_buf(),
+        }
+    }
+}
+
+/// Wall time a bounded wait may take beyond its bound: process start and the last pause.
+const BOUND_MARGIN: Duration = Duration::from_secs(3);
+
+/// The stop wait's one deadline holds even when an attempt inside it would outlive it:
+/// the silent second attempt gets only what is left of the wait, and the command fails
+/// typed `daemon_stopping` at the bound.
+#[test]
+fn a_cli_stop_wait_ends_at_its_bound_when_an_attempt_would_outlive_it() {
+    let fixture = fixture();
+    let _daemon = StoppingDaemon::bind(&fixture.socket(), Duration::ZERO, None);
+    let bound = Duration::from_secs(2);
+    let mut status = fixture.status();
+    status.env(
+        "TRELLIS_TEST_CLI_STOP_WAIT_MS",
+        bound.as_millis().to_string(),
+    );
+    let started = Instant::now();
+    let mut status = fixture.spawn("status", status);
+    assert!(!status.exit("status during a stop").success());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < bound + BOUND_MARGIN,
+        "the wait took {elapsed:?}, past its {bound:?} bound"
+    );
+    assert!(
+        status.stderr().contains("daemon_stopping"),
+        "{}",
+        status.stderr()
+    );
+}
+
+/// `trellis api` keeps its own reply bound for the whole call, a stop wait included: answers
+/// that each arrive within one read bound cannot stretch the call past it.
+#[test]
+fn trellis_api_keeps_its_own_bound_through_a_stop_wait() {
+    let fixture = fixture();
+    let answer = Duration::from_millis(1500);
+    let _daemon = StoppingDaemon::bind(&fixture.socket(), answer, Some(answer));
+    let bound = Duration::from_secs(2);
+    let mut api = fixture.cli();
+    api.args(["api", "GET", "/api/checkouts"]).env(
+        "TRELLIS_TEST_CLI_REPLY_BOUND_MS",
+        bound.as_millis().to_string(),
+    );
+    let started = Instant::now();
+    let mut api = fixture.spawn("api", api);
+    assert!(!api.exit("api during a stop").success());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < bound + BOUND_MARGIN,
+        "the call took {elapsed:?}, past its {bound:?} bound"
+    );
+    let output = api.stdout() + &api.stderr();
+    assert!(output.contains("daemon_stopping"), "{output}");
 }

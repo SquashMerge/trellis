@@ -89,7 +89,11 @@ pub(crate) async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     // out, bounded, then register with its successor (#1293).
     let mut stop_wait: Option<client::StopWait> = None;
     let (mut stream, address) = loop {
-        let connected = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5));
+        // Inside the wait, the connect and the reply get only what is left of it.
+        let left = stop_wait.as_ref().map(client::StopWait::remaining);
+        let within = |bound: Duration| left.map_or(bound, |left| bound.min(left));
+        let connected =
+            client::connect_or_start(&socket, start_daemon, within(Duration::from_secs(5)));
         let mut stream = match connected {
             Ok(stream) => stream,
             Err(_)
@@ -103,7 +107,12 @@ pub(crate) async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         };
         // Serve registers in place and never waits for a checkout's index work
         // (Decision 0009 §6).
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // The read bound is taken after the connect, from what is left then.
+        let left = stop_wait.as_ref().map(client::StopWait::remaining);
+        let read_bound = left.map_or(Duration::from_secs(10), |left| {
+            left.min(Duration::from_secs(10))
+        });
+        stream.set_read_timeout(Some(read_bound))?;
         protocol::write_frame(&mut stream, &registration)?;
         let reply: protocol::Reply = protocol::read_frame(&mut stream)
             .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;

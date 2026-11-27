@@ -41,38 +41,102 @@ pub(super) fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value>
 
 /// Send `request`, waiting out an explicit daemon stop (#1293): a
 /// `daemon_stopping` answer was given before admission, so even a mutation is
-/// sent again, to the successor, within the stop wait (60 s; `trellis api`
-/// keeps its own 25 s bound). Progress goes to stderr every 10 s. Only an
-/// attempt that never wrote (`daemon_unavailable`) is retried inside the wait.
+/// sent again, to the successor. One deadline covers the whole wait (60 s;
+/// `trellis api` keeps its own 25 s bound for the whole call), and every
+/// attempt inside it gets only what is left for its connect and its reply.
+/// Progress goes to stderr every 10 s. Only an attempt that never wrote
+/// (`daemon_unavailable`) is retried, so an ambiguous mutation is never replayed.
 pub(crate) fn send_daemon(
     request: &protocol::Request,
     read_only: bool,
 ) -> Result<serde_json::Value> {
-    let bound = if request.operation == "api" {
-        CLI_API_REPLY_BOUND.min(client::STOP_WAIT)
-    } else {
-        client::STOP_WAIT
-    };
+    let started = Instant::now();
+    let api_deadline = (request.operation == "api").then(|| started + reply_bound(request));
     let mut stop_wait: Option<client::StopWait> = None;
     loop {
-        let reply = send_daemon_once(request, read_only);
-        let stopping = match &reply {
-            Ok(reply) => protocol::is_stopping(&reply.payload),
-            Err(error) => stop_wait.is_some() && error.to_string() == "daemon_unavailable",
-        };
-        if stopping
-            && stop_wait
-                .get_or_insert_with(|| client::StopWait::new(bound))
-                .pause(&mut client::stderr_progress)
-        {
-            continue;
+        let reply = send_daemon_once(request, read_only, stop_wait.as_ref());
+        match (&reply, stop_wait.as_ref()) {
+            (Ok(reply), _) if protocol::is_stopping(&reply.payload) => {}
+            (Err(error), Some(_)) if error.to_string() == "daemon_unavailable" => {}
+            // An attempt the wait's own deadline cut off ends the wait as the stop
+            // it was waiting out. An ambiguous mutation keeps `outcome_unknown`.
+            (Err(error), Some(wait))
+                if wait.expired() && error.to_string() != "outcome_unknown" =>
+            {
+                anyhow::bail!("{}", protocol::DAEMON_STOPPING_MESSAGE);
+            }
+            _ => return checked_reply(reply?),
         }
-        return checked_reply(reply?);
+        let wait = stop_wait.get_or_insert_with(|| {
+            client::StopWait::until(
+                api_deadline.unwrap_or_else(|| Instant::now() + stop_wait_bound()),
+            )
+        });
+        if !wait.pause(&mut client::stderr_progress) {
+            return checked_reply(reply?);
+        }
     }
 }
 
-fn send_daemon_once(request: &protocol::Request, read_only: bool) -> Result<protocol::Reply> {
+/// How long a CLI command waits out a stop; a fixture may shorten it.
+fn stop_wait_bound() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(bound) = metrics_test_duration("TRELLIS_TEST_CLI_STOP_WAIT_MS") {
+        return bound;
+    }
+    client::STOP_WAIT
+}
+
+/// How long one attempt waits on a silent daemon per socket read.
+fn reply_bound(request: &protocol::Request) -> Duration {
+    // Index replies only once its request is terminal, which takes as long as
+    // the checkout needs (#179). Its bound is a liveness backstop: a checkout
+    // Trellis cannot index within it is a performance defect to fix. On
+    // expiry the requests.db row stays the answer.
+    let index_bound = INDEX_REPLY_BOUND;
+    #[cfg(feature = "test-support")]
+    let index_bound =
+        metrics_test_duration("TRELLIS_TEST_INDEX_REPLY_BOUND_MS").unwrap_or(index_bound);
+    let cli_bound = CLI_REPLY_BOUND;
+    #[cfg(feature = "test-support")]
+    let cli_bound = metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(cli_bound);
+    // The settled wait's own bound is the hang backstop.
+    #[cfg(feature = "test-support")]
+    let cli_bound = if request.operation == "settled_for_tests" {
+        trellis::testing::HANG_BACKSTOP + Duration::from_secs(30)
+    } else {
+        cli_bound
+    };
+    if request.operation == "producer_run" {
+        // The run's own timeout, plus the termination grace and the import's wait.
+        let timeout_secs = request.payload["args"]["limits"]["timeoutSecs"]
+            .as_u64()
+            .unwrap_or(1800)
+            .min(14400);
+        Duration::from_secs(timeout_secs + 630)
+    } else if matches!(
+        request.operation.as_str(),
+        "index" | "semantic_import" | "producer_pickup" | "gc_run"
+    ) {
+        index_bound
+    } else if request.operation == "api" {
+        cli_bound.min(CLI_API_REPLY_BOUND)
+    } else {
+        cli_bound
+    }
+}
+
+/// One attempt. Inside a stop wait its connect and every reply read are
+/// bounded by what is left of the wait.
+fn send_daemon_once(
+    request: &protocol::Request,
+    read_only: bool,
+    stop_wait: Option<&client::StopWait>,
+) -> Result<protocol::Reply> {
     let socket = socket_path()?;
+    let budget = stop_wait.map(client::StopWait::remaining);
+    // Read afresh at every connect, so a retry inside the attempt gets only what is left.
+    let within = |bound: Duration| stop_wait.map_or(bound, |wait| bound.min(wait.remaining()));
     if request.operation == "metrics" {
         let started = Instant::now();
         let ingress_window = Duration::from_secs(20);
@@ -94,6 +158,10 @@ fn send_daemon_once(request: &protocol::Request, read_only: bool) -> Result<prot
         let transfer_window = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_TRANSFER_MS")
             .unwrap_or(transfer_window);
         let end = ingress + work + error_window + transfer_window;
+        let (ingress, end) = match budget {
+            Some(left) => (ingress.min(started + left), end.min(started + left)),
+            None => (ingress, end),
+        };
         let reply = client::call_metrics(request, ingress, end, |timeout| {
             client::connect_or_start_metrics(
                 || std::os::unix::net::UnixStream::connect(&socket),
@@ -104,53 +172,20 @@ fn send_daemon_once(request: &protocol::Request, read_only: bool) -> Result<prot
         .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
         return Ok(reply);
     }
-    // Index replies only once its request is terminal, which takes as long as
-    // the checkout needs (#179). Its bound is a liveness backstop: a checkout
-    // Trellis cannot index within it is a performance defect to fix. On
-    // expiry the requests.db row stays the answer.
-    let index_bound = INDEX_REPLY_BOUND;
-    #[cfg(feature = "test-support")]
-    let index_bound =
-        metrics_test_duration("TRELLIS_TEST_INDEX_REPLY_BOUND_MS").unwrap_or(index_bound);
-    let cli_bound = CLI_REPLY_BOUND;
-    #[cfg(feature = "test-support")]
-    let cli_bound = metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(cli_bound);
-    // The settled wait's own bound is the hang backstop.
-    #[cfg(feature = "test-support")]
-    let cli_bound = if request.operation == "settled_for_tests" {
-        trellis::testing::HANG_BACKSTOP + Duration::from_secs(30)
-    } else {
-        cli_bound
-    };
-    let reply_bound = if request.operation == "producer_run" {
-        // The run's own timeout, plus the termination grace and the import's wait.
-        let timeout_secs = request.payload["args"]["limits"]["timeoutSecs"]
-            .as_u64()
-            .unwrap_or(1800)
-            .min(14400);
-        Duration::from_secs(timeout_secs + 630)
-    } else if matches!(
-        request.operation.as_str(),
-        "index" | "semantic_import" | "producer_pickup" | "gc_run"
-    ) {
-        index_bound
-    } else if request.operation == "api" {
-        cli_bound.min(CLI_API_REPLY_BOUND)
-    } else {
-        cli_bound
-    };
+    let reply_bound = reply_bound(request);
+    let connect_bound = || within(Duration::from_secs(5));
     let mut first = Some(
-        client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
+        client::connect_or_start(&socket, start_daemon, connect_bound())
             .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?,
     );
     let reply = client::call(request, read_only, || {
         let stream = if let Some(stream) = first.take() {
             stream
         } else {
-            client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))?
+            client::connect_or_start(&socket, start_daemon, connect_bound())?
         };
-        stream.set_read_timeout(Some(reply_bound))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(within(reply_bound)))?;
+        stream.set_write_timeout(Some(connect_bound()))?;
         Ok(stream)
     })
     .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
