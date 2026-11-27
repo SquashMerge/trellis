@@ -723,7 +723,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 34
+                  "const": 35
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -7273,6 +7273,14 @@
                 "stale",
                 null
               ]
+            },
+            "bindingMatch": {
+              "enum": [
+                "boundHere",
+                "pointsHere",
+                "pointsElsewhere",
+                "noTarget"
+              ]
             }
           },
           "required": [
@@ -7293,7 +7301,8 @@
             "freshness",
             "staleBecause",
             "projection",
-            "historicalFreshness"
+            "historicalFreshness",
+            "bindingMatch"
           ],
           "type": "object"
         },
@@ -8118,6 +8127,30 @@
                 },
                 "boundElsewhereOmitted": {
                   "$ref": "#/$defs/UInt"
+                },
+                "bindingMatches": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "boundHere": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "pointsHere": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "pointsElsewhere": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "noTarget": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "boundHere",
+                    "pointsHere",
+                    "pointsElsewhere",
+                    "noTarget"
+                  ]
                 }
               },
               "required": [
@@ -8128,7 +8161,8 @@
                 "documents",
                 "scopeCoverage",
                 "stableLookupKey",
-                "semanticDocuments"
+                "semanticDocuments",
+                "bindingMatches"
               ],
               "type": "object"
             },
@@ -8327,7 +8361,7 @@
       ],
       "type": "object"
     },
-    "description": "Find call sites whose callee name matches one declaration (name match, not proof), each annotated with its semantic binding where one is selected. Callers whose fresh direct binding targets another same-name declaration are left out and counted in `boundElsewhereOmitted`. Default limit 6 (max 50); production callers first. Each distinct semantic basis appears once in `semanticBases`; `compact:true` omits bindings, coverage and provenance, so 50 callers fit easily."
+    "description": "Find call sites whose callee name matches one declaration (name match, not proof), each annotated with its semantic binding where one is selected. Callers whose fresh direct binding targets another same-name declaration are left out and counted in `boundElsewhereOmitted`. Each caller's `bindingMatch` says whether its binding is proven here (`boundHere`), names this or another declaration without proof (`pointsHere`, `pointsElsewhere`) or names none (`noTarget`); `bindingMatches` counts the listed callers per tag. Default limit 6 (max 50); production callers first. Each distinct semantic basis appears once in `semanticBases`; `compact:true` omits bindings, coverage and provenance, so 50 callers fit easily."
   },
   {
     "annotations": {

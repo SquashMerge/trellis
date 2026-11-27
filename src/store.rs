@@ -47,8 +47,9 @@ pub use semantic_display::set_architecture_semantic_rows_for_tests;
 #[cfg(feature = "test-support")]
 pub(crate) use semantic_display::status_semantic_projections_on_thread_for_tests;
 pub use semantic_display::{
-    ArchitectureSemanticCounts, AutoRunLabels, CallSemantic, CoverageDocument, LanguagePending,
-    LanguageTier, McpSemantic, ProducerNotPublished, ProducerSelection, relabel_status,
+    ArchitectureSemanticCounts, AutoRunLabels, BindingMatch, CallSemantic, CoverageDocument,
+    LanguagePending, LanguageTier, McpSemantic, ProducerNotPublished, ProducerSelection,
+    relabel_status,
 };
 #[cfg(feature = "test-support")]
 pub use semantic_display::{

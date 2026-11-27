@@ -241,7 +241,9 @@ From the v0.1.0 eight-task MCP dogfood run (2026-11-05). `toolVersion` is **9**
     The field is absent when nothing is excluded, and that response is
     unchanged.
   - `match` (basis `name`, `sameNameDeclarations`, limitations) is unchanged.
-    Unbound callers can still call another same-name declaration. Exclusion
+    Unbound callers can still call another same-name declaration; since the
+    [#994 amendment](#amendment-994-incoming-callers-say-what-their-binding-says)
+    each listed caller says what its binding names. Exclusion
     adds no warning and does not by itself set `partial`. Outgoing calls and
     the call graph are unchanged.
 - **Bounded graph spellings.** `trellis_call_graph` clips each edge call's
@@ -1007,7 +1009,7 @@ Include test callers and self-recursion. Sort by `(callerRole production before 
 
 The caller list is **required**, not optional hints. After sorting, consider at most limit plus one eligible item for limit detection; emit the longest prefix that fits the complete 65,536-byte JSON-RPC response line including structured content, summary and LF. Recompute emitted-only document refs and mandatory selected-owner-plus-caller coverage/provenance closure for each prefix; never trim proof or scope coverage to make room. More eligible items than `limit` with every limited item fitting sets `truncated:true,truncationReason:"limit"`; dropping any limited required caller to fit sets `truncated:true,truncationReason:"response_bytes"`, which outranks `limit`. Truncation sets `partial:true`, but adds no warning. If the fixed empty-prefix envelope cannot fit, or the first required item with its complete token and proof closure cannot fit, fail `range_too_large`, not a falsely green empty list. The five-second deadline starts at protocol acceptance and includes validation, read admission/materialization and send decision; existing cancellation and typed-error precedence apply. A success summary uses `trellis_incoming_calls: N calls[, truncated: <reason>]; full result in structuredContent.` with singular `call` for one.
 
-When #59's exact semantic tier is implemented it amends **this same tool's** closed input and output with `matchedBy:"binding"` and a semantic match basis. #59's #40/#41/#58 prerequisites remain required for that later tier. The #467 amendment above already accepts `semanticProducerId` and fills each name-matched caller's binding fields; the "semantic producer selectors" rejection and fixed `binding:null` values in this section apply only when no producer is selected.
+When #59's exact semantic tier is implemented it amends **this same tool's** closed input and output with `matchedBy:"binding"` and a semantic match basis. #59's #40/#41/#58 prerequisites remain required for that later tier. The #467 amendment above already accepts `semanticProducerId` and fills each name-matched caller's binding fields; the "semantic producer selectors" rejection and fixed `binding:null` values in this section apply only when no producer is selected. The [#994 amendment](#amendment-994-incoming-callers-say-what-their-binding-says) adds `bindingMatch` to each item and `bindingMatches` to the data; every caller this section admits stays listed.
 
 ### `trellis_call_graph` (#40)
 
@@ -1474,3 +1476,22 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **Reserved.** `semantic producer does not cover this language; showing syntax` and `no semantic producer published; showing syntax` are only for a language with no such state that no published producer covers.
 - **Describe.** A `LanguageStatus.semantic.note` of a language without a selected producer follows the same labels, so describe and the call tools say the same thing.
 - **Unchanged.** A language with a selected producer has no coverage note: its older-basis, catching-up and needs-re-import documents stay labelled per item by `SemanticProjection` and in `semanticStatus`.
+
+## Amendment (#994): incoming callers say what their binding says
+
+**Status: owner ruling 2026-11-26 ([#994](https://github.com/SquashMerge/trellis/issues/994), option B).** `toolVersion` is **35** (previously 34, #1234).
+
+When a caller's binding is stale, possibly stale or absent, the [#724](#amendment-724-callers-bound-elsewhere-and-bounded-graph-spellings) exclusion cannot apply, and a page of name matches mixes callers of every same-name declaration. This amendment labels each listed caller with what its selected binding says. It removes, adds and reorders no caller.
+
+- **Item.** Each `IncomingItem` adds required `bindingMatch`, one of:
+  - `boundHere`: proven bound to the selected declaration, by the #724 test with the located `targetId` equal to the selected `symbolId` (effective freshness `fresh`, `boundaryReason:"none"`).
+  - `pointsHere`: otherwise, the binding's declared target is the internal selected `symbolId`, but it is not proven: stale or possibly stale, a `dispatch` or pending boundary, or a target not located in the admitted snapshot.
+  - `pointsElsewhere`: otherwise, the binding declares another internal declaration or an external symbol. A caller proven bound elsewhere is still left out and counted in `boundElsewhereOmitted`.
+  - `noTarget`: no selected binding (including every caller of a language without a selected producer), or a binding that declares no single target (`ambiguous` or `unresolved`, whatever its candidates).
+
+  The tests apply in that order, and depend only on the call's selected binding (the shared #466 reader) and the selected `symbolId`. Neither `pointsHere` nor `pointsElsewhere` is proof: the binding may be out of date.
+- **Counts.** Data adds required `bindingMatches:{boundHere:UInt,pointsHere:UInt,pointsElsewhere:UInt,noTarget:UInt}`, the emitted callers per tag. The four sum to `callers.length`. Callers past `limit` or the byte fit are not counted, as they are not listed. An empty page counts zero of each.
+- **Order.** Ranking is unchanged. Ranking by tag would need every name match's binding before the page is chosen, while the #724 scan reads bindings one ranked row at a time and stops at the first kept caller beyond `limit`.
+- **Compact.** `compact:true` keeps both fields.
+- **Catalog.** The `trellis_incoming_calls` output schema adds the required item property and the required data property, and its description names them; the `toolVersion` constant changes. The `tools/list` frame grows by 654 bytes, under the unchanged 235,520-byte compacted bound. Option D (narrowing by a measured call qualifier) is a separate 0.3 issue.
+- **Unchanged.** The name admission rules, `match`, the #724 exclusion and `boundElsewhereOmitted`, warnings, `partial`, the summary text, every other tool, and every bound and MCP budget.

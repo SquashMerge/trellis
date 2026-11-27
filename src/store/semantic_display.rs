@@ -177,6 +177,59 @@ impl CallSemantic {
     }
 }
 
+/// #994 (owner ruling 2026-11-26, option B): what a name-matched caller's selected binding
+/// says about the selected declaration. It labels a listed caller and never removes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingMatch {
+    /// Proven to `selected`: the #724 test with the located target equal to it.
+    BoundHere,
+    /// The binding's declared target is `selected`, but it is not proven: stale or possibly
+    /// stale, a dispatch or pending boundary, or a target not located in this snapshot.
+    PointsHere,
+    /// The binding's declared target is another declaration or an external symbol, and it
+    /// is not proven bound elsewhere (#724 leaves those out).
+    PointsElsewhere,
+    /// No selected binding, or one that names no single target (ambiguous or unresolved).
+    NoTarget,
+}
+
+impl BindingMatch {
+    pub const ALL: [Self; 4] = [
+        Self::BoundHere,
+        Self::PointsHere,
+        Self::PointsElsewhere,
+        Self::NoTarget,
+    ];
+
+    pub fn of(bound: Option<&CallSemantic>, selected: &str) -> Self {
+        let Some(bound) = bound else {
+            return Self::NoTarget;
+        };
+        if bound.boundary_reason == BoundaryReason::None
+            && bound.effective_freshness == sem::Freshness::Fresh
+            && bound.target_id.as_deref() == Some(selected)
+        {
+            return Self::BoundHere;
+        }
+        match &bound.binding.declared_target {
+            Some(sem::Target::Internal { syntax_id, .. }) if syntax_id == selected => {
+                Self::PointsHere
+            }
+            Some(_) => Self::PointsElsewhere,
+            None => Self::NoTarget,
+        }
+    }
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::BoundHere => "boundHere",
+            Self::PointsHere => "pointsHere",
+            Self::PointsElsewhere => "pointsElsewhere",
+            Self::NoTarget => "noTarget",
+        }
+    }
+}
+
 /// Only `locate` is read by `call_disposition`; it checks an exact target's location.
 struct Locate<'a> {
     db: &'a Connection,
