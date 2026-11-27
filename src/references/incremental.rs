@@ -265,6 +265,7 @@ pub(super) fn prepare_with_workers(
                             Ok(None)
                         }
                     },
+                    None,
                     &keep,
                     &mut gaps,
                     check,
@@ -279,6 +280,7 @@ pub(super) fn prepare_with_workers(
                     limit,
                     RustSource::Fresh { keep: keeping },
                     &|i| syntax(docs[i]).map(Some),
+                    None,
                     &keep,
                     &mut gaps,
                     check,
