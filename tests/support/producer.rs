@@ -364,3 +364,55 @@ pub fn auto_run(checkout: &Checkout, producer: &str) -> Value {
         .unwrap()["autoRun"]
         .clone()
 }
+
+/// `trellis daemon stop` under `home`, returned once the stopping daemon's stop command has
+/// reached every checkout runtime (#1293): the daemon then connects to `hook`, which a test
+/// sets as `TRELLIS_TEST_DAEMON_STOP_SOCKET`. Held work released after this sees the stop.
+pub fn stop_reaching_runtimes(
+    home: &Path,
+    hook: &std::os::unix::net::UnixListener,
+) -> std::process::Child {
+    use std::io::Read;
+    let stop = cli(home)
+        .args(["daemon", "stop"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook.set_nonblocking(true).unwrap();
+    let mut arrived = None;
+    trellis::testing::wait_until("the stop command reaches the runtimes", || {
+        arrived = hook.accept().ok().map(|(stream, _)| stream);
+        arrived.is_some()
+    });
+    // fcntl, unlike SO_RCVTIMEO, succeeds once the notifying peer has closed (#625).
+    let mut stream = arrived.unwrap();
+    stream.set_nonblocking(false).unwrap();
+    let mut byte = [0];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"S");
+    stop
+}
+
+/// The accepted request `id`'s state, read after the daemon has exited.
+pub fn request_state(checkout: &Checkout, id: &str) -> Option<String> {
+    request_rows(checkout)
+        .into_iter()
+        .find(|(row, _, _)| row == id)
+        .map(|(_, state, _)| state)
+}
+
+/// `child`'s output once it exits, panicking (after killing it) if it outlives the hang
+/// backstop instead of hanging the test.
+pub fn output_within_backstop(mut child: std::process::Child, what: &str) -> std::process::Output {
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} did not exit (hang)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}

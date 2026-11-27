@@ -1193,9 +1193,10 @@ async fn run_daemon() -> Result<()> {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
     if stop.is_some() {
-        registry::CheckoutRegistry::cancel_producers(registry.clone()).await?;
         // An explicit stop cancels accepted work instead of draining it
-        // (#1293): connection waits on that work end with it.
+        // (#1293). The stop command goes first, before anything that can wait
+        // on in-flight work: a pickup or producer-run import wait ends on it,
+        // and so does every connection wait.
         registry::CheckoutRegistry::request_stop(registry.clone()).await;
         #[cfg(feature = "test-support")]
         if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STOP_SOCKET") {
@@ -1204,6 +1205,7 @@ async fn run_daemon() -> Result<()> {
                 let _ = hook.write_all(b"S");
             }
         }
+        registry::CheckoutRegistry::cancel_producers(registry.clone()).await?;
     }
     stop_daemon_connections(&browser_shutdown, &mut connections).await;
     browser.lock().await.finish_owned().await?;
