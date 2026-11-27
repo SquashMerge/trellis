@@ -229,32 +229,17 @@ pub(crate) fn stop_existing_daemon() -> Result<serde_json::Value> {
         .context("daemon_unavailable: stop completion not received")?;
     ensure!(reply.id == request.id, "invalid daemon stop reply");
     if protocol::is_stopping(&reply.payload) {
-        // Another stop is under way: wait, bounded, until that owner is gone (#1293).
+        // Another stop is under way: wait, on one owning deadline, until a
+        // release is observed (#1293).
         drop(stream);
         let mut stop_wait = client::StopWait::new(client::STOP_WAIT);
-        while owner_stopping(&socket_path()?) {
-            if !stop_wait.pause(&mut client::stderr_progress) {
-                anyhow::bail!("{}", protocol::DAEMON_STOPPING_MESSAGE);
-            }
-        }
+        client::wait_for_stopping_owner(
+            &socket_path()?,
+            &mut stop_wait,
+            &mut client::stderr_progress,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
         return Ok(serde_json::json!({"stopped": false}));
     }
     checked_reply(reply)
-}
-
-/// Whether the daemon at `socket` answers a no-op request `daemon_stopping`.
-fn owner_stopping(socket: &std::path::Path) -> bool {
-    use std::os::unix::net::UnixStream;
-    (|| -> std::io::Result<bool> {
-        let mut stream = UnixStream::connect(socket)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        protocol::write_frame(
-            &mut stream,
-            &daemon_request("daemon_probe", serde_json::json!({})),
-        )?;
-        let reply: protocol::Reply = protocol::read_frame(&mut stream)?;
-        Ok(protocol::is_stopping(&reply.payload))
-    })()
-    .unwrap_or(false)
 }

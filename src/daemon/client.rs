@@ -186,6 +186,78 @@ pub fn connect_or_start_until(
     }
 }
 
+/// What one probe of a stopping owner observed.
+enum OwnerProbe {
+    /// The owner still answers `daemon_stopping`.
+    Stopping,
+    /// The owner has released: nothing listens, or a successor answered.
+    Released,
+}
+
+/// One no-op request to the daemon at `socket`, within `deadline`.
+fn probe_owner(socket: &Path, deadline: Instant) -> io::Result<OwnerProbe> {
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(OwnerProbe::Released);
+        }
+        Err(error) => return Err(error),
+    };
+    let request = Request {
+        id: 1,
+        operation: "daemon_probe".into(),
+        payload: serde_json::json!({}),
+    };
+    protocol::write_frame_until(&mut stream, &request, deadline)?;
+    let reply: Reply = protocol::read_frame_until(&mut stream, deadline)?;
+    Ok(if protocol::is_stopping(&reply.payload) {
+        OwnerProbe::Stopping
+    } else {
+        OwnerProbe::Released
+    })
+}
+
+/// A second `trellis daemon stop` waits for the stop already under way (#1293).
+/// `Ok` only once a release was observed. Every probe runs on the wait's owning
+/// deadline, checked before and after it; expiry is the typed `daemon_stopping`,
+/// and a probe that fails is a typed `daemon_unavailable`, never a release.
+pub fn wait_for_stopping_owner(
+    socket: &Path,
+    wait: &mut StopWait,
+    progress: &mut dyn FnMut(String),
+) -> io::Result<()> {
+    let stopping = || io::Error::other(protocol::DaemonStopping);
+    loop {
+        if wait.expired() {
+            return Err(stopping());
+        }
+        let probe = probe_owner(
+            socket,
+            wait.deadline().min(Instant::now() + Duration::from_secs(2)),
+        );
+        if wait.expired() {
+            return Err(stopping());
+        }
+        match probe {
+            Ok(OwnerProbe::Released) => return Ok(()),
+            Ok(OwnerProbe::Stopping) => {}
+            Err(_) => {
+                return Err(io::Error::other(
+                    "daemon_unavailable: the stopping daemon did not answer its probe",
+                ));
+            }
+        }
+        if !wait.pause(progress) {
+            return Err(stopping());
+        }
+    }
+}
+
 /// Metrics uses the caller's remaining ingress budget, capped at five seconds.
 /// Start the attempt clock before the first connect or daemon election; a
 /// late successful connect/start never admits a request.
@@ -1953,6 +2025,56 @@ mod cancellation_tests {
             result.is_err(),
             "a connection made after the deadline was accepted"
         );
+    }
+
+    /// #1293 review: a second `daemon stop` waiting for a stop under way reports a failed
+    /// probe as a typed failure, never as an observed release.
+    #[test]
+    fn a_failed_probe_of_a_stopping_owner_is_not_a_release() {
+        use super::*;
+        let dir = tempfile::Builder::new()
+            .prefix("t1293-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let closer = std::thread::spawn(move || {
+            // Accept the probe and close without an answer.
+            drop(crate::testing::accept_within_backstop(&listener));
+        });
+        let mut wait = StopWait::new(crate::testing::HANG_BACKSTOP);
+        let result = wait_for_stopping_owner(&socket, &mut wait, &mut |_| {});
+        closer.join().unwrap();
+        let error = result.expect_err("a failed probe was taken for a release");
+        assert!(
+            error.to_string().starts_with("daemon_unavailable"),
+            "{error}"
+        );
+    }
+
+    /// #1293 review: the probes run on the wait's owning deadline; a probe the owner never
+    /// answers ends the wait typed `daemon_stopping` at the deadline, not as a release.
+    #[test]
+    fn a_second_stop_wait_ends_typed_at_its_deadline() {
+        use super::*;
+        let dir = tempfile::Builder::new()
+            .prefix("t1293-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // Accept the probe and hold it unanswered until the wait has ended.
+            let _held = crate::testing::accept_within_backstop(&listener);
+            let _ = finished.recv_timeout(crate::testing::HANG_BACKSTOP);
+        });
+        let mut wait = StopWait::new(Duration::from_millis(200));
+        let result = wait_for_stopping_owner(&socket, &mut wait, &mut |_| {});
+        done.send(()).unwrap();
+        holder.join().unwrap();
+        let error = result.expect_err("an unanswered probe was taken for a release");
+        assert!(protocol::stopping_error(&error), "{error}");
     }
 
     #[test]
