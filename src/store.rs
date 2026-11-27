@@ -1755,7 +1755,6 @@ impl EvidenceResponse {
             mut snapshot,
             regions,
             tables,
-            native_revision,
         } = self.architecture_native_read(pin, kept.as_deref_mut(), check, progress)?;
         match self.architecture_fingerprints(&mut snapshot, &tables, check) {
             Ok(fingerprints) => Ok((snapshot, regions, fingerprints, tables)),
@@ -1765,7 +1764,6 @@ impl EvidenceResponse {
                 if let Some(kept) = kept
                     && let Some(back) = KeptNative::of(
                         snapshot.pin.index_generation,
-                        native_revision,
                         std::mem::take(&mut snapshot.documents),
                         regions,
                         tables,
@@ -2399,17 +2397,12 @@ impl EvidenceResponse {
                 }),
             "store_unavailable: architecture decode inventory"
         );
-        let (kept_revision, mut kept_documents) = kept
-            .map(|kept| {
-                (
-                    std::mem::take(&mut kept.native_revision),
-                    std::mem::take(&mut kept.documents),
-                )
-            })
+        let mut kept_documents = kept
+            .map(|kept| std::mem::take(&mut kept.documents))
             .unwrap_or_default();
         let mut fetched_documents = fetched_documents.into_iter();
         for ((key, decode), table) in pending.into_iter().zip(&tables) {
-            let Some(mut document) = decode
+            let Some(document) = decode
                 .is_none()
                 .then(|| kept_documents.remove(&key))
                 .flatten()
@@ -2427,13 +2420,10 @@ impl EvidenceResponse {
                 });
                 continue;
             };
-            document.rebase(
-                &kept_revision,
-                &native_revision,
-                &table.identity.producer_id,
-            );
-            regions.push(document.regions);
-            documents.push(document.input);
+            let (input, kept_regions) =
+                document.restore(&native_revision, &table.identity.producer_id);
+            regions.push(kept_regions);
+            documents.push(input);
         }
         Ok(NativeRead {
             snapshot: crate::architecture_inputs::Snapshot {
@@ -2446,7 +2436,6 @@ impl EvidenceResponse {
             },
             regions,
             tables,
-            native_revision,
         })
     }
 
@@ -10782,7 +10771,9 @@ fn fetch_native_declarations_v8(
                 });
         }
         let proof = scope.proof_id();
-        let mut result = Vec::new();
+        // One row per declaration: exact capacity, since an Architecture owner keeps these
+        // rows between builds (#1313).
+        let mut result = Vec::with_capacity(rows6.len());
         let mut recorded_owners: BTreeMap<String, Option<String>> = BTreeMap::new();
         for row in rows6 {
             optional_hint_check(progress)?;
@@ -11043,7 +11034,8 @@ fn fetch_native_calls_v8(
             region_owner.insert(id, owner);
         }
         let proof = scope.proof_id();
-        let mut calls: Vec<Call> = vec![];
+        // One row per call: exact capacity, as for declarations (#1313).
+        let mut calls: Vec<Call> = Vec::with_capacity(rows2.len());
         let mut indexes: BTreeMap<String, usize> = BTreeMap::new();
         let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
         for row in rows2 {
@@ -11186,7 +11178,8 @@ fn fetch_native_control_regions_v8(
             known.insert(row);
         }
         let proof = scope.proof_id();
-        let mut regions = Vec::<ControlRegion>::new();
+        // One row per region: exact capacity, as for declarations (#1313).
+        let mut regions = Vec::<ControlRegion>::with_capacity(rows1.len());
         let mut indexes = BTreeMap::<String, usize>::new();
         let mut ordinals = BTreeMap::<String, usize>::new();
         for row in rows1 {
