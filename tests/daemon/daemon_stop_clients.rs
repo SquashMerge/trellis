@@ -301,11 +301,23 @@ impl StoppingDaemon {
         use trellis::daemon::protocol;
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
             let mut held = Vec::new();
-            for (index, stream) in listener.incoming().enumerate() {
-                let Ok(mut stream) = stream else { return };
+            let deadline = Instant::now() + HANG_BACKSTOP;
+            let mut index = 0;
+            while Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                stream.set_nonblocking(false).unwrap();
                 let delay = if index == 0 { Some(first) } else { later };
+                index += 1;
                 let Some(delay) = delay else {
                     held.push(stream);
                     continue;

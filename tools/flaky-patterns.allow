@@ -193,3 +193,5 @@ speed-assert src/store/rebuild_in_progress_tests.rs a_read_held_past_the_spill_b
 
 # short-read-timeout: the timeout is the value under test
 short-read-timeout tests/daemon/daemon_cli.rs client_read_timeout_does_not_retry_but_connect_failure_does -- the client's own read timeout must fire; the test asserts that a timed-out read is not retried
+speed-assert tests/daemon/daemon_stop_clients.rs a_cli_stop_wait_ends_at_its_bound_when_an_attempt_would_outlive_it -- the stop wait's bound is the value under test (#1293 review): the outcome is daemon_stopping either way, only the elapsed time tells a bounded wait from one an attempt outlived
+speed-assert tests/daemon/daemon_stop_clients.rs trellis_api_keeps_its_own_bound_through_a_stop_wait -- trellis api's whole-call bound is the value under test (#1293 review): the outcome is daemon_stopping either way, only the elapsed time tells a bounded wait from one each retry restarted
