@@ -80,7 +80,9 @@ cargo run --locked --release --features test-support,metal \
 Run it for the chosen form `c` and `queries` on **both CPU and Metal**. Forms `a`
 and `b` are optional diagnostics, not acceptance gates. Prepare inputs directly from current
 `results/cards.jsonl` and `eval/queries.json`, preserving their line/array order. Use the
-**current** `results/emb` arrays, not older result directories.
+**current** `results/emb` arrays, not older result directories. The evidence root, its location,
+its manifest and how to rebuild it are in
+[semantic-search-eval/README.md](semantic-search-eval/README.md#parity-reference-corpus).
 
 The offline checker uses NumPy in the evaluation's own Python environment; Python only
 analyzes vectors and does not load or run the model:
@@ -144,8 +146,24 @@ The full-corpus utility/checker, not this seven-row test, supplies the all-card 
 
 ## Observed results
 
-These results were measured on Candle 0.11.0; the full-corpus run has not been repeated on
-0.11.1.
+### Restored reference, Candle 0.11.1 (#1323)
+
+The reference corpus was rebuilt after the original evidence root was lost; see
+[semantic-search-eval/README.md](semantic-search-eval/README.md#parity-reference-corpus). Its
+cards and all four reference arrays are byte-identical to the pre-loss pins. The full form-`c`
+run was repeated on main at `a1ed290b` (Candle 0.11.1, with #1287's bf16 token table),
+serial batches of 16, f32, inputs in saved order:
+
+| Backend | Result | Minimum card cosine | Full-vector R@5 / R@10 / MRR (reference 0.44 / 0.56 / 0.28623468) | Query minimum cosine |
+| --- | --- | --- | --- | --- |
+| Metal | pass | 0.99964637 | 0.44 / 0.56 / 0.28934607 | 0.99993938 |
+| CPU | pass | 0.99964625 | 0.44 / 0.56 / 0.28934607 | 0.99993938 |
+
+Every card is at or above 0.999 and recall@10 and MRR don't regress on either backend. The
+values equal the Candle 0.11.0 results below. Combined 1024/int8 on both documents and queries
+measured 0.48 / 0.60 / 0.29600597 on both backends (diagnostic).
+
+### Candle 0.11.0 (#211 slice 1)
 
 Release Metal inference covered all **6,722 cards in each form (`a`, `b`, `c`)**
 and 50 queries. Every card exceeded cosine 0.999:
@@ -173,8 +191,9 @@ Full-vector recall@5/10 and MRR were **0.44/0.56/0.28934607**.
 CPU forms `a` and `b` were not run; no claim about those forms follows from `c`.
 
 The source, binary, model, input and output hashes, ordered-ID restoration and full
-per-card/per-query reports are local in
-`~/projects/odin/trellis-evidence/issue-211/`. CPU and Metal seven-row model checks
+per-card/per-query reports were local in
+`~/projects/odin/trellis-evidence/issue-211/`, which was lost with the reference corpus.
+CPU and Metal seven-row model checks
 and explicit real-model fixture tests passed separately. The first full `./tools/verify` passed
 on Rust 1.99.1: all five lanes passed, including 1,510 Rust tests (7 skipped).
 Format checks, default/test-support clippy and separate Metal all-target clippy passed.

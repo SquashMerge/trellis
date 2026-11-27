@@ -36,7 +36,7 @@ MODEL = "voyage-4-nano"
 SOURCE_HASHES = {
     "results/cards.jsonl": "4ca5a9d3588944094ad2e7ee12a454b60498a3ffff7783d78ee99cb4eb28abe0",
     "eval/queries.json": "b4cf25fbfd7ba8b91c7c49f11a558de6defe4d78f22642a1ef9249eaa13e5e55",
-    "results/eval.json": "843a191d9a4fef6dd1bf975be5d04182e6fe71fe341bcb0e2a1d3fab756ea9e0",
+    "results/eval.json": "78af93939d742974af8b2a4c5bf9b61aac2b24d0236f8f42908f6fe1adcf318f",  # #1323: voyage-4-nano only
     "scripts/evaluate.py": "1a76389a368fc823c6ba68f1ac206ca345cc11cedb15179cc041798322e41b1d",
     "results/emb/voyage-4-nano.a.docs.npy": "4c80fc0658344ae5427427fc21186087edc0b235896502090ee3b874d4bc0c3d",
     "results/emb/voyage-4-nano.b.docs.npy": "1e6757ed955de1d7b2816b98e2031b14f65dd8f1363a49bfe3938ad03a102529",
@@ -47,6 +47,8 @@ ORDER_HASHES = {
     "documents": "87d8f149103449876e5bf781c20ed96f6d7ee2736c1b5eb538f7d20ede1db1dd",
     "queries": "7cbc016b8ab034ddca29ded94454cff6c2db555046b7ed98bd092a62cf97107f",
 }
+# The #1323 verified-download manifest; see docs/semantic-search-eval/reference-corpus.json.
+MODEL_PIN_MANIFEST_SHA256 = "84605f14234fa5e0388a96127eea9bd4de91c6c9298a4d80872212ae1b3371be"
 
 
 class InvalidInput(ValueError):
@@ -452,6 +454,28 @@ def self_test():
     return 0
 
 
+def verify_reference(root, model_pin_manifest):
+    """Release-checklist presence check: every pinned reference input exists with its pinned hash."""
+    problems = []
+    pinned = {**{root / name: digest for name, digest in SOURCE_HASHES.items()},
+              model_pin_manifest: MODEL_PIN_MANIFEST_SHA256}
+    for path, expected in pinned.items():
+        if not path.is_file():
+            problems.append(f"missing: {path}")
+        elif sha256(path) != expected:
+            problems.append(f"changed: {path}")
+    if not problems:
+        cards = read_jsonl(root / "results/cards.jsonl")
+        queries = json.loads((root / "eval/queries.json").read_text())["queries"]
+        if {"documents": id_order_hash([c["id"] for c in cards]),
+                "queries": id_order_hash([q["id"] for q in queries])} != ORDER_HASHES:
+            problems.append("saved ID order does not match current benchmark")
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    print("FAIL: reference corpus missing or changed" if problems else f"PASS: reference corpus present: {root}")
+    return 1 if problems else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-root", type=Path)
@@ -461,9 +485,15 @@ def main():
                         help="include c for acceptance; a/b are optional diagnostics (default: c)")
     parser.add_argument("--model-pin-manifest", type=Path)
     parser.add_argument("--self-test", action="store_true", help="run small offline synthetic checks; no model or saved corpus")
+    parser.add_argument("--verify-reference", action="store_true",
+                        help="only check that the saved reference corpus under --evidence-root is present and unchanged")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    if args.verify_reference:
+        if args.evidence_root is None or args.model_pin_manifest is None:
+            parser.error("--verify-reference requires --evidence-root and --model-pin-manifest")
+        return verify_reference(args.evidence_root, args.model_pin_manifest)
     for name in ("evidence_root", "candidate_dir", "output", "model_pin_manifest"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required unless --self-test is used")

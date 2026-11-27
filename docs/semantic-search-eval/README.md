@@ -186,3 +186,65 @@ The benchmark harness is local evidence, not part of the repository. In outline:
 3. Embed the cards with each local model, rank by cosine similarity, and score.
 
 The results and the recommendation are on #211.
+
+## Parity reference corpus
+
+The Candle parity check ([`semantic-search-candle.md`](../semantic-search-candle.md)) compares
+against a saved reference corpus: the 6,722 cards, the voyage-4-nano reference vectors and the
+saved evaluation. The corpus, the evaluation venv and the weights stay **outside Git**.
+[`reference-corpus.json`](reference-corpus.json) is its manifest: the source commit and index
+identity, the card and query hashes and ordered-ID hashes, the harness script hashes, the
+resolved Python packages, the vector and `eval.json` hashes, and the model pin manifest.
+`tools/semantic-search/check-parity.py` pins the same hashes.
+
+**Location.** On the owner's Mac the corpus is `~/projects/squashmerge/trellis-evidence/1323/reference/`,
+which is the `--evidence-root` for the checker. It holds `results/cards.jsonl`, `results/emb/`,
+`results/eval.json`, `eval/queries.json`, `scripts/`, `venv/`, `models/voyage-4-nano/` and
+`verified-download-manifest.json`.
+
+**History.** The original #214 evidence root was lost in November 2026 with no backup. #1323
+regenerated it by the original method. The four harness scripts were recovered verbatim from the
+#214 session record, and the Python packages were resolved as of the original install time.
+The result is byte-identical to the pins the checker held before the loss:
+`scripts/evaluate.py`, `results/cards.jsonl` and all four voyage-4-nano `.npy` arrays. Only
+`results/eval.json` is new: it was re-run for voyage-4-nano alone, without the other models'
+entries, which the checker never reads.
+
+### Rebuilding it
+
+Run every embedding step under the shared heavy-run lease. Never run the built `trellis` under
+your real `HOME`.
+
+1. **Indexer.** `git archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93` into a scratch directory
+   and build it with `cargo build --locked --release --bin trellis`.
+2. **Index.** The snapshot has no `.git`, so the source-set ID, and with it every `sid:v1` ID,
+   hashes the canonical workspace path. Extract the same snapshot at the original #214 path named
+   in the manifest's `inputs.workspaceRoot`, index it with
+   `HOME=<root>/home XDG_CACHE_HOME= trellis index --workspace <that path>`, stop the daemon it
+   started, and remove the path. The index's source set must equal `inputs.sourceSetId`.
+3. **Cards.** `venv/bin/python -I scripts/cards.py <index.db> results/cards.jsonl`. The output
+   must match `cards.sha256` byte for byte; if it doesn't, stop: the inputs differ.
+4. **Venv.** `uv venv --python 3.12 venv`, then `uv pip install --exclude-newer
+   2026-10-19T19:33:00Z` with the package list in `environment.resolution`. Check the resolved
+   versions against `environment.packages`.
+5. **Model.** `scripts/download.py <root>/models voyage-4-nano` fetches the evaluation pin
+   `433ece5e…`. The weight SHA-256 must equal the pin, and every file in the Candle runtime's
+   model directory must be byte-identical to the snapshot. Record both in
+   `verified-download-manifest.json`.
+6. **Vectors and evaluation.** Copy `docs/semantic-search-eval/queries.json` to
+   `eval/queries.json`, then run
+   `scripts/embed.py voyage-4-nano <root>/models results/cards.jsonl eval/queries.json results/emb a,b,c 512`
+   and `scripts/evaluate.py results/cards.jsonl eval/queries.json results/emb results/eval.json voyage-4-nano`
+   (MPS).
+7. **Pin it.** Update `reference-corpus.json` and the checker's `SOURCE_HASHES` together, and
+   re-run the CPU and Metal parity check against the new reference.
+
+A rebuild that doesn't reproduce the pinned vector hashes is a new reference, not a restore. It
+replaces the reference only with that complete CPU/Metal re-run recorded.
+
+To check that the corpus is present and unchanged (the release checklist item):
+
+```sh
+<root>/venv/bin/python tools/semantic-search/check-parity.py --verify-reference \
+  --evidence-root <root> --model-pin-manifest <root>/verified-download-manifest.json
+```
