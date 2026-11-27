@@ -1469,14 +1469,6 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **Catalog.** The `$defs/Kind` enum of `trellis_find_symbols`, `trellis_search_symbols`, `trellis_declaration`, `trellis_outgoing_calls`, `trellis_incoming_calls` and `trellis_call_graph` appends `variant`, and the `toolVersion` constant changes. The measured `tools/list` frame is 213,293 bytes modern and 213,236 legacy, 60 more than at `toolVersion` 33, under the unchanged 235,520-byte compacted-frame limit.
 - **Unchanged:** every other tool object, field and bound; no MCP budget changes. The browser's Files outline shows variants as members of their enum.
 
-## Amendment (#1293): daemon_stopping
-
-**Status: owner ruling 2026-11-26 ([#1293](https://github.com/SquashMerge/trellis/issues/1293)).** `toolVersion` is **35** (previously 34, #1234).
-
-- **Code.** Every tool's failure-code enum gains `daemon_stopping`, after `daemon_unavailable`: a call whose relay reconnect reached a daemon in an explicit stop ([local topology T03](local-topology.md#leader)). It is retryable, `currentBasis:null`, and nothing was admitted; the relay answers it within the call's own deadline instead of waiting for the stop, and a later call reaches the successor. `trellis mcp`'s launch attach waits up to 60 s for the stop instead.
-- **Catalog.** Only the failure-code enums and the `toolVersion` constant change. The measured `tools/list` frame is 213,527 bytes modern and 213,470 legacy, 234 more than at `toolVersion` 34, under the unchanged 235,520-byte compacted-frame limit.
-- **Unchanged:** every other tool object, field and bound; no MCP budget changes.
-
 ## Amendment (#1255): the coverage note names a pending language state
 
 **Status:** implemented (supervisor-ratified, #1255). It changes only the value of an existing message; no tool object, schema, field or bound changes, and `toolVersion` stays as it is.
@@ -1513,3 +1505,11 @@ When a caller's binding is stale, possibly stale or absent, the [#724](#amendmen
 - **Compact.** `compact:true` keeps both fields.
 - **Catalog.** The `trellis_incoming_calls` output schema adds the required item property and the required data property, and its description names them; the `toolVersion` constant changes. The `tools/list` frame grows by 654 bytes, under the unchanged 235,520-byte compacted bound. Option D (narrowing by a measured call qualifier) is a separate 0.3 issue.
 - **Unchanged.** The name admission rules, `match`, the #724 exclusion and `boundElsewhereOmitted`, warnings, `partial`, the summary text, every other tool, and every bound and MCP budget.
+
+## Amendment (#1293): daemon_stopping
+
+**Status: owner ruling 2026-11-26 ([#1293](https://github.com/SquashMerge/trellis/issues/1293)).** `toolVersion` is **37** (previously 36, #994).
+
+- **Code.** Every tool's failure-code enum gains `daemon_stopping`, after `daemon_unavailable`: a call whose relay reconnect reached a daemon in an explicit stop ([local topology T03](local-topology.md#leader)). It is retryable, `currentBasis:null`, and nothing was admitted; the relay answers it within the call's own deadline instead of waiting for the stop, and a later call reaches the successor. `trellis mcp`'s launch attach waits up to 60 s for the stop instead.
+- **Catalog.** Only the failure-code enums and the `toolVersion` constant change. The measured `tools/list` frame is 215,993 bytes modern and 215,936 legacy, 234 more than at `toolVersion` 36 (the thirteen enum entries), under the unchanged 235,520-byte compacted-frame limit.
+- **Unchanged:** every other tool object, field and bound; no MCP budget changes.
