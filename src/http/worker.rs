@@ -143,7 +143,7 @@ impl DaemonState {
         drop(work);
         *self.retention_last_run.lock().unwrap() = Instant::now() + Duration::from_secs(3600);
         // Make the worker recompute its sleep deadline from the delayed inventory.
-        self.inbox.wake();
+        self.inbox.wake(WakeSource::Test);
         true
     }
 
@@ -453,38 +453,103 @@ impl DaemonState {
 /// worker re-reads durable state after every wake.
 #[derive(Default)]
 pub(super) struct WorkerInbox {
-    wake: std::sync::Mutex<bool>,
+    /// The pending wake: the `WakeSource` bits set since the worker last
+    /// consumed it (0: none pending).
+    wake: std::sync::Mutex<u8>,
     changed: std::sync::Condvar,
     shutdown: Arc<AtomicBool>,
+    /// The sources the worker's last `wait` consumed (0: its deadline
+    /// passed), for the optional `worker_wake` marker (#1355).
+    last_woken_by: std::sync::atomic::AtomicU8,
     /// While the worker is blocked with no wake pending: its deadline.
     #[cfg(feature = "test-support")]
     asleep: std::sync::Mutex<Option<Option<Instant>>>,
 }
 
+/// Who woke the worker. Only the optional diagnostics markers read it: the
+/// worker re-reads durable state after every wake, whatever its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum WakeSource {
+    /// An accepted watcher signal (the notify callback or fixture ingress).
+    Watch = 1,
+    /// The store's queue waker: a FIFO row was accepted.
+    Queue = 2,
+    /// An enqueue through this daemon (index or semantic import).
+    Request = 4,
+    /// Worker start, retirement, a cancelled retirement or a GC run request.
+    Lifecycle = 8,
+    /// A configuration change.
+    Config = 16,
+    /// A test-support control.
+    Test = 32,
+    /// Shutdown.
+    Shutdown = 64,
+}
+
+impl WakeSource {
+    const ALL: [Self; 7] = [
+        Self::Watch,
+        Self::Queue,
+        Self::Request,
+        Self::Lifecycle,
+        Self::Config,
+        Self::Test,
+        Self::Shutdown,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Watch => "watch",
+            Self::Queue => "queue",
+            Self::Request => "request",
+            Self::Lifecycle => "lifecycle",
+            Self::Config => "config",
+            Self::Test => "test",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// The `worker_wake` marker detail for the sources one `wait` consumed:
+/// `source=watch+queue`, or `source=deadline` when its deadline passed first.
+pub(super) fn wake_detail(sources: u8) -> String {
+    if sources == 0 {
+        return "source=deadline".to_owned();
+    }
+    let names: Vec<&str> = WakeSource::ALL
+        .iter()
+        .filter(|source| sources & **source as u8 != 0)
+        .map(|source| source.name())
+        .collect();
+    format!("source={}", names.join("+"))
+}
+
 impl WorkerInbox {
-    pub(super) fn wake(&self) {
-        *self.wake.lock().unwrap() = true;
+    pub(super) fn wake(&self, source: WakeSource) {
+        *self.wake.lock().unwrap() |= source as u8;
         self.changed.notify_one();
     }
 
     /// A wake arrived that the worker has not consumed yet: newer work.
     pub(super) fn wake_pending(&self) -> bool {
-        *self.wake.lock().unwrap()
+        *self.wake.lock().unwrap() != 0
     }
 
     pub(super) fn shut_down(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.wake();
+        self.wake(WakeSource::Shutdown);
     }
 
-    /// Block until woken or `deadline` passes (`None`: until woken).
-    fn wait(&self, deadline: Option<Instant>) {
+    /// Block until woken or `deadline` passes (`None`: until woken). Returns
+    /// the sources it consumed; 0 when the deadline passed with none pending.
+    fn wait(&self, deadline: Option<Instant>) -> u8 {
         let mut woken = self.wake.lock().unwrap();
         #[cfg(feature = "test-support")]
-        if !*woken {
+        if *woken == 0 {
             *self.asleep.lock().unwrap() = Some(deadline);
         }
-        while !*woken && !self.shutdown.load(Ordering::Acquire) {
+        while *woken == 0 && !self.shutdown.load(Ordering::Acquire) {
             match deadline {
                 None => woken = self.changed.wait(woken).unwrap(),
                 Some(deadline) => {
@@ -500,7 +565,14 @@ impl WorkerInbox {
         {
             *self.asleep.lock().unwrap() = None;
         }
-        *woken = false;
+        let sources = std::mem::take(&mut *woken);
+        self.last_woken_by.store(sources, Ordering::Release);
+        sources
+    }
+
+    /// The sources the worker's last `wait` consumed.
+    fn last_woken_by(&self) -> u8 {
+        self.last_woken_by.load(Ordering::Acquire)
     }
 }
 
@@ -581,7 +653,7 @@ impl DaemonState {
             return;
         };
         if self.worker_started.swap(true, Ordering::AcqRel) {
-            self.inbox.wake();
+            self.inbox.wake(WakeSource::Lifecycle);
             return;
         }
         let weak = Arc::downgrade(self);
@@ -771,7 +843,7 @@ impl DaemonState {
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
-        self.inbox.wake();
+        self.inbox.wake(WakeSource::Request);
         Ok(row)
     }
 
@@ -788,7 +860,7 @@ impl DaemonState {
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
-        self.inbox.wake();
+        self.inbox.wake(WakeSource::Request);
         Ok(row)
     }
 
@@ -811,7 +883,7 @@ impl DaemonState {
                 // re-reads the queue and publishes whether FIFO work really remains (#629).
                 self.fifo.accept(&self.watch_status);
                 drop(lease);
-                self.inbox.wake();
+                self.inbox.wake(WakeSource::Request);
                 return Err(error);
             }
         };
@@ -819,7 +891,7 @@ impl DaemonState {
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
-        self.inbox.wake();
+        self.inbox.wake(WakeSource::Request);
         Ok(row)
     }
 
@@ -847,7 +919,7 @@ impl DaemonState {
                 };
                 self.state_version.fetch_add(1, Ordering::AcqRel);
                 self.state_changed.notify_all();
-                self.inbox.wake();
+                self.inbox.wake(WakeSource::Lifecycle);
             }
             _ => {}
         }
@@ -904,7 +976,7 @@ impl DaemonState {
         *state = RuntimeState::RetireRequested { cutoff, session };
         drop(state);
         self.note_state_change();
-        self.inbox.wake();
+        self.inbox.wake(WakeSource::Lifecycle);
         RetireOutcome::Requested
     }
 
@@ -1166,7 +1238,9 @@ impl Drop for AdmissionLease {
 }
 
 fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
-    worker_loop_with_wait(weak, inbox.clone(), |deadline| inbox.wait(deadline));
+    worker_loop_with_wait(weak, inbox.clone(), |deadline| {
+        inbox.wait(deadline);
+    });
 }
 
 fn worker_loop_with_wait(
@@ -1178,7 +1252,13 @@ fn worker_loop_with_wait(
     let mut deadline = weak.upgrade().map(|state| state.worker_now());
     loop {
         wait(deadline);
-        crate::index_coordinator::diagnostic_marker("-", "worker_wake", "");
+        if crate::index_coordinator::diagnostics_enabled() {
+            crate::index_coordinator::diagnostic_marker(
+                "-",
+                "worker_wake",
+                &wake_detail(inbox.last_woken_by()),
+            );
+        }
         if inbox.shutdown.load(Ordering::Acquire) {
             if let Some(state) = weak.upgrade() {
                 state.fail_requested_gc();
@@ -1239,6 +1319,37 @@ mod semantic;
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    /// #1355: a wait consumes every source that woke it since the last wait,
+    /// and a wait whose deadline passes with none pending reports the deadline.
+    #[test]
+    fn a_wait_names_the_sources_it_consumed() {
+        let inbox = WorkerInbox::default();
+        inbox.wake(WakeSource::Watch);
+        inbox.wake(WakeSource::Queue);
+        inbox.wake(WakeSource::Watch);
+        let sources = inbox.wait(None);
+        assert_eq!(wake_detail(sources), "source=watch+queue");
+        assert_eq!(inbox.last_woken_by(), sources);
+        assert!(!inbox.wake_pending());
+        let sources = inbox.wait(Some(Instant::now()));
+        assert_eq!(sources, 0);
+        assert_eq!(wake_detail(sources), "source=deadline");
+        assert_eq!(inbox.last_woken_by(), 0);
+        inbox.wake(WakeSource::Request);
+        assert!(inbox.wake_pending());
+        assert_eq!(
+            wake_detail(inbox.wait(Some(Instant::now()))),
+            "source=request"
+        );
+        inbox.shut_down();
+        assert_eq!(wake_detail(inbox.wait(None)), "source=shutdown");
+    }
+}
 
 #[cfg(test)]
 mod missing_index_tests {

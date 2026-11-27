@@ -84,12 +84,12 @@ pub fn new_with_config(
         let watch_status = watch_status.clone();
         Arc::new(move || {
             fifo.accept(&watch_status);
-            inbox.wake();
+            inbox.wake(worker::WakeSource::Queue);
         })
     };
     let watch_waker: Arc<dyn Fn() + Send + Sync> = {
         let inbox = inbox.clone();
-        Arc::new(move || inbox.wake())
+        Arc::new(move || inbox.wake(worker::WakeSource::Watch))
     };
     store.register_queue_waker(&queue_waker);
     Ok(Arc::new(DaemonState {
@@ -323,7 +323,7 @@ impl DaemonState {
     pub fn release_checkout_runtime_for_fixture(&self) {
         let _stream = self.step_lock.lock().unwrap();
         self.set_runtime_state(RuntimeState::Retired);
-        self.inbox.wake();
+        self.inbox.wake(worker::WakeSource::Test);
     }
 
     /// A daemon-local writer session is usable only after its startup reconciliation commits.
@@ -487,7 +487,7 @@ impl DaemonState {
             };
             scheduler.force_periodic_inventory_for_tests();
         }
-        self.inbox.wake();
+        self.inbox.wake(worker::WakeSource::Test);
         true
     }
 
@@ -529,7 +529,7 @@ impl DaemonState {
     #[doc(hidden)]
     pub fn select_watch_options_for_tests(&self, options: IndexOptions) {
         *self.explicit_pending.lock().unwrap() = Some(Arc::new(options));
-        self.inbox.wake();
+        self.inbox.wake(worker::WakeSource::Test);
     }
 
     /// Arm a queue-read race only after CLI enqueue has committed. Enqueue
@@ -832,7 +832,7 @@ impl DaemonState {
             slot: &self.gc_run,
             id,
         };
-        self.inbox.wake();
+        self.inbox.wake(worker::WakeSource::Lifecycle);
         match answer.recv_timeout(wait) {
             Ok(report) => report,
             Err(_) => anyhow::bail!("deadline_exceeded: the checkout worker did not run gc --run"),
