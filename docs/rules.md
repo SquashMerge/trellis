@@ -1374,11 +1374,12 @@ The fixed configuration read is limited to 2 MiB, with at most 1,024 entries per
 named collection and 8,192 aggregate glob patterns. The locked TOML parser keeps
 its default recursion guard of 80; unbounded parsing is not enabled. Structural
 accounting is iterative. Projection admits at most 2 MiB per captured source or
-retained manifest and 256 MiB total admitted captured source and present
-retained-manifest bytes, before source filters. The 250,000-site bound applies both
+retained manifest, before source filters. Capture already bounds the checkout's aggregate
+source at 256 MiB, which reference admission checks again; the snapshot no longer repeats
+that total (owner ruling 2026-11-26, [#1321](https://github.com/SquashMerge/trellis/issues/1321)). The 250,000-site bound applies both
 to each raw source extraction and to deduplicated selected sites across the request.
 Reference samples accept at most 50 sites per edge. Snapshot admission also caps the
-inventory at 100,000 documents and 512 MiB of aggregate stored input. These bounds
+inventory at 100,000 documents and 2 GiB of aggregate stored input. These bounds
 refuse the entire result rather than silently dropping evidence.
 
 **Stored input (owner ruling 2026-11-26, [#1321](https://github.com/SquashMerge/trellis/issues/1321)).**
@@ -1388,20 +1389,32 @@ parameter, call, control-region and call-region rows, each charged at its stored
 the selected read's budgets measure rows, plus the stored retained dependency and config
 inputs. A document's references, coverage roles, capability and macro rows, class rows and
 class extraction are stored too, but the snapshot never reads them, so they are not
-charged. The 512 MiB value is unchanged.
+charged.
+
+**The stored total's value (owner ruling 2026-11-26, #1321)** is set from measured charges and
+peaks, after the language-lane parse (#1360). It was 512 MiB.
+
+| checkout | stored input | Architecture build peak | budget |
+|---|---:|---:|---:|
+| Trellis's own checkout | 202 MiB | about 0.95 GB | – |
+| 1,000-file synthetic cohort | 347 MiB | about 1.5 GiB | 2 GiB |
+| 10,000-file synthetic cohort | 1.49 GiB | about 6.6–6.8 GiB | 7 GiB |
+
+2 GiB admits the 10,000-file cohort with a third of headroom (owner ruling 2026-11-27, "go
+with 2 GiB"). The 7 GiB large budget is a target for measured large codebases, not a hard
+ceiling: decoded rows take about 2.4 times their stored input, so a revision shaped like that
+cohort at the limit may peak near 8 GiB. Past the limit, the revision is refused, typed
+`bounded_work`.
 
 Every `bounded_work` refusal names the bound it hit (owner ruling 2026-11-26,
 [#1321](https://github.com/SquashMerge/trellis/issues/1321), option A). The snapshot's byte
 bounds also report the observed value: `architecture document source: <path> is <N> bytes,
-over the 2 MiB limit` for the first such document in key order, `architecture source total:
-<N> bytes, over the 256 MiB limit`, `architecture stored total: <N> bytes, over the 512 MiB
-limit`, and `architecture retained input: <path> is <N> bytes, over the 16 MiB limit` for a
-present retained manifest or config input. A document over its bound is refused when it is
-reached. The stored total and the documents' source total are the whole revision's: once
-either is over its limit, the read fetches no more rows, frees those it fetched, and charges
-every remaining document's size and the retained inputs' stored lengths before it refuses,
-the source total first. A source total that retained manifests or the root TypeScript config
-carry over the bound reports the total counted when that input was charged. For every
+over the 2 MiB limit` for the first such document in key order, `architecture stored total:
+<N> bytes, over the 2 GiB limit`, and `architecture retained input: <path> is <N> bytes, over
+the 16 MiB limit` for a present retained manifest or config input (capture's own input bound). A document over its bound is refused when it is
+reached. The stored total is the whole revision's: once it is over its limit, the read
+fetches no more rows, frees those it fetched, and charges every remaining document and the
+retained inputs' stored lengths before it refuses. For every
 `bounded_work`, MCP and the browser answer the refusal's text after `Architecture projection
 work bound exceeded: `, and the CLI the error itself.
 
