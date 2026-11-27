@@ -726,6 +726,10 @@ impl crate::producer::import::ImportScheduler for http::DaemonState {
         http::DaemonState::wait_state_change(self, seen, timeout)
     }
 
+    fn stopping(&self) -> bool {
+        self.stop_requested()
+    }
+
     fn enqueue_generated_semantic_import(
         &self,
         options: &crate::store::requests::GeneratedImportOptions,
