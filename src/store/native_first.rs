@@ -613,18 +613,32 @@ impl Store {
     }
 
     pub(crate) fn pending_semantic_target(&self) -> Result<Option<PendingSemanticTarget>> {
-        self.with_evidence(|db| {
-            let target = pending_target(db)?;
-            if let Some(target) = &target {
-                selected_ensure!(
-                    target.root_id == self.identity.root_key,
-                    "incompatible_index: pending semantic root differs"
-                );
-            }
-            Ok(target)
-        })
+        self.with_evidence(|db| pending_target_of(db, &self.identity.root_key))
     }
+}
 
+/// The pending semantic target recorded in `db`'s snapshot, checked against `root`.
+fn pending_target_of(db: &Connection, root: &str) -> Result<Option<PendingSemanticTarget>> {
+    let target = pending_target(db)?;
+    if let Some(target) = &target {
+        selected_ensure!(
+            target.root_id == root,
+            "incompatible_index: pending semantic root differs"
+        );
+    }
+    Ok(target)
+}
+
+impl super::EvidenceResponse {
+    /// The head this admitted read's snapshot has a semantic catch-up queued for, if any. It
+    /// reads the response's own snapshot, so no second snapshot opens while this one is held
+    /// (#1313 T10b review).
+    pub(crate) fn pending_semantic_target_pin(&self) -> Result<Option<IndexPin>> {
+        Ok(pending_target_of(&self.db, &self.store.identity.root_key)?.map(|target| target.pin))
+    }
+}
+
+impl Store {
     pub fn semantic_projection_at(
         &self,
         pin: IndexPin,
