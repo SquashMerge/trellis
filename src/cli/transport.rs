@@ -178,16 +178,21 @@ fn send_daemon_once(
         client::connect_or_start(&socket, start_daemon, connect_bound())
             .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?,
     );
-    let reply = client::call(request, read_only, || {
-        let stream = if let Some(stream) = first.take() {
-            stream
-        } else {
-            client::connect_or_start(&socket, start_daemon, connect_bound())?
-        };
-        stream.set_read_timeout(Some(within(reply_bound)))?;
-        stream.set_write_timeout(Some(connect_bound()))?;
-        Ok(stream)
-    })
+    let reply = client::call_until(
+        request,
+        read_only,
+        || {
+            let stream = if let Some(stream) = first.take() {
+                stream
+            } else {
+                client::connect_or_start(&socket, start_daemon, connect_bound())?
+            };
+            stream.set_read_timeout(Some(within(reply_bound)))?;
+            stream.set_write_timeout(Some(connect_bound()))?;
+            Ok(stream)
+        },
+        stop_wait.map(client::StopWait::deadline),
+    )
     .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
     Ok(reply)
 }

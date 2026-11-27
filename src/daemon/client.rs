@@ -25,8 +25,20 @@ impl CallError {
 /// How long a CLI, `serve` or `trellis mcp` attach waits out an explicit
 /// daemon stop before it fails (#1293, owner ruling 2026-11-26).
 pub const STOP_WAIT: Duration = Duration::from_secs(60);
-/// The connect and the attach reply of one MCP attach, each at most this long.
+/// The connect and the attach exchange of one MCP attach, each at most this long.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the `trellis mcp` launch attach waits out a stop; a fixture may shorten it.
+fn mcp_stop_wait() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(millis) = std::env::var("TRELLIS_TEST_MCP_STOP_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    STOP_WAIT
+}
 /// How often a waiting CLI reports on stderr, as the first-index wait does (#842).
 const STOP_WAIT_PROGRESS: Duration = Duration::from_secs(10);
 
@@ -62,6 +74,11 @@ impl StopWait {
         self.deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1))
+    }
+
+    /// The wait's one absolute deadline.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
     }
 
     /// Whether the wait's deadline has passed.
@@ -173,7 +190,19 @@ pub fn connect_or_start_metrics(
 pub fn call(
     request: &Request,
     read_only: bool,
+    connect: impl FnMut() -> io::Result<UnixStream>,
+) -> Result<Reply, CallError> {
+    call_until(request, read_only, connect, None)
+}
+
+/// [`call`], bounded by `deadline` when one is given: every frame of the reply,
+/// progress included, is read by it, and a reply that completes after it is
+/// refused, so a stop wait's deadline holds across the attempt (#1293).
+pub fn call_until(
+    request: &Request,
+    read_only: bool,
     mut connect: impl FnMut() -> io::Result<UnixStream>,
+    deadline: Option<Instant>,
 ) -> Result<Reply, CallError> {
     let attempts = if read_only { 2 } else { 1 };
     for attempt in 0..attempts {
@@ -194,7 +223,7 @@ pub fn call(
                 CallError::OutcomeUnknown
             });
         }
-        match read_reply(&mut stream, request.id) {
+        match read_reply_bounded(&mut stream, request.id, deadline) {
             Ok(reply) => return Ok(reply),
             Err(error)
                 if read_only
@@ -260,14 +289,29 @@ pub fn call_metrics(
 
 /// One large daemon reply is a sequence of individually bounded frames. The
 /// final JSON is parsed only after every frame with the same request ID arrives.
-fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
-    read_reply_until(stream, id, None)
+/// A CLI reply, under `deadline` when one is given. Unlike a metrics reply it has
+/// no 64 MiB cap of its own.
+fn read_reply_bounded(
+    stream: &mut UnixStream,
+    id: u64,
+    deadline: Option<Instant>,
+) -> io::Result<Reply> {
+    read_reply_capped(stream, id, deadline, false)
 }
 
 fn read_reply_until(
     stream: &mut UnixStream,
     id: u64,
     deadline: Option<Instant>,
+) -> io::Result<Reply> {
+    read_reply_capped(stream, id, deadline, deadline.is_some())
+}
+
+fn read_reply_capped(
+    stream: &mut UnixStream,
+    id: u64,
+    deadline: Option<Instant>,
+    capped: bool,
 ) -> io::Result<Reply> {
     let read = |stream: &mut UnixStream| -> io::Result<Reply> {
         match deadline {
@@ -321,7 +365,7 @@ fn read_reply_until(
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon chunk"))?;
         let part = hex::decode(chunk).map_err(io::Error::other)?;
         bytes.extend_from_slice(&part);
-        if deadline.is_some() && bytes.len() > 64 * 1024 * 1024 + 4096 {
+        if capped && bytes.len() > 64 * 1024 * 1024 + 4096 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "metrics reply too large",
@@ -356,7 +400,7 @@ fn attach_mcp(
     mut stream: UnixStream,
     workspace: &crate::store::topology::WorkspaceIdentity,
     attachments: &[protocol::McpAttachment],
-    timeout: Duration,
+    deadline: Instant,
 ) -> io::Result<UnixStream> {
     let request = Request {
         id: 1,
@@ -371,10 +415,9 @@ fn attach_mcp(
             "attachments": attachments,
         }),
     };
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    protocol::write_frame(&mut stream, &request)?;
-    let reply: Reply = protocol::read_frame(&mut stream)?;
+    // One absolute deadline for the request and its reply (#1293).
+    protocol::write_frame_until(&mut stream, &request, deadline)?;
+    let reply: Reply = protocol::read_frame_until(&mut stream, deadline)?;
     if reply.id != request.id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1646,9 +1689,9 @@ pub fn relay_stdio(
         move |stream: io::Result<UnixStream>,
               generation: u64,
               attachments: &[protocol::McpAttachment],
-              timeout: Duration|
+              deadline: Instant|
               -> io::Result<DaemonConnection> {
-            let stream = attach_mcp(stream?, workspace, attachments, timeout)?;
+            let stream = attach_mcp(stream?, workspace, attachments, deadline)?;
             stream.set_read_timeout(None)?;
             spawn_reply_reader(&stream, generation, reply_sender.clone(), doorbell.clone())?;
             Ok(DaemonConnection { stream, generation })
@@ -1657,7 +1700,7 @@ pub fn relay_stdio(
     // The launch attach waits out an explicit daemon stop (#1293), bounded,
     // then reaches the successor; any other failure is typed, never a raw
     // I/O error such as a read timeout's EAGAIN.
-    let mut attached = open(Ok(stream), 0, &[], ATTACH_TIMEOUT);
+    let mut attached = open(Ok(stream), 0, &[], Instant::now() + ATTACH_TIMEOUT);
     let mut stop_wait: Option<StopWait> = None;
     loop {
         let waiting = match &attached {
@@ -1672,16 +1715,17 @@ pub fn relay_stdio(
         };
         if !waiting
             || !stop_wait
-                .get_or_insert_with(|| StopWait::new(STOP_WAIT))
+                .get_or_insert_with(|| StopWait::new(mcp_stop_wait()))
                 .pause(&mut |_| {})
         {
             break;
         }
-        // Each attempt gets only what is left of the wait.
-        let budget = stop_wait
-            .as_ref()
-            .map_or(ATTACH_TIMEOUT, |wait| wait.remaining().min(ATTACH_TIMEOUT));
-        attached = open(reconnect(budget), 0, &[], budget);
+        // Each attempt draws its connect and its attach from the wait's one
+        // absolute deadline, never a fresh budget per phase.
+        let wait = stop_wait.as_ref().expect("waiting");
+        let connected = reconnect(wait.remaining().min(ATTACH_TIMEOUT));
+        let deadline = wait.deadline().min(Instant::now() + ATTACH_TIMEOUT);
+        attached = open(connected, 0, &[], deadline);
     }
     let (first, restart_required) = match attached {
         Ok(first) => (Some(first), false),
@@ -1718,11 +1762,12 @@ pub fn relay_stdio(
         restart_required,
         stopping: false,
         connect: Box::new(move |generation, attachments| {
+            let connected = reconnect(ATTACH_TIMEOUT);
             open(
-                reconnect(ATTACH_TIMEOUT),
+                connected,
                 generation,
                 attachments,
-                ATTACH_TIMEOUT,
+                Instant::now() + ATTACH_TIMEOUT,
             )
         }),
         attachments: Default::default(),
@@ -2132,7 +2177,12 @@ mod reply_gate_tests {
                     .recv_timeout(crate::testing::HANG_BACKSTOP)
                     .unwrap();
             });
-            let result = attach_mcp(client, &fixture.workspace, &[], ATTACH_TIMEOUT);
+            let result = attach_mcp(
+                client,
+                &fixture.workspace,
+                &[],
+                Instant::now() + ATTACH_TIMEOUT,
+            );
             if expected {
                 assert!(result.is_ok(), "{result:?}");
             } else {

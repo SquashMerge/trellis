@@ -2,7 +2,10 @@
 use super::transport::{checked_reply, daemon_request, socket_path};
 use crate::{CLI_REPLY_BOUND, ServeArgs, discover_rust_library, resolve_browse_root, start_daemon};
 use anyhow::{Context, Result, ensure};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use trellis::{
     daemon::{client, protocol, registry},
     indexer::IndexOptions,
@@ -106,15 +109,14 @@ pub(crate) async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             Err(_) => anyhow::bail!("daemon_unavailable"),
         };
         // Serve registers in place and never waits for a checkout's index work
-        // (Decision 0009 §6).
-        // The read bound is taken after the connect, from what is left then.
-        let left = stop_wait.as_ref().map(client::StopWait::remaining);
-        let read_bound = left.map_or(Duration::from_secs(10), |left| {
-            left.min(Duration::from_secs(10))
-        });
-        stream.set_read_timeout(Some(read_bound))?;
-        protocol::write_frame(&mut stream, &registration)?;
-        let reply: protocol::Reply = protocol::read_frame(&mut stream)
+        // (Decision 0009 §6). The request and its reply share one absolute
+        // deadline, inside a stop wait no later than the wait's own (#1293).
+        let exchange = Instant::now() + Duration::from_secs(10);
+        let deadline = stop_wait
+            .as_ref()
+            .map_or(exchange, |wait| wait.deadline().min(exchange));
+        protocol::write_frame_until(&mut stream, &registration, deadline)?;
+        let reply: protocol::Reply = protocol::read_frame_until(&mut stream, deadline)
             .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
         if protocol::is_stopping(&reply.payload)
             && stop_wait

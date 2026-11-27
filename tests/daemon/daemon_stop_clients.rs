@@ -400,3 +400,141 @@ fn trellis_api_keeps_its_own_bound_through_a_stop_wait() {
     let output = api.stdout() + &api.stderr();
     assert!(output.contains("daemon_stopping"), "{output}");
 }
+
+/// A stand-in that answers its first connection `daemon_stopping`, then, as a successor
+/// would, streams progress frames on the next one for `progress` before a successful
+/// `trellis api` answer.
+fn progressing_successor(socket: &std::path::Path, progress: Duration) {
+    use trellis::daemon::protocol;
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        for index in 0..2 {
+            let mut stream = trellis::testing::accept_within_backstop(&listener);
+            let Ok(request) = protocol::read_frame::<protocol::Request>(&mut stream) else {
+                return;
+            };
+            let reply = |payload| protocol::Reply {
+                id: request.id,
+                payload,
+            };
+            if index == 0 {
+                let error = serde_json::json!({"error": protocol::DAEMON_STOPPING_MESSAGE});
+                let _ = protocol::write_frame(&mut stream, &reply(error));
+                continue;
+            }
+            let end = Instant::now() + progress;
+            while Instant::now() < end {
+                let frame = serde_json::json!({"progress": "trellis: indexing this checkout"});
+                if protocol::write_frame(&mut stream, &reply(frame)).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let done = serde_json::json!({"result": {"status": 200, "body": {}}});
+            let _ = protocol::write_frame(&mut stream, &reply(done));
+        }
+    });
+}
+
+/// The stop wait's deadline holds across every frame of the attempt after it: progress
+/// frames that each arrive within one read bound cannot carry the call past it, and a
+/// success that completes after it is refused (#1293 review).
+#[test]
+fn a_late_success_after_a_stop_wait_is_refused() {
+    let fixture = fixture();
+    progressing_successor(&fixture.socket(), Duration::from_secs(3));
+    let mut api = fixture.cli();
+    api.args(["api", "GET", "/api/checkouts"])
+        .env("TRELLIS_TEST_CLI_REPLY_BOUND_MS", "1000");
+    let mut api = fixture.spawn("api", api);
+    assert!(
+        !api.exit("api after a stop").success(),
+        "a success after the bound was accepted: {}",
+        api.stdout()
+    );
+    let output = api.stdout() + &api.stderr();
+    assert!(output.contains("daemon_stopping"), "{output}");
+}
+
+/// The `trellis mcp` launch attach draws its connect and its attach exchange from the
+/// stop wait's one deadline. Here the connect takes most of the wait (the socket is gone
+/// and a candidate cannot win the election this test holds), and the attach answer comes
+/// after the wait's deadline but within a fresh attach budget: it must not be accepted.
+#[test]
+fn an_mcp_launch_attach_spends_one_deadline_across_connect_and_attach() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use trellis::daemon::protocol;
+    let fixture = fixture();
+    let paths = trellis::daemon::SocketPaths::new(&fixture.roots().data);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&paths.run)
+        .unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&paths.lock)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let socket = paths.socket.clone();
+    let first = UnixListener::bind(&socket).unwrap();
+    // The wait is 4 s; the socket returns at 2.4 s and the attach answer at 5.2 s.
+    let (rebind, answer) = (Duration::from_millis(2400), Duration::from_millis(5200));
+    let stand_in = std::thread::spawn(move || {
+        let mut stream = trellis::testing::accept_within_backstop(&first);
+        let request: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+        let started = Instant::now();
+        protocol::write_frame(
+            &mut stream,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"error": protocol::DAEMON_STOPPING_MESSAGE}),
+            },
+        )
+        .unwrap();
+        drop(first);
+        fs::remove_file(&socket).unwrap();
+        std::thread::sleep(rebind.saturating_sub(started.elapsed()));
+        let second = UnixListener::bind(&socket).unwrap();
+        let mut stream = trellis::testing::accept_within_backstop(&second);
+        let Ok(request) = protocol::read_frame::<protocol::Request>(&mut stream) else {
+            return;
+        };
+        std::thread::sleep(answer.saturating_sub(started.elapsed()));
+        let _ = protocol::write_frame(
+            &mut stream,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"result": true, "mcpIdentity": protocol::mcp_identity()}),
+            },
+        );
+        // Hold the connection until the relay is done with it.
+        let _ = protocol::read_frame::<protocol::Request>(&mut stream);
+    });
+    let mut mcp = fixture.cli();
+    mcp.arg("mcp")
+        .arg("--workspace")
+        .arg(&fixture.root)
+        .env("TRELLIS_TEST_MCP_STOP_WAIT_MS", "4000");
+    // With no input, an attached relay exits 0 at once; only a refused attach fails.
+    let mut mcp = fixture.spawn("mcp", mcp);
+    assert!(
+        !mcp.exit("mcp launch during a stop").success(),
+        "an attach answered after the wait's deadline was accepted"
+    );
+    assert!(
+        mcp.stderr().contains("daemon_unavailable"),
+        "{}",
+        mcp.stderr()
+    );
+    drop(lock);
+    let _ = stand_in.join();
+}
