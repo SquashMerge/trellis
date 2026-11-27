@@ -381,6 +381,11 @@ impl DaemonState {
         });
         match outcome {
             Ok(session) => {
+                // Releases owed while the checkout was retired, or before a lost session,
+                // are settled by the first idle retention pass after reconciliation, not
+                // one cadence later (#1291). Maintenance stays the lowest class.
+                self.startup_release_pass.store(true, Ordering::Release);
+                self.make_maintenance_due();
                 self.replace_serving_session(Some(session));
                 if let Some(lifecycle) = self.lifecycle.get() {
                     lifecycle();
@@ -649,6 +654,13 @@ impl DaemonState {
         *self.retention_last_run.lock().unwrap() + MAINTENANCE_INTERVAL
     }
 
+    /// Make the next retention unit due now; it still waits for its class.
+    fn make_maintenance_due(&self) {
+        let now = Instant::now();
+        *self.retention_last_run.lock().unwrap() =
+            now.checked_sub(MAINTENANCE_INTERVAL).unwrap_or(now);
+    }
+
     /// Maintenance is the lowest class (Decision 0009 §4): it runs only when
     /// the step made no progress, no wake is pending and its unit is due.
     fn maintenance_ready(&self) -> bool {
@@ -740,7 +752,7 @@ impl DaemonState {
     #[doc(hidden)]
     pub fn on_next_maintenance_unit_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
         *self.maintenance_hook.lock().unwrap() = Some(Box::new(hook));
-        *self.retention_last_run.lock().unwrap() = Instant::now() - MAINTENANCE_INTERVAL;
+        self.make_maintenance_due();
     }
 
     /// Hold retirement just before its `Closing` linearization point.

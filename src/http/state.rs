@@ -194,6 +194,7 @@ pub fn new_with_config(
         recovery_retry_after: Mutex::new(None),
         watcher_health: Arc::new(crate::watch::WatcherHealth::default()),
         retention_last_run: Mutex::new(Instant::now()),
+        startup_release_pass: AtomicBool::new(false),
         gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         gc_run: Mutex::new(None),
         gc_run_next: AtomicU64::new(0),
@@ -964,11 +965,20 @@ impl DaemonState {
             }
             Ok(MaintenanceOutcome::Idle) => {
                 *self.retention_last_run.lock().unwrap() = Instant::now();
+                if self.startup_release_pass.swap(false, Ordering::AcqRel) {
+                    return Ok(());
+                }
             }
             Err(error) => {
                 *self.retention_last_run.lock().unwrap() = Instant::now();
+                self.startup_release_pass.store(false, Ordering::Release);
                 return Err(error);
             }
+        }
+        // The pass after reconciliation only settles owed releases (#1291): GC
+        // keeps its cadence, first checked one interval after that pass.
+        if self.startup_release_pass.load(Ordering::Acquire) {
+            return Ok(());
         }
         self.gc_tick(&session, &options)?;
         Ok(())
