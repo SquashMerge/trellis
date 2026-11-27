@@ -178,10 +178,16 @@ fn send_daemon_once(
     }
     let reply_bound = reply_bound(request);
     let connect_bound = || within(Duration::from_secs(5));
-    let mut first = Some(
-        client::connect_or_start(&socket, start_daemon, connect_bound())
-            .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?,
-    );
+    // Inside a stop wait a reconnect runs on the wait's owning deadline.
+    let reconnect = || match stop_wait {
+        Some(wait) => client::connect_or_start_until(
+            &socket,
+            start_daemon,
+            wait.deadline().min(Instant::now() + Duration::from_secs(5)),
+        ),
+        None => client::connect_or_start(&socket, start_daemon, Duration::from_secs(5)),
+    };
+    let mut first = Some(reconnect().map_err(|_| anyhow::anyhow!("daemon_unavailable"))?);
     let reply = client::call_until(
         request,
         read_only,
@@ -189,7 +195,7 @@ fn send_daemon_once(
             let stream = if let Some(stream) = first.take() {
                 stream
             } else {
-                client::connect_or_start(&socket, start_daemon, connect_bound())?
+                reconnect()?
             };
             stream.set_read_timeout(Some(within(reply_bound)))?;
             stream.set_write_timeout(Some(connect_bound()))?;

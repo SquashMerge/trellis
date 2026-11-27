@@ -93,10 +93,15 @@ pub(crate) async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let mut stop_wait: Option<client::StopWait> = None;
     let (mut stream, address) = loop {
         // Inside the wait, the connect and the reply get only what is left of it.
-        let left = stop_wait.as_ref().map(client::StopWait::remaining);
-        let within = |bound: Duration| left.map_or(bound, |left| bound.min(left));
-        let connected =
-            client::connect_or_start(&socket, start_daemon, within(Duration::from_secs(5)));
+        // Inside a stop wait the reconnect runs on the wait's owning deadline.
+        let connected = match stop_wait.as_ref() {
+            Some(wait) => client::connect_or_start_until(
+                &socket,
+                start_daemon,
+                wait.deadline().min(Instant::now() + Duration::from_secs(5)),
+            ),
+            None => client::connect_or_start(&socket, start_daemon, Duration::from_secs(5)),
+        };
         let mut stream = match connected {
             Ok(stream) => stream,
             Err(_)

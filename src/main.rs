@@ -560,8 +560,8 @@ async fn main() -> Result<()> {
             let socket = socket_path()?;
             let stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
                 .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
-            client::relay_stdio(stream, &identity, |timeout| {
-                client::connect_or_start(&socket, start_daemon, timeout)
+            client::relay_stdio(stream, &identity, |deadline| {
+                client::connect_or_start_until(&socket, start_daemon, deadline)
             })?;
         }
         Command::Model(args) => model_command(args).await?,

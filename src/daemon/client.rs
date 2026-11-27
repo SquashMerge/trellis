@@ -149,6 +149,43 @@ pub fn connect_or_start(
     }
 }
 
+/// [`connect_or_start`] under an owning absolute `deadline`, as a stop wait's
+/// reconnect needs (#1293): the deadline is checked before the first connect,
+/// after it, after the start and after every later connect, and each pause is
+/// capped at what is left. A single blocking connect or start may finish past
+/// the deadline, but nothing it yields after the deadline is accepted.
+pub fn connect_or_start_until(
+    socket: &Path,
+    mut start: impl FnMut() -> io::Result<StartOutcome>,
+    deadline: Instant,
+) -> io::Result<UnixStream> {
+    let expired = || io::Error::new(io::ErrorKind::TimedOut, "daemon unavailable");
+    let live = || Instant::now() < deadline;
+    if !live() {
+        return Err(expired());
+    }
+    if let Ok(stream) = UnixStream::connect(socket) {
+        return if live() { Ok(stream) } else { Err(expired()) };
+    }
+    if !live() {
+        return Err(expired());
+    }
+    let _ = start()?; // An election loser waits for the winner within the same deadline.
+    loop {
+        if !live() {
+            return Err(expired());
+        }
+        if let Ok(stream) = UnixStream::connect(socket) {
+            return if live() { Ok(stream) } else { Err(expired()) };
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(expired());
+        }
+        thread::sleep(left.min(Duration::from_millis(20)));
+    }
+}
+
 /// Metrics uses the caller's remaining ingress budget, capped at five seconds.
 /// Start the attempt clock before the first connect or daemon election; a
 /// late successful connect/start never admits a request.
@@ -1692,7 +1729,7 @@ impl<W: std::io::Write> Relay<'_, W> {
 pub fn relay_stdio(
     stream: UnixStream,
     workspace: &crate::store::topology::WorkspaceIdentity,
-    mut reconnect: impl FnMut(Duration) -> io::Result<UnixStream>,
+    mut reconnect: impl FnMut(Instant) -> io::Result<UnixStream>,
 ) -> io::Result<()> {
     let doorbell = std::sync::Arc::new(Doorbell::default());
     let (receiver, stdin) = spawn_ringing_frame_reader(0, Some(doorbell.clone()))?;
@@ -1736,7 +1773,7 @@ pub fn relay_stdio(
         // Each attempt draws its connect and its attach from the wait's one
         // absolute deadline, never a fresh budget per phase.
         let wait = stop_wait.as_ref().expect("waiting");
-        let connected = reconnect(wait.remaining().min(ATTACH_TIMEOUT));
+        let connected = reconnect(wait.deadline().min(Instant::now() + ATTACH_TIMEOUT));
         let deadline = wait.deadline().min(Instant::now() + ATTACH_TIMEOUT);
         attached = open(connected, 0, &[], deadline);
     }
@@ -1775,7 +1812,7 @@ pub fn relay_stdio(
         restart_required,
         stopping: false,
         connect: Box::new(move |generation, attachments| {
-            let connected = reconnect(ATTACH_TIMEOUT);
+            let connected = reconnect(Instant::now() + ATTACH_TIMEOUT);
             open(
                 connected,
                 generation,
@@ -1885,6 +1922,35 @@ mod cancellation_tests {
             std::io::Read::read(&mut peer, &mut byte)
                 .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock),
             "a request was written after the deadline"
+        );
+    }
+
+    /// #1293 review: a reconnect inside a stop wait runs on the wait's owning deadline. A
+    /// start that returns after it (the single blocking call may finish) cannot lead to an
+    /// accepted connection.
+    #[test]
+    fn a_connection_after_a_delayed_start_past_the_deadline_is_refused() {
+        use super::*;
+        let dir = tempfile::Builder::new()
+            .prefix("t1293-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut listener = None;
+        let result = connect_or_start_until(
+            &socket,
+            || {
+                std::thread::sleep(Duration::from_millis(375));
+                listener = Some(std::os::unix::net::UnixListener::bind(&socket)?);
+                Ok(StartOutcome::Started)
+            },
+            deadline,
+        );
+        assert!(listener.is_some(), "the delayed start ran");
+        assert!(
+            result.is_err(),
+            "a connection made after the deadline was accepted"
         );
     }
 
