@@ -1464,6 +1464,27 @@ pub fn incoming(
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
     use std::collections::BTreeMap;
+    /// #994 (owner ruling 2026-11-26, option B): what a caller's selected binding says
+    /// about the selected declaration, as an index into `MATCHES`. It labels a listed
+    /// caller and removes none: proven here (the #724 test with the located target equal to
+    /// `selected`), then a declared target of `selected` without proof, then any other
+    /// declared target, else none (no binding, or an ambiguous or unresolved one).
+    const MATCHES: [&str; 4] = ["boundHere", "pointsHere", "pointsElsewhere", "noTarget"];
+    fn binding_match(bound: Option<&crate::store::CallSemantic>, selected: &str) -> usize {
+        use crate::semantic_records::Target;
+        let Some(bound) = bound else { return 3 };
+        if bound.boundary_reason == crate::graph_query::BoundaryReason::None
+            && bound.effective_freshness == crate::semantic_evidence::Freshness::Fresh
+            && bound.target_id.as_deref() == Some(selected)
+        {
+            return 0;
+        }
+        match &bound.binding.declared_target {
+            Some(Target::Internal { syntax_id, .. }) if syntax_id == selected => 1,
+            Some(_) => 2,
+            None => 3,
+        }
+    }
     let owner = &result.selected.selected;
     let basis = json!({"indexGeneration":owner.pin.index_generation.to_string(),
         "indexRevision":owner.pin.index_revision});
@@ -1548,8 +1569,8 @@ pub fn incoming(
             boundary |= bound.is_none_or(|bound| {
                 bound.boundary_reason != crate::graph_query::BoundaryReason::None
             });
-            let binding_match = crate::store::BindingMatch::of(bound, &owner.declaration.syntax_id);
-            matches[binding_match as usize] += 1;
+            let tag = binding_match(bound, &owner.declaration.syntax_id);
+            matches[tag] += 1;
             let evidence = call_evidence(bound, call_projection(semantic, &call.document))?;
             callers.push(
                 json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
@@ -1562,7 +1583,7 @@ pub fn incoming(
                 "evidenceTier":evidence.evidence_tier,"semanticBasis":evidence.semantic_basis,
                 "freshness":evidence.freshness,"staleBecause":[],
                 "historicalFreshness":evidence.historical_freshness,"projection":evidence.projection,
-                "bindingMatch":binding_match.wire()}),
+                "bindingMatch":MATCHES[tag]}),
             );
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
@@ -1613,9 +1634,10 @@ pub fn incoming(
                     .filter_map(|document| document["document"]["language"].as_str()),
             ),
         );
-        let binding_matches: serde_json::Map<String, Value> = crate::store::BindingMatch::ALL
+        let binding_matches: serde_json::Map<String, Value> = MATCHES
             .iter()
-            .map(|tag| (tag.wire().to_owned(), json!(matches[*tag as usize])))
+            .zip(matches)
+            .map(|(tag, count)| ((*tag).to_owned(), json!(count)))
             .collect();
         let mut data = json!({
             "symbolId":owner.declaration.syntax_id,"displayKey":crate::references::display_key(&owner.declaration),
