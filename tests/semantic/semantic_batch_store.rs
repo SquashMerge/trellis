@@ -7893,7 +7893,7 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
     // native coverage, which keeps its syntax tier; other languages have no producer.
     let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
-    assert_eq!(describe["data"]["toolVersion"], 35);
+    assert_eq!(describe["data"]["toolVersion"], 36);
     for (scope, rows) in [
         ("describe", &describe["data"]["languages"]),
         ("incoming", &incoming["data"]["scopeCoverage"]),
@@ -13246,7 +13246,105 @@ async fn incoming_calls_keep_unbound_name_matches() {
     for caller in page["data"]["callers"].as_array().unwrap() {
         assert_eq!(caller["binding"], Value::Null, "{page}");
         assert_eq!(caller["evidenceTier"], "syntax", "{page}");
+        // #994: a caller with no binding names no target.
+        assert_eq!(caller["bindingMatch"], "noTarget", "{page}");
     }
+    assert_eq!(
+        page["data"]["bindingMatches"],
+        json!({"boundHere":0,"pointsHere":0,"pointsElsewhere":0,"noTarget":3}),
+        "{page}"
+    );
+    mcp.finish();
+}
+
+/// #994 (owner ruling 2026-11-26, option B), real scip-typescript bindings: `caller` in
+/// `src/main.js` calls its own `plain` twice. Fresh, both calls are `boundHere`. An edit
+/// then adds a second `plain` in `src/other.js`, so the JavaScript evidence is possibly
+/// stale and #724 cannot leave those calls out of the new `plain`'s answer: they stay
+/// listed there as `pointsElsewhere`, and as `pointsHere` in the old `plain`'s answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_callers_say_what_their_fresh_or_stale_binding_names() {
+    let files = ["src/lib.js", "src/main.js"];
+    let published = || {
+        let (world, _) = real_fixture_world("issue444-javascript-calls", &files);
+        let (p, _) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+        (world, p)
+    };
+    let (world, _) = published();
+    let plain = declaration_in(&world, "plain", "src/main.js");
+    let caller = declaration_in(&world, "caller", "src/main.js");
+    let assert_page = |page: &Value, caller: &str, tag: &str, same_name: u64| {
+        assert_eq!(incoming_owners(page), [caller, caller], "{page}");
+        for item in page["data"]["callers"].as_array().unwrap() {
+            assert_eq!(item["bindingMatch"], tag, "{page}");
+        }
+        let mut counts = json!({"boundHere":0,"pointsHere":0,"pointsElsewhere":0,"noTarget":0});
+        counts[tag] = json!(2);
+        assert_eq!(page["data"]["bindingMatches"], counts, "{page}");
+        assert_eq!(
+            page["data"]["match"]["sameNameDeclarations"], same_name,
+            "{page}"
+        );
+        assert!(
+            page["data"].get("boundElsewhereOmitted").is_none(),
+            "{page}"
+        );
+    };
+    let incoming = |mcp: &mut McpSession, symbol: &str| {
+        mcp.success(
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":symbol}),
+        )
+    };
+    let mut mcp = McpSession::start(&world, 994);
+    let page = incoming(&mut mcp, &plain);
+    assert_page(&page, &caller, "boundHere", 1);
+    for item in page["data"]["callers"].as_array().unwrap() {
+        assert_eq!(item["freshness"], "fresh", "{page}");
+    }
+    mcp.finish();
+
+    // The edit runs in a second world, which no MCP session has served yet.
+    drop(world);
+    let (world, p) = published();
+    let plain = declaration_in(&world, "plain", "src/main.js");
+    let caller = declaration_in(&world, "caller", "src/main.js");
+    write_files(
+        &world.root,
+        &[("src/other.js", "export function plain() { return 2; }\n")],
+    );
+    let (graph, native_artifact, capture) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let native = world
+        .store
+        .publish_native_recovery_for_tests(
+            &graph,
+            &capture,
+            &native_artifact,
+            &leader,
+            &world.cancel,
+        )
+        .unwrap();
+    drop(leader);
+    assert_ne!(native, p);
+    world
+        .store
+        .catch_up_semantic_for_tests(&world.cancel)
+        .unwrap();
+    let other = declaration_in(&world, "plain", "src/other.js");
+    let mut mcp = McpSession::start(&world, 995);
+    let page = incoming(&mut mcp, &plain);
+    assert_page(&page, &caller, "pointsHere", 2);
+    for item in page["data"]["callers"].as_array().unwrap() {
+        assert_eq!(item["freshness"], "possiblyStale", "{page}");
+    }
+    assert_page(&incoming(&mut mcp, &other), &caller, "pointsElsewhere", 2);
     mcp.finish();
 }
 
