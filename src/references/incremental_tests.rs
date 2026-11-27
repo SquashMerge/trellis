@@ -174,6 +174,7 @@ fn single(snapshot: &Snapshot, raw: bool, ambiguous: bool) -> CompletedFile {
     site.anchor = (!admitted.docs[source].semantic.anchors.is_empty()).then_some(0);
     let completed = file_references(
         read,
+        read.docs,
         &mut catalogs,
         PreparedFile {
             source,

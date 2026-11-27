@@ -514,8 +514,7 @@ fn resolve_keeping(
         document_map,
         total_bytes,
     } = admit_snapshot(snapshot, check)?;
-    // Parsing is unbudgeted, so one pass over every document keeps all workers busy.
-    let (trees, gaps): (Vec<_>, Vec<_>) = map_all(&docs, workers, request, |doc| {
+    let parse = |doc: &DocumentInput| -> Result<(Tree, Option<syntax_bounds::SyntaxGap>)> {
         let check = &mut request.worker();
         let (tree, unread) = syntax(doc, snapshot.unparsed.contains(&doc.key), check)?;
         let gap = if unread {
@@ -526,9 +525,88 @@ fn resolve_keeping(
             syntax_bounds::scan(tree.root_node(), check)?
         };
         Ok((tree, gap))
-    })?
-    .into_iter()
-    .unzip();
+    };
+    let lanes = lanes(&docs, |_| true);
+    // Parsing is unbudgeted, so one pass over every document keeps all workers busy. A read
+    // whose syntax would not fit at once parses in lanes, and prepares each selected source
+    // while its lane holds its tree (#1321).
+    let (trees, gaps): (Vec<_>, Vec<_>) = if lanes.len() == 1 {
+        map_all(&docs, workers, request, |doc| parse(doc))?
+            .into_iter()
+            .unzip()
+    } else {
+        (Vec::new(), vec![None; docs.len()])
+    };
+    let mut gaps = gaps;
+    let selected: Vec<_> = docs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, doc)| {
+            // A document with no evidence has no sites either: only `partialFiles` names it.
+            (sources.selects(&globs, &doc.key.path)
+                && !snapshot.evidence_gaps.contains_key(&doc.key))
+            .then_some(i)
+        })
+        .collect();
+    let limit = work::reference_limit(docs.len(), total_bytes);
+    let rust_source = RustSource::Fresh {
+        keep: keep.is_some(),
+    };
+    let mut trees = trees;
+    let mut is_selected = vec![false; docs.len()];
+    for &i in &selected {
+        is_selected[i] = true;
+    }
+    let early: Early = (0..docs.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    let built =
+        if lanes.len() == 1 {
+            let read = ReadContext {
+                snapshot,
+                docs: &docs,
+                trees: &trees,
+                document_map: &document_map,
+                selected: &selected,
+                sample_limit,
+                workers,
+                request,
+            };
+            build_catalogs(read, limit, rust_source, check)?
+        } else {
+            let read = ReadContext {
+                snapshot,
+                docs: &docs,
+                trees: &[],
+                document_map: &document_map,
+                selected: &selected,
+                sample_limit,
+                workers,
+                request,
+            };
+            let (built, placeholders) =
+                catalogs_in_lanes(
+                    read,
+                    &lanes,
+                    limit,
+                    rust_source,
+                    &|i| {
+                        let (tree, gap) = parse(docs[i])?;
+                        if is_selected[i] {
+                            *early[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(
+                                prepare_file(i, docs[i], &tree, limit, &mut request.worker()),
+                            );
+                        }
+                        Ok(Some((tree, gap)))
+                    },
+                    &|_| false,
+                    &mut gaps,
+                    check,
+                )?;
+            trees = placeholders;
+            built
+        };
+    let (mut catalogs, prepared) = built.context("store_unavailable: fresh Rust catalog")?;
     // Every snapshot document feeds resolution, so path filters do not narrow this list.
     let partial_files: Vec<_> = docs
         .iter()
@@ -543,17 +621,6 @@ fn resolve_keeping(
                 .map(|gap| gap.file(&doc.key))
         })
         .collect();
-    let selected: Vec<_> = docs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, doc)| {
-            // A document with no evidence has no sites either: only `partialFiles` names it.
-            (sources.selects(&globs, &doc.key.path)
-                && !snapshot.evidence_gaps.contains_key(&doc.key))
-            .then_some(i)
-        })
-        .collect();
-    let limit = work::reference_limit(docs.len(), total_bytes);
     let read = ReadContext {
         snapshot,
         docs: &docs,
@@ -564,15 +631,6 @@ fn resolve_keeping(
         workers,
         request,
     };
-    let (mut catalogs, prepared) = build_catalogs(
-        read,
-        limit,
-        RustSource::Fresh {
-            keep: keep.is_some(),
-        },
-        check,
-    )?
-    .context("store_unavailable: fresh Rust catalog")?;
     let kept = keep
         .zip(prepared)
         .map(|(versions, rust)| {
@@ -594,7 +652,27 @@ fn resolve_keeping(
         sources,
         external_packages,
         facts: source_facts,
-    } = selected_references(read, &mut catalogs, &locate, check)?;
+    } = if lanes.len() == 1 {
+        selected_references(read, &mut catalogs, &locate, None, check)?
+    } else {
+        let read = ReadContext {
+            snapshot,
+            docs: &docs,
+            trees: &[],
+            document_map: &document_map,
+            selected: &selected,
+            sample_limit,
+            workers,
+            request,
+        };
+        selected_references(
+            read,
+            &mut catalogs,
+            &locate,
+            Some((&mut trees, &early)),
+            check,
+        )?
+    };
     external_packages.validate(&sources)?;
     drop_trees(trees, workers);
     let base = ReferenceBase {
@@ -666,6 +744,46 @@ struct Catalogs {
     /// By sorted document, whether its syntax was parsed: `None` when every document was.
     /// A kept Rust catalog spares clean Rust documents (#1315).
     parsed: Option<Vec<bool>>,
+    /// Sources whose tree is parsed only if their resolution reads it (#1321).
+    lazy: BTreeMap<usize, LazySyntax>,
+}
+
+/// A source's syntax, parsed on first use (#1321): the same bounded parse as [`syntax`].
+pub(crate) struct LazySyntax {
+    key: DocumentKey,
+    text: String,
+    unparsed: bool,
+    tree: std::sync::OnceLock<Tree>,
+}
+
+impl LazySyntax {
+    fn of(doc: &DocumentInput, unparsed: bool) -> Self {
+        Self {
+            key: doc.key.clone(),
+            text: doc.file.text.clone(),
+            unparsed,
+            tree: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(super) fn tree(&self, check: &mut impl FnMut() -> Result<()>) -> Result<&Tree> {
+        if let Some(tree) = self.tree.get() {
+            return Ok(tree);
+        }
+        let tree = if self.unparsed {
+            None
+        } else {
+            syntax_bounds::parse_stored(
+                &self.key.language,
+                &grammar(&self.key)?,
+                &self.text,
+                "bounded_work: reference parser stopped",
+                check,
+            )?
+        };
+        let tree = tree.unwrap_or_else(|| syntax_bounds::unread_tree(&self.text));
+        Ok(self.tree.get_or_init(|| tree))
+    }
 }
 
 /// Admission: the documents in key order, each with one file module and within the byte
@@ -775,7 +893,36 @@ fn build_catalogs(
     limit: usize,
     rust_source: RustSource<'_>,
     check: &mut impl FnMut() -> Result<()>,
-) -> Result<Option<(Catalogs, Option<rust::kept::Prepared>)>> {
+) -> Result<BuiltCatalogs> {
+    let jobs = map_batch(&CATALOGS, read.workers, read.request, |&language| {
+        build_catalog(language, read, limit, rust_source)
+    })?;
+    admit_catalogs(jobs, limit, rust_source, check)
+}
+
+/// Built catalogs and the kept Rust half, or `None` for a kept Rust catalog that declined.
+type BuiltCatalogs = Option<(Catalogs, Option<rust::kept::Prepared>)>;
+
+/// The catalogs in admission order: Rust, Java, Python, then JavaScript and TypeScript.
+const CATALOGS: [u8; 4] = [0, 1, 2, 3];
+
+/// The catalog that reads a language's syntax.
+fn catalog_of(language: &str) -> u8 {
+    match language {
+        "rust" => 0,
+        "java" => 1,
+        "python" => 2,
+        _ => 3,
+    }
+}
+
+/// One catalog under its own count of the limit. It reads only its own language's trees.
+fn build_catalog(
+    language: u8,
+    read: ReadContext<'_, '_>,
+    limit: usize,
+    rust_source: RustSource<'_>,
+) -> Result<(CatalogJob, usize)> {
     let ReadContext {
         snapshot,
         docs,
@@ -786,100 +933,104 @@ fn build_catalogs(
         request,
         ..
     } = read;
-    let catalogs = map_batch(&[0u8, 1, 2, 3], workers, request, |language| {
-        let mut check = request.worker();
-        let mut work = Work::new(limit);
-        let catalog = match language {
-            0 => {
-                let packages =
-                    external::RustPackages::new(&snapshot.manifests, &mut work, &mut check)?;
-                let workspace =
-                    cargo_workspace::Workspace::new(&snapshot.manifests, &mut work, &mut check)?;
-                let (prepared, execution) = match rust_source {
-                    RustSource::Fresh { .. } => {
-                        rust::kept::Prepared::build(docs, trees, &workspace, work, &mut check)?
-                    }
-                    RustSource::Kept {
-                        prepared, changed, ..
-                    } => match prepared
-                        .replace(docs, trees, changed, &workspace, work, &mut check)?
-                    {
-                        Some(replaced) => replaced,
-                        None => return Ok((CatalogJob::Declined, 0)),
-                    },
-                };
-                let keep = !matches!(rust_source, RustSource::Fresh { keep: false });
-                let (catalog, kept) = if keep {
-                    let catalog = prepared.finish(
-                        docs,
-                        document_map,
-                        &workspace,
-                        &packages,
-                        execution,
-                        &mut check,
-                    )?;
-                    (catalog, Some(prepared))
-                } else {
-                    let catalog = prepared.finish_owned(
-                        docs,
-                        document_map,
-                        &workspace,
-                        &packages,
-                        execution,
-                        &mut check,
-                    )?;
-                    (catalog, None)
-                };
-                let used = catalog.1.work.used;
-                return Ok((CatalogJob::Rust(Box::new((catalog, packages, kept))), used));
-            }
-            1 => CatalogJob::Java(Box::new(java::Catalog::new(
-                docs, trees, selected, &mut work, &mut check,
-            )?)),
-            2 => CatalogJob::Python(Box::new(python::Catalog::new(
-                docs,
-                trees,
-                &snapshot.manifests,
-                selected,
-                &mut work,
-                &mut check,
-            )?)),
-            3 => {
-                let catalog = if selected
-                    .iter()
-                    .any(|&i| script_family(&docs[i].key.language))
-                {
-                    let workspaces =
-                        js_workspace::Workspaces::new(&snapshot.manifests, &mut work, &mut check)?;
-                    let packages = external::JavascriptPackages::new(
-                        &snapshot.manifests,
-                        &workspaces,
-                        &mut work,
-                        &mut check,
-                    )?;
-                    Some(javascript::Catalog::new(
-                        docs,
-                        trees,
-                        document_map,
-                        selected,
-                        &packages,
-                        &workspaces,
-                        snapshot.root_tsconfig.as_ref(),
-                        &mut work,
-                        request,
-                        workers,
-                    )?)
-                } else {
-                    None
-                };
-                CatalogJob::Javascript(Box::new(catalog))
-            }
-            _ => unreachable!(),
-        };
-        Ok((catalog, work.used))
-    })?;
+    let mut check = request.worker();
     let mut work = Work::new(limit);
-    let mut catalogs = catalogs.into_iter();
+    let catalog = match language {
+        0 => {
+            let packages = external::RustPackages::new(&snapshot.manifests, &mut work, &mut check)?;
+            let workspace =
+                cargo_workspace::Workspace::new(&snapshot.manifests, &mut work, &mut check)?;
+            let (prepared, execution) = match rust_source {
+                RustSource::Fresh { .. } => {
+                    rust::kept::Prepared::build(docs, trees, &workspace, work, &mut check)?
+                }
+                RustSource::Kept {
+                    prepared, changed, ..
+                } => match prepared.replace(docs, trees, changed, &workspace, work, &mut check)? {
+                    Some(replaced) => replaced,
+                    None => return Ok((CatalogJob::Declined, 0)),
+                },
+            };
+            let keep = !matches!(rust_source, RustSource::Fresh { keep: false });
+            let (catalog, kept) = if keep {
+                let catalog = prepared.finish(
+                    docs,
+                    document_map,
+                    &workspace,
+                    &packages,
+                    execution,
+                    &mut check,
+                )?;
+                (catalog, Some(prepared))
+            } else {
+                let catalog = prepared.finish_owned(
+                    docs,
+                    document_map,
+                    &workspace,
+                    &packages,
+                    execution,
+                    &mut check,
+                )?;
+                (catalog, None)
+            };
+            let used = catalog.1.work.used;
+            return Ok((CatalogJob::Rust(Box::new((catalog, packages, kept))), used));
+        }
+        1 => CatalogJob::Java(Box::new(java::Catalog::new(
+            docs, trees, selected, &mut work, &mut check,
+        )?)),
+        2 => CatalogJob::Python(Box::new(python::Catalog::new(
+            docs,
+            trees,
+            &snapshot.manifests,
+            selected,
+            &mut work,
+            &mut check,
+        )?)),
+        3 => {
+            let catalog = if selected
+                .iter()
+                .any(|&i| script_family(&docs[i].key.language))
+            {
+                let workspaces =
+                    js_workspace::Workspaces::new(&snapshot.manifests, &mut work, &mut check)?;
+                let packages = external::JavascriptPackages::new(
+                    &snapshot.manifests,
+                    &workspaces,
+                    &mut work,
+                    &mut check,
+                )?;
+                Some(javascript::Catalog::new(
+                    docs,
+                    trees,
+                    document_map,
+                    selected,
+                    &packages,
+                    &workspaces,
+                    snapshot.root_tsconfig.as_ref(),
+                    &mut work,
+                    request,
+                    workers,
+                )?)
+            } else {
+                None
+            };
+            CatalogJob::Javascript(Box::new(catalog))
+        }
+        _ => unreachable!(),
+    };
+    Ok((catalog, work.used))
+}
+
+/// The four built catalogs, in catalog order, admitted into one budget.
+fn admit_catalogs(
+    jobs: Vec<(CatalogJob, usize)>,
+    limit: usize,
+    rust_source: RustSource<'_>,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BuiltCatalogs> {
+    let mut work = Work::new(limit);
+    let mut catalogs = jobs.into_iter();
     let mut admit = |(catalog, used)| -> Result<CatalogJob> {
         merge_work(&mut work, used, check)?;
         Ok(catalog)
@@ -917,9 +1068,140 @@ fn build_catalogs(
             python,
             javascript,
             parsed,
+            lazy: BTreeMap::new(),
         },
         kept,
     )))
+}
+
+/// The source bytes a read parses at once (#1321). Syntax trees take about 60 bytes per
+/// source byte, so a read past this parses each language's catalog in its own lane rather
+/// than holding every tree at once.
+const LANE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LANE_SOURCE_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The lane bytes a read on this thread uses: [`LANE_SOURCE_BYTES`], or a test's own.
+fn lane_source_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_LANE_SOURCE_BYTES.get() {
+        return bytes;
+    }
+    LANE_SOURCE_BYTES
+}
+
+/// Sets this thread's lane bytes until the guard drops.
+#[cfg(test)]
+fn set_lane_source_bytes_for_tests(bytes: usize) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_LANE_SOURCE_BYTES.set(None);
+        }
+    }
+    TEST_LANE_SOURCE_BYTES.set(Some(bytes));
+    Reset
+}
+
+/// The catalogs whose syntax a read holds together (#1321): every catalog at once when the
+/// documents it parses fit [`lane_source_bytes`], else consecutive catalogs while they fit,
+/// one at least.
+fn lanes(docs: &[&DocumentInput], parsed: impl Fn(usize) -> bool) -> Vec<Vec<u8>> {
+    let mut bytes = [0usize; 4];
+    for (i, doc) in docs.iter().enumerate() {
+        if parsed(i) {
+            let catalog = usize::from(catalog_of(&doc.key.language));
+            bytes[catalog] = bytes[catalog].saturating_add(doc.file.text.len());
+        }
+    }
+    let budget = lane_source_bytes();
+    if bytes.iter().fold(0usize, |sum, b| sum.saturating_add(*b)) <= budget {
+        return vec![CATALOGS.to_vec()];
+    }
+    let mut lanes: Vec<Vec<u8>> = Vec::new();
+    let mut held = 0usize;
+    for catalog in CATALOGS {
+        let size = bytes[usize::from(catalog)];
+        match lanes.last_mut() {
+            Some(lane) if held.saturating_add(size) <= budget => {
+                lane.push(catalog);
+                held += size;
+            }
+            _ => {
+                lanes.push(vec![catalog]);
+                held = size;
+            }
+        }
+    }
+    lanes
+}
+
+/// Parse and build the catalogs lane by lane (#1321), each lane's syntax dropped once its
+/// catalogs are built, except the trees `keep` names. Returns the catalogs (or `None` for a
+/// declined kept Rust catalog), every document's tree (a placeholder unless kept) and gap.
+#[allow(clippy::too_many_arguments)]
+fn catalogs_in_lanes(
+    read: ReadContext<'_, '_>,
+    lanes: &[Vec<u8>],
+    limit: usize,
+    rust_source: RustSource<'_>,
+    parse: &(dyn Fn(usize) -> Result<Option<(Tree, Option<syntax_bounds::SyntaxGap>)>> + Sync),
+    keep: &(dyn Fn(usize) -> bool + Sync),
+    gaps: &mut [Option<syntax_bounds::SyntaxGap>],
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<(BuiltCatalogs, Vec<Tree>)> {
+    let docs = read.docs;
+    let placeholder = syntax_bounds::unread_tree("");
+    let mut kept: Vec<Tree> = vec![placeholder.clone(); docs.len()];
+    let mut jobs: Vec<Option<(CatalogJob, usize)>> = (0..4).map(|_| None).collect();
+    for lane in lanes {
+        let members: Vec<usize> = (0..docs.len())
+            .filter(|&i| lane.contains(&catalog_of(&docs[i].key.language)))
+            .collect();
+        let parsed = map_all(&members, read.workers, read.request, |&i| parse(i))?;
+        let mut trees = vec![placeholder.clone(); docs.len()];
+        for (&i, parsed) in members.iter().zip(parsed) {
+            if let Some((tree, gap)) = parsed {
+                trees[i] = tree;
+                gaps[i] = gap;
+            }
+        }
+        let built = map_batch(lane, read.workers, read.request, |&language| {
+            build_catalog(
+                language,
+                ReadContext {
+                    trees: &trees,
+                    ..read
+                },
+                limit,
+                rust_source,
+            )
+        })?;
+        for (&language, job) in lane.iter().zip(built) {
+            jobs[usize::from(language)] = Some(job);
+        }
+        for &i in &members {
+            if keep(i) {
+                std::mem::swap(&mut kept[i], &mut trees[i]);
+            }
+        }
+        drop_trees(trees, read.workers);
+        if matches!(jobs[0], Some((CatalogJob::Declined, _))) {
+            break;
+        }
+    }
+    if matches!(jobs[0], Some((CatalogJob::Declined, _))) {
+        return Ok((None, kept));
+    }
+    let jobs = jobs
+        .into_iter()
+        .map(|job| job.context("store_unavailable: reference catalog lane"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((admit_catalogs(jobs, limit, rust_source, check)?, kept))
 }
 
 /// Every declaration of the snapshot, by sorted document and syntax ID.
@@ -967,13 +1249,19 @@ struct CompletedFile {
 
 /// The references of every selected source, in batches of one prepared file per worker,
 /// each admitted in source order.
+/// What a lane prepared of each selected source while its tree was held (#1321), under the
+/// whole read's allowance, an upper bound of the one its batch later has.
+type Early = Vec<std::sync::Mutex<Option<Result<PreparedFile>>>>;
+
 fn selected_references(
     read: ReadContext<'_, '_>,
     catalogs: &mut Catalogs,
     locate: &impl Fn(usize, &str) -> Option<usize>,
+    mut reparse: Option<(&mut Vec<Tree>, &Early)>,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SelectedReferences> {
     let ReadContext {
+        snapshot,
         docs,
         trees,
         selected,
@@ -989,15 +1277,72 @@ fn selected_references(
     let mut target_documents: BTreeMap<usize, TargetDocument<'_>> = BTreeMap::new();
     for batch in selected.chunks(workers) {
         let remaining = catalogs.rust_execution.work.remaining();
-        let prepared = map_batch(batch, workers, request, |&source| {
-            prepare_file(
-                source,
-                docs[source],
-                &trees[source],
-                remaining,
-                &mut request.worker(),
-            )
-        })?;
+        let (prepared, batch_trees) = match reparse.as_mut() {
+            None => (
+                map_batch(batch, workers, request, |&source| {
+                    prepare_file(
+                        source,
+                        docs[source],
+                        &trees[source],
+                        remaining,
+                        &mut request.worker(),
+                    )
+                })?,
+                None,
+            ),
+            // With syntax parsed in lanes (#1321), a source prepared there within this
+            // batch's own allowance is exactly the one that allowance gives, and its tree is
+            // parsed again only if its resolution reads it. Any other batch parses and
+            // prepares again under its own allowance.
+            Some((held, early)) => {
+                let taken: Vec<_> = batch
+                    .iter()
+                    .map(|&source| {
+                        early[source]
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                    })
+                    .collect();
+                if taken
+                    .iter()
+                    .all(|file| matches!(file, Some(Ok(file)) if file.work.used <= remaining))
+                {
+                    let mut prepared = Vec::with_capacity(taken.len());
+                    for file in taken {
+                        let mut file = file.expect("prepared early").expect("prepared early");
+                        file.work.limit = remaining;
+                        let doc = docs[file.source];
+                        if doc.key.language == "rust" {
+                            catalogs.lazy.insert(
+                                file.source,
+                                LazySyntax::of(doc, snapshot.unparsed.contains(&doc.key)),
+                            );
+                        }
+                        prepared.push(file);
+                    }
+                    (prepared, Some(held.as_slice()))
+                } else {
+                    let parsed = map_batch(batch, workers, request, |&source| {
+                        let check = &mut request.worker();
+                        let doc = docs[source];
+                        let (tree, _) = syntax(doc, snapshot.unparsed.contains(&doc.key), check)?;
+                        let prepared = prepare_file(source, doc, &tree, remaining, check)?;
+                        Ok((prepared, tree))
+                    })?;
+                    let mut prepared = Vec::with_capacity(parsed.len());
+                    for (file, tree) in parsed {
+                        held[file.source] = tree;
+                        prepared.push(file);
+                    }
+                    (prepared, Some(held.as_slice()))
+                }
+            }
+        };
+        let read = ReadContext {
+            trees: batch_trees.unwrap_or(trees),
+            ..read
+        };
         for prepared in prepared {
             let CompletedFile {
                 source,
@@ -1006,6 +1351,7 @@ fn selected_references(
                 facts: source_facts,
             } = file_references(
                 read,
+                docs,
                 catalogs,
                 prepared,
                 locate,
@@ -1020,6 +1366,13 @@ fn selected_references(
             sources[source] = Some(Arc::new(found));
             facts[source] = source_facts;
         }
+        catalogs.lazy.clear();
+        if let Some((held, _)) = reparse.as_mut() {
+            let placeholder = syntax_bounds::unread_tree("");
+            for &source in batch {
+                held[source] = placeholder.clone();
+            }
+        }
     }
     Ok(SelectedReferences {
         sources,
@@ -1030,8 +1383,10 @@ fn selected_references(
 
 /// One prepared file's sites, in site order: each resolved structurally by its language's
 /// catalog, then by its semantic binding, counted against the site limit and recorded.
+#[allow(clippy::too_many_arguments)]
 fn file_references<'a>(
-    read: ReadContext<'a, '_>,
+    read: ReadContext<'_, '_>,
+    target_docs: &[&'a DocumentInput],
     catalogs: &mut Catalogs,
     prepared: PreparedFile,
     locate: &impl Fn(usize, &str) -> Option<usize>,
@@ -1146,7 +1501,7 @@ fn file_references<'a>(
         )? {
             let entry = target_documents
                 .entry(target)
-                .or_insert_with(|| TargetDocument::new(docs[target]));
+                .or_insert_with(|| TargetDocument::new(target_docs[target]));
             site.target = entry.by_sid.get(sid.as_str()).map(|d| ReferenceTarget {
                 syntax_id: sid.clone(),
                 display_key: display_key(d),
@@ -2218,6 +2573,8 @@ mod historical_projection_tests;
 #[cfg(test)]
 mod range_index_tests;
 
+#[cfg(test)]
+mod lanes_tests;
 #[cfg(test)]
 mod parallel_tests;
 

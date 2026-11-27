@@ -218,58 +218,94 @@ pub(super) fn prepare_with_workers(
             }
         }
         let placeholder = syntax_bounds::unread_tree("");
-        let (mut trees, mut gaps): (Vec<_>, Vec<_>) = map_all(
-            &(0..docs.len()).collect::<Vec<_>>(),
-            workers,
-            &request,
-            |&i| match usable {
-                Some(kept) if !parsed[i] => Ok((placeholder.clone(), kept.gaps[i].clone())),
-                _ => syntax(docs[i]),
-            },
-        )?
-        .into_iter()
-        .unzip();
         let limit = work::reference_limit(docs.len(), total_bytes);
         let selected = docs
             .iter()
             .enumerate()
             .filter_map(|(i, doc)| (!snapshot.evidence_gaps.contains_key(&doc.key)).then_some(i))
             .collect::<Vec<_>>();
-        let mut built = None;
-        if let Some(kept) = usable {
-            built = build_catalogs(
-                ReadContext {
-                    snapshot,
-                    docs: &docs,
-                    trees: &trees,
-                    document_map: &document_map,
-                    selected: &selected,
-                    sample_limit: MAX_SAMPLE_LIMIT,
-                    workers,
-                    request: &request,
-                },
-                limit,
-                RustSource::Kept {
-                    prepared: &kept.rust,
-                    changed: &changed,
-                    parsed: &parsed,
-                },
-                check,
-            )?;
-        }
-        let (catalogs, prepared) = match built {
-            Some(built) => built,
-            None => {
-                // No kept catalog, or one that cannot take this change: parse the rest and
-                // build in full.
-                let rest: Vec<usize> = (0..docs.len()).filter(|&i| !parsed[i]).collect();
-                let reparsed = map_all(&rest, workers, &request, |&i| syntax(docs[i]))?;
-                for (i, (tree, gap)) in rest.into_iter().zip(reparsed) {
-                    trees[i] = tree;
-                    gaps[i] = gap;
-                    parsed[i] = true;
+        // A read whose syntax would not fit at once parses in lanes (#1321), keeping only the
+        // trees `finish_incremental` reads: its dirty sources, and the Rust sources it parsed,
+        // whose replay may read their syntax.
+        let plan = match dirty {
+            Some(_) => lanes(&docs, |i| usable.is_none() || parsed[i]),
+            None => vec![CATALOGS.to_vec()],
+        };
+        let (trees, gaps, catalogs, prepared) = if plan.len() > 1 {
+            let dirty = dirty.expect("lanes need the dirty sources");
+            let is_dirty: Vec<bool> = docs.iter().map(|doc| dirty.contains(&doc.key)).collect();
+            let read = ReadContext {
+                snapshot,
+                docs: &docs,
+                trees: &[],
+                document_map: &document_map,
+                selected: &selected,
+                sample_limit: MAX_SAMPLE_LIMIT,
+                workers,
+                request: &request,
+            };
+            let mut gaps = vec![None; docs.len()];
+            let mut built = None;
+            let mut trees = Vec::new();
+            if let Some(kept) = usable {
+                for (i, gap) in gaps.iter_mut().enumerate() {
+                    if !parsed[i] {
+                        gap.clone_from(&kept.gaps[i]);
+                    }
                 }
-                build_catalogs(
+                let keep = |i: usize| is_dirty[i] || (docs[i].key.language == "rust" && parsed[i]);
+                (built, trees) = catalogs_in_lanes(
+                    read,
+                    &plan,
+                    limit,
+                    RustSource::Kept {
+                        prepared: &kept.rust,
+                        changed: &changed,
+                        parsed: &parsed,
+                    },
+                    &|i| {
+                        if parsed[i] {
+                            syntax(docs[i]).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    &keep,
+                    &mut gaps,
+                    check,
+                )?;
+            }
+            if built.is_none() {
+                // No kept catalog, or one that cannot take this change: build in full.
+                let keep = |i: usize| is_dirty[i] || docs[i].key.language == "rust";
+                (built, trees) = catalogs_in_lanes(
+                    read,
+                    &lanes(&docs, |_| true),
+                    limit,
+                    RustSource::Fresh { keep: keeping },
+                    &|i| syntax(docs[i]).map(Some),
+                    &keep,
+                    &mut gaps,
+                    check,
+                )?;
+            }
+            let (catalogs, prepared) = built.context("store_unavailable: fresh Rust catalog")?;
+            (trees, gaps, catalogs, prepared)
+        } else {
+            let (mut trees, mut gaps): (Vec<_>, Vec<_>) = map_all(
+                &(0..docs.len()).collect::<Vec<_>>(),
+                workers,
+                &request,
+                |&i| match usable {
+                    Some(kept) if !parsed[i] => Ok((placeholder.clone(), kept.gaps[i].clone())),
+                    _ => syntax(docs[i]),
+                },
+            )?
+            .into_iter()
+            .unzip();
+            let mut built = None;
+            if let Some(kept) = usable {
+                built = build_catalogs(
                     ReadContext {
                         snapshot,
                         docs: &docs,
@@ -281,11 +317,45 @@ pub(super) fn prepare_with_workers(
                         request: &request,
                     },
                     limit,
-                    RustSource::Fresh { keep: keeping },
+                    RustSource::Kept {
+                        prepared: &kept.rust,
+                        changed: &changed,
+                        parsed: &parsed,
+                    },
                     check,
-                )?
-                .context("store_unavailable: fresh Rust catalog")?
+                )?;
             }
+            let (catalogs, prepared) = match built {
+                Some(built) => built,
+                None => {
+                    // No kept catalog, or one that cannot take this change: parse the rest and
+                    // build in full.
+                    let rest: Vec<usize> = (0..docs.len()).filter(|&i| !parsed[i]).collect();
+                    let reparsed = map_all(&rest, workers, &request, |&i| syntax(docs[i]))?;
+                    for (i, (tree, gap)) in rest.into_iter().zip(reparsed) {
+                        trees[i] = tree;
+                        gaps[i] = gap;
+                        parsed[i] = true;
+                    }
+                    build_catalogs(
+                        ReadContext {
+                            snapshot,
+                            docs: &docs,
+                            trees: &trees,
+                            document_map: &document_map,
+                            selected: &selected,
+                            sample_limit: MAX_SAMPLE_LIMIT,
+                            workers,
+                            request: &request,
+                        },
+                        limit,
+                        RustSource::Fresh { keep: keeping },
+                        check,
+                    )?
+                    .context("store_unavailable: fresh Rust catalog")?
+                }
+            };
+            (trees, gaps, catalogs, prepared)
         };
         let partial_files = docs
             .iter()
@@ -437,6 +507,7 @@ pub(crate) fn finish_incremental(
                     trace.file_references.push(docs[source].key.clone());
                     let completed = file_references(
                         read,
+                        &docs,
                         &mut catalogs,
                         prepared.next().expect("prepared dirty source"),
                         &locate,

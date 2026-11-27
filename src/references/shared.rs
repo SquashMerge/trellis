@@ -105,10 +105,13 @@ pub(super) fn resolve_charge_site(
         python,
         javascript,
         parsed,
+        lazy,
     } = catalogs;
     // A clean source a kept catalog spares from parsing reads what it read before (#1315).
     let syntax = if parsed.as_ref().is_some_and(|parsed| !parsed[source]) {
         super::rust::SiteSyntax::Recorded(site.glob.as_ref())
+    } else if let Some(lazy) = lazy.get(&source) {
+        super::rust::SiteSyntax::Lazy(lazy)
     } else {
         super::rust::SiteSyntax::Tree(&read.trees[source])
     };
