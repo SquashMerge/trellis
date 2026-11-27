@@ -565,12 +565,6 @@ fn recheck_build(
     }
 }
 
-/// MEASUREMENT ONLY (#1313 T10b A/B; removed before the PR): `X1313_T10B=off` turns the
-/// deferral off.
-fn deferral_enabled() -> bool {
-    std::env::var_os("X1313_T10B").is_none_or(|value| value != "off")
-}
-
 fn verify_value(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
@@ -1008,15 +1002,12 @@ impl DaemonState {
         // sampled first: a catch-up unit that ends after this read bumps it, and this turn
         // then builds rather than skip on a stale queue read.
         let settles = owner.state.lock().unwrap().catchup_settles;
-        let catchup = if deferral_enabled() {
-            self.store
-                .pending_semantic_target()
-                .ok()
-                .flatten()
-                .map(|target| target.pin)
-        } else {
-            None
-        };
+        let catchup = self
+            .store
+            .pending_semantic_target()
+            .ok()
+            .flatten()
+            .map(|target| target.pin);
         let (key, bases, base_cancelled) = {
             let mut state = owner.state.lock().unwrap();
             state.head = Some(head);
