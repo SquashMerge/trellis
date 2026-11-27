@@ -477,6 +477,7 @@ fn an_mcp_launch_attach_spends_one_deadline_across_connect_and_attach() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(&paths.lock)
         .unwrap();
