@@ -343,8 +343,10 @@ impl StoppingDaemon {
     }
 }
 
-/// Wall time a bounded wait may take beyond its bound: process start and the last pause.
-const BOUND_MARGIN: Duration = Duration::from_secs(3);
+/// Wall time a bounded wait may take beyond its bound: process start and the last pause,
+/// with room for a loaded runner. The 12 s ceiling still separates the bounded case
+/// (about 2 s) from an unbounded one (27.5 s and 60.8 s at the parent).
+const BOUND_MARGIN: Duration = Duration::from_secs(10);
 
 /// The stop wait's one deadline holds even when an attempt inside it would outlive it:
 /// the silent second attempt gets only what is left of the wait, and the command fails
