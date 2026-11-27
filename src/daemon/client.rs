@@ -1941,7 +1941,8 @@ mod cancellation_tests {
         let result = connect_or_start_until(
             &socket,
             || {
-                std::thread::sleep(Duration::from_millis(375));
+                // A slow start: it returns only once the deadline has passed.
+                crate::testing::wait_until("the deadline passes", || Instant::now() > deadline);
                 listener = Some(std::os::unix::net::UnixListener::bind(&socket)?);
                 Ok(StartOutcome::Started)
             },
