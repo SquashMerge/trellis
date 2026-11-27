@@ -2570,6 +2570,106 @@ async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
 }
 
+/// #1291: releases an idle checkout still owed when it retired are settled by the release pass
+/// that follows the next activation's startup reconciliation, before the worker first sleeps
+/// on its idle timers. The head stays head and readable (Decision 0006 §1).
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn revisions_due_while_retired_are_released_when_the_checkout_reactivates() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // This active runtime never reaches a retention unit, as when it retires before
+    // the grace passes. The test store dates its two publications 30 minutes ago:
+    // by the real clock, the grace of the revisions they supersede passed while the
+    // checkout was retired.
+    let held = scheduler.hold_worker_for_tests();
+    assert!(scheduler.delay_timed_work_for_tests());
+    let past = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 1_800;
+    store.set_retention_clock_for_tests(past, 0);
+    let owner = scheduler.checkout_serving_owner().unwrap();
+    let publish = |expected| {
+        let (graph, native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.writer_guard().unwrap(),
+                expected,
+                &cancel,
+            )
+            .unwrap()
+    };
+    let first = store.index_baseline().unwrap();
+    let old = publish(first);
+    let head = publish(old);
+    drop(owner);
+    drop(held);
+    let owed =
+        [first, old].map(|pin| format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision));
+    for revision in &owed {
+        let ((state, debt, rows), _) = store.retention_state_for_tests(revision).unwrap();
+        assert_eq!((state.as_str(), debt), ("retained", 0), "{revision}");
+        assert!(rows > 0, "{revision}");
+    }
+    drop(store);
+
+    // Idle retirement, then the next activation.
+    registry.disconnect(1);
+    release_when_idle(&mut registry, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
+    registry.attach_launch(2, &id).unwrap();
+    let fresh = registry.activate(&id.root_key).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&fresh, &runtime));
+    assert_eq!(fresh.settled_for_tests(None).await.unwrap(), head);
+    let scheduler = fresh.browser_scheduler().unwrap();
+    // Wait for the worker's first sleep on an idle timer (watcher inventory and retention
+    // are 60 s); a deferred or retried step sleeps only 250 ms.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Some(Some(deadline)) = scheduler.worker_asleep_until_for_tests()
+                && deadline > std::time::Instant::now() + Duration::from_secs(10)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reactivated worker never went idle");
+    let store =
+        trellis::testing::retry_admission(|| Store::open(roots(base.path()), identity(&checkout)));
+    for revision in &owed {
+        assert_eq!(
+            store.retention_state_for_tests(revision).unwrap(),
+            (("released".to_string(), 0, 0), (0, 0)),
+            "{revision} was not released by the activation's release pass"
+        );
+    }
+    assert_eq!(store.index_baseline().unwrap(), head);
+    let (read, _) = fresh.evidence_response().unwrap();
+    assert!(read.source_at("a.js", None).unwrap().is_some());
+    read.finish(()).unwrap();
+}
+
 /// Decision 0009 §8: an index waiter records the terminal-commit count, re-reads
 /// its row and sleeps until a confirmed terminal COMMIT, never polling.
 #[cfg(feature = "test-support")]
