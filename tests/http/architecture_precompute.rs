@@ -355,20 +355,37 @@ async fn architecture_incremental_add_delete_and_rename() {
     let (base, runtime, _, _) =
         super::architecture_http::fixture_exact_sources(NATIVE_SOURCES).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    for edits in [
-        vec![("src/added.rs", Some("pub fn added() {}\n"))],
-        vec![("src/added.rs", None)],
-        vec![
-            ("src/clean.rs", None),
-            ("src/renamed.rs", Some("pub fn clean() {}\n")),
-        ],
+    // Deleting the added file returns to the first core's document set, and that retained
+    // core leaves no document dirty (#1313): the build starts from it, not from the newest.
+    for (edits, from_older_core) in [
+        (vec![("src/added.rs", Some("pub fn added() {}\n"))], false),
+        (vec![("src/added.rs", None)], true),
+        (
+            vec![
+                ("src/clean.rs", None),
+                ("src/renamed.rs", Some("pub fn clean() {}\n")),
+            ],
+            false,
+        ),
     ] {
         let pin = index_edit(&base, &runtime, &edits).await;
         let attempt = published_attempt(&scheduler, pin);
-        assert_eq!(
-            attempt.path,
-            ArchitectureBuildPath::Full(FullReason::DocumentSetChanged)
-        );
+        if from_older_core {
+            assert!(
+                matches!(
+                    &attempt.path,
+                    ArchitectureBuildPath::Incremental { dirty, patched, .. }
+                        if dirty.is_empty() && patched.is_empty()
+                ),
+                "{:?}",
+                attempt.path
+            );
+        } else {
+            assert_eq!(
+                attempt.path,
+                ArchitectureBuildPath::Full(FullReason::DocumentSetChanged)
+            );
+        }
         assert_eq!(
             core(&scheduler, pin).canonical().unwrap(),
             independent_full(&runtime, pin).await

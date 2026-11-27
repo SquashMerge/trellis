@@ -39,6 +39,7 @@ fn standalone_runtime(tmp: &Path) -> (std::path::PathBuf, Arc<ActiveResources>, 
         mcp_read_hook: std::sync::Mutex::new(None),
         mcp_read_gate: std::sync::Mutex::new(None),
         mcp_admitted_gate: std::sync::Mutex::new(None),
+        mcp_building_gate: std::sync::Mutex::new(None),
         evidence_sampled_hook: std::sync::Mutex::new(None),
     };
     (root, resources, runtime)

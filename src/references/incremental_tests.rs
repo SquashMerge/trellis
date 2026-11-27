@@ -280,8 +280,8 @@ fn full_source_facts_match_actual_work_sites_and_raw_requests() {
         let prepared = prepare_file(index, doc, &trees[index], limit, check).unwrap();
         let plan = facts.plan.as_ref().unwrap();
         assert_eq!(plan.prepared_work, prepared.work.used);
-        assert_eq!(plan.sites.len(), prepared.sites.len());
-        for (recorded, original) in plan.sites.iter().zip(prepared.sites) {
+        assert_eq!(plan.len(), prepared.sites.len());
+        for (recorded, original) in plan.sites().zip(prepared.sites) {
             match (&recorded.structural, original.raw) {
                 (StructuralCharge::Resolve(raw), Some(original)) => {
                     assert_eq!(json!(raw), json!(original))
@@ -340,16 +340,13 @@ fn charge_plan_shapes() {
             let source = document(&snapshot, "src/lib.rs");
             snapshot.documents[source].semantic.anchors = vec![anchor];
             let completed = single(&snapshot, true, false);
-            let plan = completed.facts.plan.unwrap();
+            let plan = completed.facts.plan.unwrap().sites().collect::<Vec<_>>();
             assert_eq!(
-                json!(plan.sites[0].semantic.as_ref().unwrap().historical),
+                json!(plan[0].semantic.as_ref().unwrap().historical),
                 json!(historical)
             );
             assert_eq!(completed.facts.sites, 1);
-            assert!(matches!(
-                plan.sites[0].structural,
-                StructuralCharge::Resolve(_)
-            ));
+            assert!(matches!(plan[0].structural, StructuralCharge::Resolve(_)));
             let expected = match outcome {
                 SemanticOutcome::Boundary => json!("Boundary"),
                 SemanticOutcome::External => json!("External"),
@@ -357,10 +354,7 @@ fn charge_plan_shapes() {
                 SemanticOutcome::Unresolved => json!("Unresolved"),
                 _ => unreachable!(),
             };
-            assert_eq!(
-                json!(plan.sites[0].semantic.as_ref().unwrap().outcome),
-                expected
-            );
+            assert_eq!(json!(plan[0].semantic.as_ref().unwrap().outcome), expected);
             let semantic_only = single(&snapshot, false, false);
             let accepted = historical
                 || matches!(
@@ -382,10 +376,10 @@ fn charge_plan_shapes() {
         (2, 1),
         "one internal lookup and one effective target"
     );
-    let plan = completed.facts.plan.unwrap();
-    assert!(matches!(plan.sites[0].structural, StructuralCharge::None));
+    let plan = completed.facts.plan.unwrap().sites().collect::<Vec<_>>();
+    assert!(matches!(plan[0].structural, StructuralCharge::None));
     let SemanticChargeOutcome::Internal { document, sid } =
-        &plan.sites[0].semantic.as_ref().unwrap().outcome
+        &plan[0].semantic.as_ref().unwrap().outcome
     else {
         panic!("internal plan")
     };
@@ -426,7 +420,7 @@ fn charge_plan_shapes() {
         "semantic-only self site is skipped"
     );
     assert_eq!(
-        skipped.facts.plan.unwrap().sites.len(),
+        skipped.facts.plan.unwrap().len(),
         1,
         "skipped requests remain in the recipe"
     );
@@ -435,7 +429,14 @@ fn charge_plan_shapes() {
     assert_eq!(absent.facts.sites, 0);
     let ambiguous = single(&snapshot, true, true);
     assert!(matches!(
-        ambiguous.facts.plan.unwrap().sites[0].structural,
+        ambiguous
+            .facts
+            .plan
+            .unwrap()
+            .sites()
+            .next()
+            .unwrap()
+            .structural,
         StructuralCharge::OwnerAmbiguous
     ));
     assert_eq!(ambiguous.found.unresolved[0].1, "reference_owner_ambiguous");
@@ -451,7 +452,14 @@ fn charge_plan_shapes() {
     let suppressed = single(&snapshot, true, true);
     assert!(
         matches!(
-            suppressed.facts.plan.unwrap().sites[0].structural,
+            suppressed
+                .facts
+                .plan
+                .unwrap()
+                .sites()
+                .next()
+                .unwrap()
+                .structural,
             StructuralCharge::None
         ),
         "historical suppression precedes owner ambiguity"
@@ -511,7 +519,7 @@ fn complete_semantic_endpoints_precede_sampling_skips_and_boundary_elimination()
         .plan
         .as_ref()
         .unwrap();
-    assert!(plan.sites.iter().any(|site| matches!(
+    assert!(plan.sites().any(|site| matches!(
         site.semantic.as_ref().map(|semantic| &semantic.outcome),
         Some(SemanticChargeOutcome::Internal { document, .. }) if *document == sorted("src/b.rs")
     )));

@@ -274,6 +274,17 @@ pub(crate) struct GlobUse {
     outcome: GlobOutcome,
 }
 
+#[cfg(test)]
+impl GlobUse {
+    /// A recorded glob read for plan tests (#1313).
+    pub(crate) fn for_tests(names: usize) -> Self {
+        Self {
+            names,
+            outcome: GlobOutcome::NoRoot,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 enum GlobOutcome {
     /// No node spans the scope.
