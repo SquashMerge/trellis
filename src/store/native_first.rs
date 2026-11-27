@@ -618,7 +618,10 @@ impl Store {
 }
 
 /// The pending semantic target recorded in `db`'s snapshot, checked against `root`.
-fn pending_target_of(db: &Connection, root: &str) -> Result<Option<PendingSemanticTarget>> {
+pub(super) fn pending_target_of(
+    db: &Connection,
+    root: &str,
+) -> Result<Option<PendingSemanticTarget>> {
     let target = pending_target(db)?;
     if let Some(target) = &target {
         selected_ensure!(
@@ -627,15 +630,6 @@ fn pending_target_of(db: &Connection, root: &str) -> Result<Option<PendingSemant
         );
     }
     Ok(target)
-}
-
-impl super::EvidenceResponse {
-    /// The head this admitted read's snapshot has a semantic catch-up queued for, if any. It
-    /// reads the response's own snapshot, so no second snapshot opens while this one is held
-    /// (#1313 T10b review).
-    pub(crate) fn pending_semantic_target_pin(&self) -> Result<Option<IndexPin>> {
-        Ok(pending_target_of(&self.db, &self.store.identity.root_key)?.map(|target| target.pin))
-    }
 }
 
 impl Store {

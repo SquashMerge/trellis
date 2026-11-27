@@ -1650,6 +1650,16 @@ impl ReadFence {
 type TreeOverlays = Vec<(usize, String, usize)>;
 
 impl EvidenceResponse {
+    /// The head this admitted read's snapshot has a semantic catch-up queued for, if any. It
+    /// reads the response's own snapshot, so no second snapshot opens while this one is held
+    /// (#1313 T10b review).
+    pub(crate) fn pending_semantic_target_pin(&self) -> Result<Option<IndexPin>> {
+        Ok(
+            native_first::pending_target_of(&self.db, &self.store.identity.root_key)?
+                .map(|target| target.pin),
+        )
+    }
+
     /// Carry the runtime automatic re-run labels into `mcp_language_tiers` (#660).
     pub fn with_auto_run_labels(mut self, labels: AutoRunLabels) -> Self {
         self.auto_run = labels;
