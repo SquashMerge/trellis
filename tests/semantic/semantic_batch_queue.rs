@@ -446,7 +446,8 @@ fn reader_sees_old_pin_until_batch_commit_then_complete_new_pin() {
         &socket.with_extension("ready"),
         "publication pause before COMMIT",
     );
-    // The transaction is open and has written every row, but readers still see the old pin.
+    // The publishing transaction is open and the raw batch and payloads are pre-written
+    // (#995), but no revision names them: readers still see the old pin.
     assert_eq!(world.head(), before);
     assert_eq!(world.store.semantic_at(before).unwrap(), prior);
     assert!(
@@ -456,7 +457,11 @@ fn reader_sees_old_pin_until_batch_commit_then_complete_new_pin() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
+    assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(
+        world.count("SELECT count(*) FROM semantic_revision_raw_selections"),
+        0
+    );
     drop(UnixStream::connect(&socket).unwrap());
     let imported = succeeded(&child.wait_with_output().unwrap());
     let published: IndexPin =
@@ -502,8 +507,12 @@ fn precommit_sql_fault_leaves_prior_head_and_retry_publishes_once() {
         before,
         "the failed publication left the prior head"
     );
-    assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
-    assert_eq!(world.count("SELECT count(*) FROM semantic_raw_captures"), 0);
+    // Its pre-written raw batch may remain until maintenance collects it (#995), but no
+    // revision selects it.
+    assert_eq!(
+        world.count("SELECT count(*) FROM semantic_revision_raw_selections"),
+        0
+    );
     assert!(
         world
             .store
@@ -1250,7 +1259,12 @@ fn full_disk_at_commit_fails_storage_full_with_prior_head() {
         &output.stderr,
     );
     assert_eq!(world.head(), prior, "the prior head stays");
-    assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
+    // Its pre-written raw batch may remain until maintenance collects it (#995), but no
+    // revision selects it.
+    assert_eq!(
+        world.count("SELECT count(*) FROM semantic_revision_raw_selections"),
+        0
+    );
     assert_eq!(stage_entries(&world), Vec::<String>::new());
     trellis::testing::wait_until("storage cause", || {
         fs::read_to_string(&log).is_ok_and(|text| text.contains("database or disk is full"))

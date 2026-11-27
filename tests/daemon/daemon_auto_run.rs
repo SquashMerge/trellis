@@ -574,11 +574,11 @@ fn read_surface(mcp: &mut Mcp, lookup: &str) -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// MCP reads keep answering while an automatic run runs its producer and while its import's
-/// publication holds the index (#905). During the producer phase they answer from the prior
-/// validated head. While the publication has spilled to `index.db` and holds every reader out,
-/// they answer the typed, retryable `rebuild_in_progress` within the call's deadline, never a
-/// plain `deadline_exceeded`. After COMMIT they answer from the new head.
+/// MCP reads keep answering while an automatic run runs its producer and while its import
+/// publishes (#905, #995). During the producer phase they answer from the prior validated head.
+/// While the import's publishing transaction is open, its rows pre-written and its COMMIT held,
+/// they still answer from the prior head: the import no longer holds readers out for the whole
+/// publication. After COMMIT they answer from the new head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_answer_while_an_auto_run_runs_and_imports() {
     if !in_own_process("reads_answer_while_an_auto_run_runs_and_imports") {
@@ -613,19 +613,17 @@ async fn reads_answer_while_an_auto_run_runs_and_imports() {
         );
     }
 
-    // Its import's publication has spilled and waits before COMMIT.
+    // Its import has pre-written its rows and waits before the publishing COMMIT.
     let pause = auto.stub_dir.path().join("commit.sock");
-    set_env("TRELLIS_TEST_BATCH_WRITER_CACHE_KIB", "64");
     set_env("TRELLIS_TEST_SEMANTIC_PAUSE_BEFORE_COMMIT_SOCKET", &pause);
     auto.release_hook(SPAWNED);
     let ready = pause.with_extension("ready");
     trellis::testing::wait_until("the publication paused before COMMIT", || ready.exists());
+    let mut held = None;
     for (tool, envelope) in read_surface(&mut mcp, &lookup) {
-        assert_eq!(
-            envelope["error"]["code"], "rebuild_in_progress",
-            "{tool}: {envelope}"
-        );
-        assert_eq!(envelope["error"]["retryable"], true, "{tool}: {envelope}");
+        assert!(envelope.get("error").is_none(), "{tool}: {envelope}");
+        let revision = envelope["evidenceBasis"]["indexRevision"].clone();
+        assert_eq!(*held.get_or_insert(revision.clone()), revision, "{tool}");
     }
 
     UnixStream::connect(&pause).unwrap();
@@ -635,6 +633,11 @@ async fn reads_answer_while_an_auto_run_runs_and_imports() {
     assert_eq!(runs[0]["outcome"], "imported");
     let published = auto.settle();
     assert_ne!(published, prior);
+    // Reads during the held COMMIT answered the head the import then published over.
+    assert_eq!(
+        published["indexRevision"].as_u64().unwrap(),
+        held.unwrap().as_u64().unwrap() + 1
+    );
     for (tool, envelope) in read_surface(&mut mcp, &lookup) {
         assert!(envelope.get("error").is_none(), "{tool}: {envelope}");
         assert_eq!(
