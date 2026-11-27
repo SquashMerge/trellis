@@ -6404,7 +6404,7 @@ async fn an_oversized_answer_is_typed_and_keeps_the_connection() {
     }] {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert_eq!(
-            reply["result"]["structuredContent"]["data"]["toolVersion"], 34,
+            reply["result"]["structuredContent"]["data"]["toolVersion"], 35,
             "{reply}"
         );
     }
@@ -13000,6 +13000,157 @@ async fn a_passed_revision_published_before_the_wait_still_answers_building() {
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
+}
+
+/// #1278: while the head's Architecture core builds, find, search and the call graph with an
+/// `app` filter answer the typed #798 `building`, as the architecture tools do, and without
+/// `app` they answer from the index as before. Every admitted read with `app` costs 1.5 s of
+/// its 3 s call clock, so a second admission after the wait for the owner would run past the
+/// deadline: the answer comes from the owner's state. It was `deadline_exceeded` before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_filtered_reads_during_an_architecture_build_answer_building() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("package.json", "{\"name\":\"web\"}\n"),
+            (
+                "a.js",
+                "import { b } from './b.js';\nexport function a() { return b(); }\n",
+            ),
+            ("b.js", "export function b() { return 1; }\n"),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1278, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    runtime.await_architecture_for_tests();
+    let (entered, reached) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    scheduler.set_architecture_hook_for_tests(std::sync::Arc::new(move |point| {
+        // Mid-build, past its read.
+        if point == "resolving" {
+            let _ = entered.send(());
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP);
+        }
+    }));
+    // A rules edit needs a new core at this revision.
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.other]\norder = 1\npaths = [\"*.js\"]\n",
+    )
+    .unwrap();
+    scheduler.architecture_hint();
+    reached
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let call = |deadline: Duration, name: &str, arguments: Value| {
+        let (mut client, mut reader, session) =
+            socket_session(&identity, &registry, 1278, Some(deadline));
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(1),
+                "tools/call",
+                json!({"name":name,"arguments":arguments})
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+        reply
+    };
+    let builds = scheduler.architecture_builds_for_tests();
+    let mut answers = Vec::new();
+
+    // Without `app` the index answers, the build notwithstanding.
+    let found = call(
+        Duration::from_secs(60),
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"a"}),
+    );
+    tool(&found, None, true);
+    let symbol = found["result"]["structuredContent"]["data"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "a")
+        .unwrap_or_else(|| panic!("{found}"))["symbolId"]
+        .clone();
+    let unfiltered = [
+        (
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":"b"}),
+        ),
+        (
+            "trellis_search_symbols",
+            json!({"schemaVersion":1,"query":"b"}),
+        ),
+        (
+            "trellis_call_graph",
+            json!({"schemaVersion":1,"symbolId":symbol}),
+        ),
+    ];
+    for (name, arguments) in unfiltered.clone() {
+        let reply = call(Duration::from_secs(60), name, arguments);
+        tool(&reply, None, true);
+        answers.push(json!({"name":name,
+            "structuredContent":reply["result"]["structuredContent"]}));
+    }
+
+    // With `app`, each admitted read costs half the call clock from here on.
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let slow = std::sync::Arc::downgrade(&runtime);
+    let counted = admissions.clone();
+    let charging = std::sync::Arc::new(AtomicBool::new(true));
+    let charged = charging.clone();
+    runtime.set_mcp_admitted_gate_for_tests(std::sync::Arc::new(move || {
+        if charged.load(Ordering::Acquire) {
+            counted.fetch_add(1, Ordering::AcqRel);
+            if let Some(runtime) = slow.upgrade() {
+                runtime.advance_mcp_clock_for_tests(Duration::from_millis(1500));
+            }
+        }
+    }));
+    for (index, (name, mut arguments)) in unfiltered.into_iter().enumerate() {
+        arguments["app"] = json!("web");
+        // The gate's charges add up across calls, so each call's clock starts where the
+        // last one's charges left it: 3 s beyond the 1.5 s each earlier call cost.
+        let deadline = Duration::from_millis(1500 * index as u64 + 3000);
+        let reply = call(deadline, name, arguments);
+        tool(&reply, Some("building"), true);
+        let error = &reply["result"]["structuredContent"]["error"];
+        assert_eq!(error["retryable"], true, "{name}: {reply}");
+        assert_eq!(error["retryAfterMs"], 250, "{name}: {reply}");
+        assert_eq!(error["progress"]["phase"], "resolving", "{name}: {reply}");
+        assert!(error["currentBasis"].is_object(), "{name}: {reply}");
+        // One admitted read found the core building; the answer needed no second one.
+        assert_eq!(admissions.load(Ordering::Acquire), index + 1, "{name}");
+        answers.push(json!({"name":name,
+            "structuredContent":reply["result"]["structuredContent"]}));
+    }
+    charging.store(false, Ordering::Release);
+    validate_structured_content(&answers);
+    // No read started another build.
+    assert_eq!(scheduler.architecture_builds_for_tests(), builds);
+    drop(release);
 }
 
 /// #448: a rules check scoped to one file with hundreds of unknown sites failed
