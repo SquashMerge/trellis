@@ -190,6 +190,16 @@ struct OwnerState {
     head: Option<IndexPin>,
     retry_at: Option<Instant>,
     retries: u32,
+    /// The head whose build this owner skipped because a semantic catch-up of that same head
+    /// was queued (#1313 T10b): the catch-up's publication supersedes it. The semantic
+    /// maintenance owner clears it when a catch-up unit ends.
+    deferred: Option<IndexPin>,
+    /// A head whose build is not skipped (again): a read asked for it, or a unit of its
+    /// catch-up ended without publishing it.
+    declined: Option<IndexPin>,
+    /// Counts catch-up units that ended, so a turn that sampled the queue before a unit ended
+    /// does not skip on that sample.
+    catchup_settles: u64,
     /// A hash returning after a different live hash starts a new eligibility episode.
     live_rules: Option<(uuid::Uuid, Option<String>)>,
     eligible: Vec<CoreKey>,
@@ -222,6 +232,13 @@ impl OwnerState {
                 .as_ref()
                 .and_then(|run| run.base_cancelled.as_deref()),
         )
+    }
+
+    /// Whether a turn skips building `head` for a queued semantic catch-up (#1313 T10b): the
+    /// catch-up targets this same head, no unit of it ended without publishing this head,
+    /// and none ended since the turn read the queue (`settles` is the count it sampled).
+    fn defers_for_catchup(&self, head: IndexPin, catchup: Option<IndexPin>, settles: u64) -> bool {
+        catchup == Some(head) && self.declined != Some(head) && self.catchup_settles == settles
     }
 
     /// Every retained core a build of `key` may start from, newest first (#1313).
@@ -548,6 +565,12 @@ fn recheck_build(
     }
 }
 
+/// MEASUREMENT ONLY (#1313 T10b A/B; removed before the PR): `X1313_T10B=off` turns the
+/// deferral off.
+fn deferral_enabled() -> bool {
+    std::env::var_os("X1313_T10B").is_none_or(|value| value != "off")
+}
+
 fn verify_value(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
@@ -695,6 +718,37 @@ impl DaemonState {
         self.architecture.0.changed.notify_all();
     }
 
+    /// A semantic catch-up unit ended (#1313 T10b). When the owner skipped the head's build
+    /// for that catch-up, it looks again now: a published catch-up moved the head, and one
+    /// that did not publish leaves this head to build.
+    pub(crate) fn architecture_catchup_unit_ended(self: &Arc<Self>, published: bool) {
+        let mut state = self.architecture.0.state.lock().unwrap();
+        state.catchup_settles = state.catchup_settles.wrapping_add(1);
+        let Some(head) = state.deferred.take() else {
+            return;
+        };
+        if !published {
+            state.declined = Some(head);
+        }
+        self.hint_locked(&mut state);
+        drop(state);
+        self.architecture.0.changed.notify_all();
+    }
+
+    /// Build `pin` even while a semantic catch-up of it is queued, as when a unit of that
+    /// catch-up ended without publishing it: for fixtures that drive catch-up themselves and
+    /// ask for the native head's own core.
+    #[cfg(feature = "test-support")]
+    pub fn architecture_decline_catchup_for_tests(self: &Arc<Self>, pin: IndexPin) {
+        let mut state = self.architecture.0.state.lock().unwrap();
+        state.declined = Some(pin);
+        if state.deferred.take().is_some() {
+            self.hint_locked(&mut state);
+        }
+        drop(state);
+        self.architecture.0.changed.notify_all();
+    }
+
     fn start_architecture_owner(self: &Arc<Self>, state: &mut OwnerState) {
         if state.thread_started {
             return;
@@ -820,6 +874,12 @@ impl DaemonState {
             let progress = running.and_then(|running| running.progress);
             if running.is_none() && !submitted {
                 submitted = true;
+                // A read of a head whose catch-up is queued wants that head's own core: the
+                // owner builds it rather than wait for the catch-up (#1313 T10b, #934).
+                state.declined = Some(pin);
+                if state.deferred == Some(pin) {
+                    state.deferred = None;
+                }
                 state.ask();
                 self.start_architecture_owner(&mut state);
                 owner.changed.notify_all();
@@ -943,6 +1003,20 @@ impl DaemonState {
             pin: head,
             rules_hash: config.as_ref().map(|config| config.content_hash.clone()),
         };
+        // #1313 T10b: a semantic catch-up of this same head is queued. Its publication is
+        // the next head, so a build of this one would be superseded. The settle count is
+        // sampled first: a catch-up unit that ends after this read bumps it, and this turn
+        // then builds rather than skip on a stale queue read.
+        let settles = owner.state.lock().unwrap().catchup_settles;
+        let catchup = if deferral_enabled() {
+            self.store
+                .pending_semantic_target()
+                .ok()
+                .flatten()
+                .map(|target| target.pin)
+        } else {
+            None
+        };
         let (key, bases, base_cancelled) = {
             let mut state = owner.state.lock().unwrap();
             state.head = Some(head);
@@ -959,7 +1033,17 @@ impl DaemonState {
                 .filter(|older| older.pin != head)
                 .filter(|older| !state.published.iter().any(|p| p.key == *older));
             state.older = older;
-            let key = if !head_done && owner.wanted(&state) {
+            let building_head = !head_done && owner.wanted(&state);
+            if building_head && !state.shutdown && state.defers_for_catchup(head, catchup, settles)
+            {
+                // The catch-up's own owner wakes this one when a unit ends; its
+                // publication moves the head and hints the next turn.
+                state.deferred = Some(head);
+                drop(state);
+                owner.hook("architecture_deferred_to_catchup");
+                return;
+            }
+            let key = if building_head {
                 head_key
             } else if let Some(older) = state.older.clone() {
                 older
@@ -2065,6 +2149,25 @@ mod owner_state_tests {
         state.published.push(ruled);
         assert!(state.answer(pin(1), CoreRules::Exactly(None)).is_none());
         assert!(state.answer(pin(1), CoreRules::Any).is_some());
+    }
+
+    /// #1313 T10b: a turn skips the head's build only for a catch-up of that same head, never
+    /// for a catch-up of another revision or none, never again once a unit of it ended
+    /// without publishing that head, and never on a queue read older than a unit's end.
+    #[test]
+    fn the_head_build_defers_only_to_a_catch_up_of_that_same_head() {
+        let mut state = OwnerState::default();
+        assert!(state.defers_for_catchup(pin(5), Some(pin(5)), 0));
+        assert!(!state.defers_for_catchup(pin(5), Some(pin(4)), 0));
+        assert!(!state.defers_for_catchup(pin(5), None, 0));
+        // A catch-up unit ended after this turn read the queue.
+        state.catchup_settles = 1;
+        assert!(!state.defers_for_catchup(pin(5), Some(pin(5)), 0));
+        assert!(state.defers_for_catchup(pin(5), Some(pin(5)), 1));
+        // A unit ended without publishing head 5: 5 builds, a later head may defer again.
+        state.declined = Some(pin(5));
+        assert!(!state.defers_for_catchup(pin(5), Some(pin(5)), 1));
+        assert!(state.defers_for_catchup(pin(6), Some(pin(6)), 1));
     }
 
     fn revisions(state: &OwnerState) -> Vec<u64> {

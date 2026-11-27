@@ -1483,3 +1483,16 @@ An independently returned projected proof wrapper is `{evidence:T,projection:Sem
 - **Unchanged.** Without `app` these tools never read the Architecture core and answer from the index as before. With a published core the filter applies as #851 says.
 - **Catalog.** Each of the three tools' `Failure.error` gains what the architecture tools carry: `building` last in its `code` enum, the `progress` and `retryAfterMs` properties, and the `if`/`then`/`else` that requires both, `retryable:true`, a `Basis` and a null content hash with `building` and forbids them with any other code (#864). The `toolVersion` constant changes. The measured `tools/list` frame is 215,105 bytes modern and 215,048 legacy, 1,812 more than at `toolVersion` 34 (213,293 and 213,236), under the unchanged 235,520-byte compacted-frame limit.
 - **Unchanged:** every other tool object, field and bound; no MCP budget changes.
+
+## Amendment (#1313 T10b): a head whose semantic catch-up is queued is built on the catch-up
+
+**Status: proposed (owner ruling 2026-11-27 on #1313, "build the proper version of T10b"), for ratification under the supervisor's delegation.** `toolVersion` is unchanged: no tool, schema or answer shape changes. This section wins over the [#798](#amendment-798-a-typed-building-answer-from-the-architecture-tools) "Eager build" sentence where they differ.
+
+- **The exception.** The Architecture owner builds every active runtime's new head eagerly, except a native publication whose semantic catch-up of that same head is already queued. The catch-up's publication supersedes that head, so the owner does not build it unasked.
+- **When it builds.** No timer or poll drives any of these cases.
+  - **On the catch-up's publication.** The catch-up's owner signals the Architecture owner when each catch-up unit ends. A published catch-up moves the head, and the owner builds the new head at once.
+  - **On a read.** A read of the skipped head asks the owner for it, which builds it at once. So `trellis_references`, `trellis_rules_check` and `trellis_rules_explain` still answer at the catch-up head, labelled as catching up (#934), under the #798 wait and `building` rules.
+  - **On a unit that does not publish.** A catch-up unit that ends without publishing (deferred, failed or idle) makes the owner build the skipped head.
+
+  A head built for a read or after such a unit is not skipped again.
+
