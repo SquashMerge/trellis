@@ -943,17 +943,10 @@ mod engine {
             completed: 0,
             total: read_a.input.snapshot.documents.len(),
         });
-        // Bases are newest first. Each usable base is tried in order of fewest dirty
-        // documents, then recency, and the first that passes the catalog gates is built on.
-        // When none does, the newest base's own full reason stands, as with one base.
-        let mut decisions = Vec::with_capacity(bases.len());
-        for base in &bases {
-            decisions.push(dependencies::changed_documents(
-                &read_a.input.snapshot,
-                &read_a.input.fingerprints,
-                Some(&base.dependencies),
-            )?);
-        }
+        // Bases are newest first. The newest base the build can go incremental on is built
+        // on: an older one is compared only when every newer one needs a full build, so the
+        // ordinary edit compares against one base, as with one retained core. When none can
+        // be built on, the newest base's own full reason stands.
         let mut plan = ArchitectureBuildPlan {
             path: ArchitectureBuildPath::Full(FullReason::NoBase),
             changed: dependencies::ChangedDocuments::default(),
@@ -980,12 +973,6 @@ mod engine {
                 read_a
             },
         };
-        let mut usable: Vec<_> = decisions
-            .iter()
-            .enumerate()
-            .filter_map(|(i, decision)| Some((decision.as_ref().ok()?.dirty.len(), i)))
-            .collect();
-        usable.sort();
         // The first catalog that differs from a base's, in the gates' order.
         let catalog_change =
             |base: &ArchitectureCore,
@@ -1019,10 +1006,20 @@ mod engine {
                 .into_iter()
                 .find_map(|(current, old, reason)| (current != old).then_some(reason))
             };
-        let mut gate_failures = BTreeMap::new();
+        let mut newest_reason = None;
         let mut chosen = None;
-        for (_, i) in usable {
-            let changed = decisions[i].as_ref().expect("usable decision");
+        for (i, base) in bases.iter().enumerate() {
+            let changed = match dependencies::changed_documents(
+                &plan.read_a.input.snapshot,
+                &plan.read_a.input.fingerprints,
+                Some(&base.dependencies),
+            )? {
+                Ok(changed) => changed,
+                Err(reason) => {
+                    newest_reason.get_or_insert(reason);
+                    continue;
+                }
+            };
             let syntax = plan.read_a.input.kept.as_ref().and_then(|slot| {
                 slot.lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1043,27 +1040,22 @@ mod engine {
             )?;
             drop(syntax);
             plan.read_a.input.keep_syntax(references.kept.take());
-            match catalog_change(&bases[i], changed, &references) {
+            match catalog_change(base, &changed, &references) {
                 Some(reason) => {
-                    gate_failures.insert(i, reason);
+                    newest_reason.get_or_insert(reason);
                 }
                 None => {
-                    chosen = Some((i, references));
+                    chosen = Some((i, changed, references));
                     break;
                 }
             }
         }
-        let Some((chosen, references)) = chosen else {
-            match decisions.first() {
-                Some(Err(reason)) => plan.path = ArchitectureBuildPath::Full(*reason),
-                Some(Ok(_)) => plan.path = ArchitectureBuildPath::Full(gate_failures[&0]),
-                None => {}
+        let Some((chosen, changed, references)) = chosen else {
+            if let Some(reason) = newest_reason {
+                plan.path = ArchitectureBuildPath::Full(reason);
             }
             return Ok(plan);
         };
-        let changed = decisions
-            .swap_remove(chosen)
-            .expect("the chosen decision is usable");
         plan.base = Some(bases[chosen].clone());
         plan.all_semantic = plan.read_a.config.is_some_and(Config::has_rules)
             && plan

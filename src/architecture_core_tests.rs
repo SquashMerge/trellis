@@ -653,10 +653,12 @@ fn architecture_incremental_metrics() {
 }
 
 #[test]
-fn architecture_incremental_builds_on_the_retained_base_with_the_fewest_dirty_documents() {
-    // #1313: when the newest retained core is further from the head than the one before
-    // it (a slow semantic catch-up let the intermediate revision's build finish), the build
-    // starts from the closer one. Any base gives the full build's core.
+fn architecture_incremental_builds_on_the_newest_retained_base_it_can_go_incremental_on() {
+    // #1313: the newest retained core is built on whenever it allows an incremental build,
+    // so the ordinary edit compares against one base. An older core is compared only when
+    // the newest one needs a full build: after a slow semantic catch-up let the intermediate
+    // revision's build finish, the build starts from the core before it. Any base gives the
+    // full build's core.
     let (_state, root, store) = incremental_checkout();
     let util = "crates/alpha/src/util.rs";
     let older = store.architecture_build_for_tests(None, None).unwrap();
@@ -673,30 +675,61 @@ fn architecture_incremental_builds_on_the_retained_base_with_the_fewest_dirty_do
         ArchitectureBuildPath::Incremental { dirty, .. } => dirty.len(),
         path => panic!("{path:?}"),
     };
-    let on_newer = store
-        .architecture_build_for_tests(Some(&newer.core), None)
-        .unwrap();
-    assert_eq!(dirty(&on_newer), 2);
-    assert_eq!(on_newer.base, Some(newer.core.pin()));
+    let full = || {
+        store
+            .architecture_build_for_tests(None, None)
+            .unwrap()
+            .core
+            .canonical()
+            .unwrap()
+    };
+    // The newest base allows an incremental build, so it is the one built on, although the
+    // older one matches every document.
     let built = store
         .architecture_build_on_bases_for_tests(&[&newer.core, &older.core], None)
         .unwrap();
-    assert_eq!(dirty(&built), 0, "the older core matches every document");
-    assert_eq!(built.base, Some(older.core.pin()));
-    let full = store.architecture_build_for_tests(None, None).unwrap();
-    assert_eq!(
-        built.core.canonical().unwrap(),
-        full.core.canonical().unwrap()
-    );
-    assert_eq!(
-        on_newer.core.canonical().unwrap(),
-        full.core.canonical().unwrap()
-    );
-    // Among equally distant bases the newest wins, as with one base.
-    let tied = store
-        .architecture_build_on_bases_for_tests(&[&on_newer.core, &built.core], None)
+    assert_eq!(dirty(&built), 2);
+    assert_eq!(built.base, Some(newer.core.pin()));
+    assert_eq!(built.core.canonical().unwrap(), full());
+
+    // A revision that changes every document: built on its own, the newest base needs a full
+    // build (more than half is dirty).
+    let texts: Vec<(String, String)> = native_input(&store)
+        .snapshot
+        .documents
+        .iter()
+        .map(|doc| (doc.key.path.clone(), doc.file.text.clone()))
+        .collect();
+    for (path, text) in &texts {
+        write(root.path(), path, &format!("{text}\n"));
+    }
+    publish(&store, root.path());
+    let everything = store
+        .architecture_build_for_tests(Some(&built.core), None)
         .unwrap();
-    assert_eq!(tied.base, Some(on_newer.core.pin()));
+    assert_eq!(
+        everything.path,
+        ArchitectureBuildPath::Full(FullReason::DirtyMajority)
+    );
+    // Back to the earlier texts: against the newest core every document is dirty, so the
+    // older core is compared too and built on, with nothing dirty.
+    for (path, text) in &texts {
+        write(root.path(), path, text);
+    }
+    publish(&store, root.path());
+    let alone = store
+        .architecture_build_for_tests(Some(&everything.core), None)
+        .unwrap();
+    assert_eq!(
+        alone.path,
+        ArchitectureBuildPath::Full(FullReason::DirtyMajority)
+    );
+    let rebased = store
+        .architecture_build_on_bases_for_tests(&[&everything.core, &built.core], None)
+        .unwrap();
+    assert_eq!(dirty(&rebased), 0, "the older core matches every document");
+    assert_eq!(rebased.base, Some(built.core.pin()));
+    assert_eq!(rebased.core.canonical().unwrap(), full());
 }
 
 #[test]

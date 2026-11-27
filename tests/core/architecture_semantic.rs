@@ -277,11 +277,8 @@ fn architecture_incremental_import_and_catchup() {
     );
     assert_ne!(fixture.packages(&before), fixture.packages(&after));
 
-    // A catch-up after N was built at its own native revision. The owner builds S on the
-    // core before N, which only the edit separates from S (#1313); a build on N's core,
-    // where the rejoined provenance IDs cannot move, has the semantic changes N→S Dirty.
-    // Both equal the full build.
-    let previous = after;
+    // A catch-up whose base was built at its own native revision N: the rejoined provenance
+    // IDs cannot move, and only the semantic changes N→S are Dirty.
     let projected = [
         "src/main.rs",
         "src/lib.rs",
@@ -314,44 +311,17 @@ fn architecture_incremental_import_and_catchup() {
         native,
         "catch-up keeps N's native revision"
     );
-    let on_n = fixture
-        .store
-        .architecture_build_for_tests(Some(&before), None)
-        .unwrap();
-    match &on_n.path {
-        trellis::http::ArchitectureBuildPath::Incremental { dirty, .. } => {
-            let mut dirty: Vec<_> = dirty.iter().map(|key| key.path.as_str()).collect();
-            dirty.sort();
-            let mut want = projected.to_vec();
-            want.sort();
-            assert_eq!(dirty, want);
-        }
-        path => panic!("{path:?}"),
-    }
-    let full = fixture
-        .store
-        .architecture_build_for_tests(None, None)
-        .unwrap();
-    assert_eq!(
-        on_n.core.canonical().unwrap(),
-        full.core.canonical().unwrap()
-    );
-    let (attempt, after) = fixture.expect(
+    let (_, after) = fixture.expect(
         s,
         Expected::Incremental {
-            dirty: &["src/main.rs"],
+            dirty: &projected,
             patched: &[],
-            native: &["src/main.rs"],
+            native: &[],
             all_b: false,
         },
     );
-    assert_eq!(attempt.base, Some(previous.pin()));
-    // S's native revision moved since that core, so the caller's rejoined provenance is
-    // rebased, as at the first edit; every other clean source is shared.
-    for (key, sharing) in after.sharing(&previous) {
-        if key.path == "src/caller.rs" {
-            assert!(!sharing.source && sharing.metric, "{key:?}: {sharing:?}");
-        } else if key.path != "src/main.rs" {
+    for (key, sharing) in after.sharing(&before) {
+        if !projected.contains(&key.path.as_str()) {
             assert!(sharing.source && sharing.metric, "{key:?}: {sharing:?}");
         }
     }
