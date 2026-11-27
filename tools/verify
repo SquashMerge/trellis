@@ -235,6 +235,8 @@ checks() {
   # tools/test-selected's mapping and refusals, on a synthetic checkout (#1145).
   python3 tools/test-selected-test.py
   python3 tools/verify-heavy-lease-test.py
+  # The factory's verify on CI, with fake git and gh (no network).
+  python3 tools/ci-verify-test.py
   node --test tests/mcp-catalog-sdk.test.mjs tests/mcp-smoke.test.mjs
   python3 tools/stage3-watcher-runner-test.py
   python3 tools/verify-67-mixed-performance-test.py

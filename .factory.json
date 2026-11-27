@@ -1,8 +1,10 @@
 {
   "resolve": "export LC_ALL=C CLICOLOR_FORCE=0 NO_COLOR=1; case \"$FACTORY_INPUT\" in \\#*) n=${FACTORY_INPUT#\\#} ;; https://github.com/SquashMerge/trellis/issues/*) n=${FACTORY_INPUT#https://github.com/SquashMerge/trellis/issues/} ;; *) n=$FACTORY_INPUT ;; esac; case \"$n\" in ''|0|0*|*[!0-9]*) exit 0 ;; esac; gh issue view \"$n\" --repo SquashMerge/trellis --json number,title,body,url,state,labels,assignees --jq '{run_id:(.number|tostring)} + .'",
-  "verify": "${FACTORY_VERIFY_WRAPPER:-} ./tools/verify",
+  "verify": "sh tools/ci-verify.sh",
   "pr_draft": true,
-  "verify_timeout_ms": 14400000,
+  "verify_timeout_ms": 5400000,
+  "verify_unavailable_exit": 75,
+  "verify_scope": "integration",
   "bootstrap": "npm ci --prefix tests/mcp --ignore-scripts",
   "bootstrap_timeout_ms": 900000,
   "max_retries": 5,
