@@ -349,6 +349,9 @@ pub struct DaemonState {
     /// lives as long as this state. Readers never wait for watcher work.
     watcher_health: Arc<crate::watch::WatcherHealth>,
     retention_last_run: Mutex<Instant>,
+    /// The retention pass that settles releases owed at reconciliation is running
+    /// (#1291). It releases revisions only; GC keeps its own cadence.
+    startup_release_pass: AtomicBool,
     gc_last_check: Mutex<Instant>,
     /// The one pending `trellis gc --run` request (#1316). Its waiter submits it;
     /// only the worker takes and answers it.

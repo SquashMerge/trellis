@@ -364,6 +364,8 @@ impl CheckoutRegistry {
             #[cfg(feature = "test-support")]
             mcp_admitted_gate: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
+            mcp_building_gate: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-support")]
             evidence_sampled_hook: std::sync::Mutex::new(None),
         });
         #[cfg(feature = "test-support")]
@@ -778,6 +780,10 @@ pub struct CheckoutRuntime {
     /// Test-support gate run once read admission has sampled `catchingUp`.
     #[cfg(feature = "test-support")]
     mcp_admitted_gate: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-support gate run after an MCP read found its Architecture core building and
+    /// ended, before the call waits on the owner (#1329).
+    #[cfg(feature = "test-support")]
+    mcp_building_gate: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test-support hold, once, in the next evidence admission after it sampled
     /// `catchingUp` and before it opens the selected snapshot (#752).
     #[cfg(feature = "test-support")]

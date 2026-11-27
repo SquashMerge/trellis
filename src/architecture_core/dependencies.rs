@@ -447,8 +447,8 @@ mod staged {
                     references: Arc::new(ReferenceDependencies {
                         work: fact.work,
                         sites: fact.sites,
-                        endpoints: fact.endpoints.clone().into(),
-                        eligibility: fact.eligibility.clone().into(),
+                        endpoints: fact.endpoints.clone(),
+                        eligibility: fact.eligibility.clone(),
                         plan: fact.plan.clone(),
                     }),
                     semantic: *counts

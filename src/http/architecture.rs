@@ -12,7 +12,7 @@
 use super::DaemonState;
 use crate::architecture_core::{
     ArchitectureBuildPath, ArchitectureCore, ArchitectureProgress, ArchitectureReadA, CoreFailure,
-    FullReason, ReferenceWorkMargin, finish_architecture, prepare_architecture,
+    FullReason, ReferenceWorkMargin, finish_architecture, prepare_architecture_from,
 };
 #[cfg(feature = "test-support")]
 use crate::architecture_core::{
@@ -224,11 +224,13 @@ impl OwnerState {
         )
     }
 
-    fn base(&self, key: &CoreKey) -> Option<Arc<ArchitectureCore>> {
+    /// Every retained core a build of `key` may start from, newest first (#1313).
+    fn bases(&self, key: &CoreKey) -> Vec<Arc<ArchitectureCore>> {
         if self.head != Some(key.pin) {
-            return None;
+            return Vec::new();
         }
-        self.published
+        let mut bases: Vec<_> = self
+            .published
             .iter()
             .filter(|published| {
                 published.key.pin.index_generation == key.pin.index_generation
@@ -238,8 +240,10 @@ impl OwnerState {
             })
             .filter_map(|published| published.outcome.as_ref().ok())
             .filter(|core| core.incremental_base_eligible())
-            .max_by_key(|core| core.pin.index_revision)
             .cloned()
+            .collect();
+        bases.sort_by_key(|core| std::cmp::Reverse(core.pin.index_revision));
+        bases
     }
 
     fn answer(&self, pin: IndexPin, rules: CoreRules<'_>) -> Option<&Published> {
@@ -550,6 +554,8 @@ fn verify_value(value: Option<&std::ffi::OsStr>) -> bool {
 
 struct BuildRecord {
     path: ArchitectureBuildPath,
+    /// The retained core the plan chose to build on (#1313).
+    base: Option<IndexPin>,
     semantic_sources: Vec<crate::native_records::DocumentKey>,
     native_reads: Vec<crate::native_records::DocumentKey>,
     references: Mutex<crate::references::ReferenceReplayTrace>,
@@ -569,6 +575,7 @@ impl Default for BuildRecord {
     fn default() -> Self {
         Self {
             path: ArchitectureBuildPath::Full(FullReason::NoBase),
+            base: None,
             semantic_sources: Vec::new(),
             native_reads: Vec::new(),
             references: Mutex::default(),
@@ -743,9 +750,13 @@ impl DaemonState {
     }
 
     /// After an admitted read found `building`'s core still being computed and ended (#1252):
-    /// wait at most `wait` on the owner, holding no lease or read. `None` when a new read
-    /// should be admitted, because the core or its kept failure is published, the owner passed
-    /// the pin, or `check` failed; otherwise the core is still building, with its progress now.
+    /// wait at most `wait` on the owner, holding no lease or read. When the owner has passed
+    /// the pin (the head moved), the answer is the core of the head it moved to, with the
+    /// same rules, whatever was published for the passed pin meanwhile: the caller waits for
+    /// that core in turn instead of admitting a read that would only find it building too
+    /// (#1329). Otherwise `None` when a new read should be admitted, because the core or its
+    /// kept failure is published or `check` failed, and else the core still building, with
+    /// its progress now.
     pub(crate) fn architecture_still_building(
         self: &Arc<Self>,
         building: &ArchitectureBuilding,
@@ -753,12 +764,26 @@ impl DaemonState {
         check: &mut impl FnMut() -> anyhow::Result<()>,
     ) -> Option<ArchitectureBuilding> {
         let pin = building.pin;
-        let error = self
-            .architecture_outcome(pin, building.rules.core_rules(), wait, check, false)
-            .err()?;
-        let still = error.downcast::<ArchitectureBuilding>().ok()?;
-        let passed = self.architecture.0.state.lock().unwrap().passed(pin);
-        (!passed).then_some(still)
+        let rules = building.rules.core_rules();
+        let outcome = self.architecture_outcome(pin, rules, wait, check, false);
+        // The passed pin first: its own outcome, published before the head moved, answers
+        // no read the caller could be admitted for now.
+        let state = self.architecture.0.state.lock().unwrap();
+        if let Some(head) = state.head.filter(|_| state.passed(pin)) {
+            return Some(ArchitectureBuilding {
+                pin: head,
+                progress: state
+                    .running
+                    .as_ref()
+                    .filter(|running| {
+                        running.pin == head && rules.admits(running.rules_hash.as_deref())
+                    })
+                    .and_then(|running| running.progress),
+                rules: building.rules.clone(),
+            });
+        }
+        drop(state);
+        outcome.err()?.downcast::<ArchitectureBuilding>().ok()
     }
 
     fn architecture_outcome(
@@ -918,7 +943,7 @@ impl DaemonState {
             pin: head,
             rules_hash: config.as_ref().map(|config| config.content_hash.clone()),
         };
-        let (key, base, base_cancelled) = {
+        let (key, bases, base_cancelled) = {
             let mut state = owner.state.lock().unwrap();
             state.head = Some(head);
             state.observe_rules(&head_key);
@@ -946,15 +971,15 @@ impl DaemonState {
             }
             owner.stop.store(false, Ordering::Release);
             owner.head_may_have_moved.store(false, Ordering::Release);
-            let base = state.base(&key);
-            let base_cancelled = base.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
+            let bases = state.bases(&key);
+            let base_cancelled = (!bases.is_empty()).then(|| Arc::new(AtomicBool::new(false)));
             state.running = Some(Running {
                 pin: key.pin,
                 rules_hash: key.rules_hash.clone(),
                 progress: None,
                 base_cancelled: base_cancelled.clone(),
             });
-            (key, base, base_cancelled)
+            (key, bases, base_cancelled)
         };
         let pin = key.pin;
         #[cfg(feature = "test-support")]
@@ -1014,10 +1039,10 @@ impl DaemonState {
             record.execution_hook = owner.execution_hook.lock().unwrap().take();
         }
         #[cfg(feature = "test-support")]
-        let base_pin = base.as_ref().map(|core| core.pin);
+        let newest_base = bases.first().map(|core| core.pin);
         let built = self.architecture_build(
             (lease, response),
-            (pin, config.as_ref(), base),
+            (pin, config.as_ref(), bases),
             &mut check,
             (&give_way, &|point| owner.hook(point)),
             (&progress, &mut record),
@@ -1059,7 +1084,7 @@ impl DaemonState {
         #[cfg(feature = "test-support")]
         owner.attempts.lock().unwrap().push(ArchitectureAttempt {
             pin,
-            base: base_pin,
+            base: record.base.or(newest_base),
             path: record.path.clone(),
             semantic_sources: record.semantic_sources.clone(),
             measured_sources: execution.measured_sources,
@@ -1130,10 +1155,10 @@ impl DaemonState {
     fn architecture_build(
         &self,
         (lease, response): (super::AdmissionLease, crate::store::EvidenceResponse),
-        (pin, config, base): (
+        (pin, config, bases): (
             IndexPin,
             Option<&crate::rules::Config>,
-            Option<Arc<ArchitectureCore>>,
+            Vec<Arc<ArchitectureCore>>,
         ),
         check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         (give_way, hook): (
@@ -1144,7 +1169,7 @@ impl DaemonState {
     ) -> anyhow::Result<ArchitectureCore> {
         #[cfg(feature = "test-support")]
         let _execution = record.execution_scope(ArchitectureExecutionBranch::Candidate);
-        let incremental = base.is_some();
+        let incremental = !bases.is_empty();
         let candidate = (|| {
             let mut read_check = || {
                 give_way()?;
@@ -1165,7 +1190,7 @@ impl DaemonState {
             record.native_reads = input.read_documents();
             read_check()?;
             record.fault("prepare")?;
-            let mut plan = prepare_architecture(
+            let mut plan = prepare_architecture_from(
                 ArchitectureReadA {
                     input,
                     store: &self.store,
@@ -1176,9 +1201,10 @@ impl DaemonState {
                     #[cfg(feature = "test-support")]
                     work_limit: self.architecture_work_limit(),
                 },
-                base,
+                bases,
                 &mut read_check,
             )?;
+            record.base = plan.base_pin();
             record.path = plan.path.clone();
             record.semantic_sources = plan.semantic_keys();
             read_check()?;

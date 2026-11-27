@@ -110,7 +110,11 @@ fn architecture_incremental_canonical_index() {
         assert_eq!(dependency.fingerprint.as_ref(), &inputs.documents[key]);
         assert_eq!(dependency.references.work, facts.work);
         assert_eq!(dependency.references.sites, facts.sites);
-        assert_eq!(dependency.references.endpoints.as_ref(), facts.endpoints);
+        assert_eq!(dependency.references.endpoints, facts.endpoints);
+        assert!(Arc::ptr_eq(
+            &dependency.references.endpoints,
+            &facts.endpoints
+        ));
         assert!(facts.endpoints.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(
             facts
@@ -200,9 +204,7 @@ fn architecture_incremental_canonical_index() {
                 2 => references.endpoints = Arc::from([]),
                 3 => references.plan = None,
                 4 => Arc::make_mut(references.plan.as_mut().unwrap()).prepared_work += 1,
-                _ => Arc::make_mut(references.plan.as_mut().unwrap())
-                    .sites
-                    .clear(),
+                _ => Arc::make_mut(references.plan.as_mut().unwrap()).clear_for_tests(),
             }
         });
     }
@@ -650,6 +652,86 @@ fn architecture_incremental_metrics() {
         "neither plans nor completed cores retain the base core"
     );
     assert!(built.core.canonical().is_ok());
+}
+
+#[test]
+fn architecture_incremental_builds_on_the_newest_retained_base_it_can_go_incremental_on() {
+    // #1313: the newest retained core is built on whenever it allows an incremental build,
+    // so the ordinary edit compares against one base. An older core is compared only when
+    // the newest one needs a full build: after a slow semantic catch-up let the intermediate
+    // revision's build finish, the build starts from the core before it. Any base gives the
+    // full build's core.
+    let (_state, root, store) = incremental_checkout();
+    let util = "crates/alpha/src/util.rs";
+    let older = store.architecture_build_for_tests(None, None).unwrap();
+    write(root.path(), "idle.rs", "pub fn idle() { let _ = 2; }\n");
+    write(root.path(), util, "pub fn u() { let _ = 2; }\n");
+    publish(&store, root.path());
+    let newer = store
+        .architecture_build_for_tests(Some(&older.core), None)
+        .unwrap();
+    write(root.path(), "idle.rs", "pub fn idle() { let _ = 1; }\n");
+    write(root.path(), util, "pub fn u() {}\n");
+    publish(&store, root.path());
+    let dirty = |built: &ArchitectureBuildForTests| match &built.path {
+        ArchitectureBuildPath::Incremental { dirty, .. } => dirty.len(),
+        path => panic!("{path:?}"),
+    };
+    let full = || {
+        store
+            .architecture_build_for_tests(None, None)
+            .unwrap()
+            .core
+            .canonical()
+            .unwrap()
+    };
+    // The newest base allows an incremental build, so it is the one built on, although the
+    // older one matches every document.
+    let built = store
+        .architecture_build_on_bases_for_tests(&[&newer.core, &older.core], None)
+        .unwrap();
+    assert_eq!(dirty(&built), 2);
+    assert_eq!(built.base, Some(newer.core.pin()));
+    assert_eq!(built.core.canonical().unwrap(), full());
+
+    // A revision that changes every document: built on its own, the newest base needs a full
+    // build (more than half is dirty).
+    let texts: Vec<(String, String)> = native_input(&store)
+        .snapshot
+        .documents
+        .iter()
+        .map(|doc| (doc.key.path.clone(), doc.file.text.clone()))
+        .collect();
+    for (path, text) in &texts {
+        write(root.path(), path, &format!("{text}\n"));
+    }
+    publish(&store, root.path());
+    let everything = store
+        .architecture_build_for_tests(Some(&built.core), None)
+        .unwrap();
+    assert_eq!(
+        everything.path,
+        ArchitectureBuildPath::Full(FullReason::DirtyMajority)
+    );
+    // Back to the earlier texts: against the newest core every document is dirty, so the
+    // older core is compared too and built on, with nothing dirty.
+    for (path, text) in &texts {
+        write(root.path(), path, text);
+    }
+    publish(&store, root.path());
+    let alone = store
+        .architecture_build_for_tests(Some(&everything.core), None)
+        .unwrap();
+    assert_eq!(
+        alone.path,
+        ArchitectureBuildPath::Full(FullReason::DirtyMajority)
+    );
+    let rebased = store
+        .architecture_build_on_bases_for_tests(&[&everything.core, &built.core], None)
+        .unwrap();
+    assert_eq!(dirty(&rebased), 0, "the older core matches every document");
+    assert_eq!(rebased.base, Some(built.core.pin()));
+    assert_eq!(rebased.core.canonical().unwrap(), full());
 }
 
 #[test]
@@ -1916,16 +1998,24 @@ fn architecture_kept_read_a_equals_a_full_read_a_at_a_new_revision() {
         "the build holds the documents"
     );
     drop(first);
-    assert_eq!(
-        kept.lock()
-            .unwrap()
-            .native
-            .as_ref()
-            .unwrap()
-            .documents
-            .len(),
-        all.len()
-    );
+    {
+        let kept = kept.lock().unwrap();
+        let native = kept.native.as_ref().unwrap();
+        assert_eq!(native.documents.len(), all.len());
+        // #1313: kept rows hold no copies of their document's key, revision or proof ID; the
+        // reads below refill them.
+        assert!(
+            native
+                .documents
+                .values()
+                .all(|document| !document.holds_row_copies())
+        );
+    }
+    // The same revision again: every kept document restores exactly as a full read decodes it.
+    let again = kept_read(&store, &kept, &mut || Ok(())).unwrap();
+    assert!(again.read_documents().is_empty());
+    assert_same_read_a(&again, &native_input(&store));
+    drop(again);
     // A body edit, an added and a deleted document, at a new native revision.
     write(
         root.path(),
