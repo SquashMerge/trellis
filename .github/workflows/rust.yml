@@ -1,10 +1,14 @@
 name: Rust foundation
 # One run per commit: pull requests run on their merge ref; pushes run only
-# for the long-lived branches, main and feature-* (no slash). Topic and PR
-# branches, including Factory's feature/<n>, get only their PR run.
+# for the long-lived branches, main and feature-* (no slash), and for
+# qualify/** branches. Topic and PR branches, including Factory's feature/<n>,
+# get only their PR run. A reviewer pushes the exact composition it will
+# land (current main plus the PR, a stack or a batch) to a qualify/ branch,
+# so CI tests that tree; the branch is deleted after the merge and never
+# saves a cache.
 on:
   push:
-    branches: [main, "feature-*"]
+    branches: [main, "feature-*", "qualify/**"]
   pull_request:
 permissions:
   contents: read

@@ -263,6 +263,8 @@ pub(super) struct RustExecution {
 pub(super) enum SiteSyntax<'a> {
     Tree(&'a Tree),
     Recorded(Option<&'a GlobUse>),
+    /// The source's tree, parsed only if its resolution reads it (#1321).
+    Lazy(&'a super::LazySyntax),
 }
 
 /// What [`RustResolver::drop_unused`] read in a site's syntax tree, for the number of names
@@ -272,6 +274,17 @@ pub(super) enum SiteSyntax<'a> {
 pub(crate) struct GlobUse {
     names: usize,
     outcome: GlobOutcome,
+}
+
+#[cfg(test)]
+impl GlobUse {
+    /// A recorded glob read for plan tests (#1313).
+    pub(crate) fn for_tests(names: usize) -> Self {
+        Self {
+            names,
+            outcome: GlobOutcome::NoRoot,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -3014,7 +3027,16 @@ impl RustResolver<'_> {
         if names.names.is_empty() {
             return Ok(false);
         }
+        let lazy;
+        let syntax = match syntax {
+            SiteSyntax::Lazy(source) => {
+                lazy = source.tree(check)?;
+                SiteSyntax::Tree(lazy)
+            }
+            syntax => syntax,
+        };
         let outcome = match syntax {
+            SiteSyntax::Lazy(_) => unreachable!("lazy syntax was parsed"),
             SiteSyntax::Tree(tree) => {
                 let outcome = self.unseen(doc, tree, scope, import, names, check)?;
                 self.execution.glob = Some(GlobUse {

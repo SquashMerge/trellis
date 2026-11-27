@@ -87,7 +87,7 @@ fn incoming_empty_and_required_item_closed_shape() {
     for modern in [false, true] {
         let empty = project(fixture(0, false, 0), modern).unwrap();
         let data = &empty["data"];
-        assert_eq!(data.as_object().unwrap().len(), 11);
+        assert_eq!(data.as_object().unwrap().len(), 12);
         assert!(data.get("stableLookupKey").is_some_and(Value::is_null));
         assert_eq!(data["semanticBases"], json!([]));
         assert_eq!(data["documents"], json!([]));
@@ -115,7 +115,7 @@ fn incoming_empty_and_required_item_closed_shape() {
         assert_eq!(empty["warnings"][0]["code"], "syntaxOnly");
         let full = project(fixture(1, false, 0), modern).unwrap();
         let caller = &full["data"]["callers"][0];
-        assert_eq!(caller.as_object().unwrap().len(), 20);
+        assert_eq!(caller.as_object().unwrap().len(), 21);
         assert_eq!(caller["callerRole"], "production");
         assert_eq!(caller["callerDisplayKey"], "a.js#Owner");
         assert_eq!(caller["calleeText"], "Target");

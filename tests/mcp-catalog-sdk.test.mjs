@@ -62,7 +62,7 @@ test("the thirteen-tool order and unchanged schemas are explicit", () => {
     "trellis_rules_explain", "trellis_show", "trellis_endpoints",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
-  assert.equal(describe.toolVersion.const, 34);
+  assert.equal(describe.toolVersion.const, 36);
   assert.equal(search.inputSchema.additionalProperties, false);
   assert.equal(search.inputSchema.properties.limit.default, 10);
   assert.equal(search.inputSchema.properties.limit.maximum, 50);
@@ -269,8 +269,9 @@ test("trellis_show input admits one target per view, and its outcomes are closed
   assert.ok(!output(envelope({ outcome: "shown", generation: 7 })), "shown is not an outcome");
 });
 
-// #798: the building error of each architecture tool takes exactly the ratified shape,
-// with the admitted basis and a null content hash.
+// #798: the building error of each architecture tool, and of find, search and the call graph
+// (their `app` filter, #1278), takes exactly the ratified shape, with the admitted basis and a
+// null content hash.
 test("architecture building failures require a basis and a null content hash", () => {
   const basis = { indexGeneration: "123e4567-e89b-42d3-a456-426614174000", indexRevision: 7 };
   const valid = {
@@ -286,7 +287,8 @@ test("architecture building failures require a basis and a null content hash", (
     change(copy.error);
     return copy;
   };
-  for (const name of ["trellis_references", "trellis_rules_check", "trellis_rules_explain"]) {
+  for (const name of ["trellis_references", "trellis_rules_check", "trellis_rules_explain",
+    "trellis_find_symbols", "trellis_search_symbols", "trellis_call_graph"]) {
     const validate = ajv.compile(tools.find((tool) => tool.name === name).outputSchema);
     assert.ok(validate(valid), `${name}: ${JSON.stringify(validate.errors)}`);
     assert.ok(validate(variant((error) => { error.progress = null; })), name);
@@ -371,14 +373,15 @@ test("each tool's one failure schema accepts exactly the #864 failure shape", ()
   const reasons = ["not_absolute", "not_checkout", "identity_changed", "unavailable"];
   const architecture = ["trellis_references", "trellis_rules_check", "trellis_rules_explain",
     "trellis_endpoints"];
-  // #851: an `app` filter of these fails as the rules check does.
+  // #851: an `app` filter of these fails as the rules check does, and answers `building`
+  // while the core builds (#1278).
   const appFiltered = ["trellis_find_symbols", "trellis_search_symbols", "trellis_call_graph"];
   // #930: every tool may answer `response_too_large` for a finished answer over the cap.
   const codesOf = (name) => [...resolved,
     ...(architecture.includes(name) ? ["invalid_rules", "rules_not_found", "bounded_work"]
       : appFiltered.includes(name) ? ["invalid_rules", "bounded_work"] : []),
     "response_too_large", "workspace_selection_failed",
-    ...(architecture.includes(name) ? ["building"] : [])];
+    ...(architecture.includes(name) || appFiltered.includes(name) ? ["building"] : [])];
   const keys = (object, allowed) => Object.keys(object).every((key) => allowed.includes(key));
   const common = ["code", "message", "retryable", "currentBasis", "currentContentHash"];
   const attemptedOk = (value) => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -391,7 +394,8 @@ test("each tool's one failure schema accepts exactly the #864 failure shape", ()
     if (!common.every((key) => key in error) || typeof error.message !== "string") return false;
     if (typeof error.retryable !== "boolean") return false;
     if (!codesOf(name).includes(error.code)) return false;
-    const building = architecture.includes(name) ? ["progress", "retryAfterMs"] : [];
+    const building = architecture.includes(name) || appFiltered.includes(name)
+      ? ["progress", "retryAfterMs"] : [];
     if (!keys(error, [...common, "attemptedWorkspace", "reason", ...building])) return false;
     if ("reason" in error && !reasons.includes(error.reason)) return false;
     if ("attemptedWorkspace" in error && !attemptedOk(error.attemptedWorkspace)) return false;

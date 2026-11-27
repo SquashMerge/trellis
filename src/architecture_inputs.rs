@@ -653,23 +653,23 @@ pub(crate) struct NativeRead {
     pub(crate) snapshot: Snapshot,
     pub(crate) regions: Vec<Vec<crate::native_records::ControlRegion>>,
     pub(crate) tables: Vec<NativeTable>,
-    /// The native revision the documents' revision-scoped IDs are at.
-    pub(crate) native_revision: String,
 }
 
 /// One document an earlier Read A read, kept for the next one (#1315).
+///
+/// Its rows are kept without their per-row copies of the document's key, native revision ID
+/// and native proof ID (#1313): a read decodes the same three values into every row, so
+/// [`Self::restore`] refills them for the revision that takes the document.
 pub(crate) struct KeptNativeDocument {
     pub(crate) table: NativeTable,
-    pub(crate) input: DocumentInput,
-    pub(crate) regions: Vec<crate::native_records::ControlRegion>,
+    input: DocumentInput,
+    regions: Vec<crate::native_records::ControlRegion>,
 }
 
 /// The native documents of the owner's last Read A, by key, within one index generation.
 /// They are owner-level auxiliary state: no result depends on which build kept them.
 pub(crate) struct KeptNative {
     pub(crate) generation: uuid::Uuid,
-    /// The native revision every kept row's revision-scoped IDs were decoded or rebased at.
-    pub(crate) native_revision: String,
     pub(crate) documents: BTreeMap<DocumentKey, KeptNativeDocument>,
 }
 
@@ -677,7 +677,6 @@ impl KeptNative {
     /// The documents of a finished Read A, without the semantic rows Read B added.
     pub(crate) fn of(
         generation: uuid::Uuid,
-        native_revision: String,
         documents: Vec<DocumentInput>,
         regions: Vec<Vec<crate::native_records::ControlRegion>>,
         tables: Vec<NativeTable>,
@@ -687,13 +686,13 @@ impl KeptNative {
         }
         Some(Self {
             generation,
-            native_revision,
             documents: documents
                 .into_iter()
                 .zip(regions)
                 .zip(tables)
-                .map(|((mut input, regions), table)| {
+                .map(|((mut input, mut regions), table)| {
                     input.semantic = DocumentSemantic::default();
+                    strip_rows(&mut input, &mut regions);
                     (
                         input.key.clone(),
                         KeptNativeDocument {
@@ -708,33 +707,94 @@ impl KeptNative {
     }
 }
 
+/// Drops the per-row copies of the document's key, native revision ID and proof ID.
+fn strip_rows(input: &mut DocumentInput, regions: &mut [crate::native_records::ControlRegion]) {
+    let empty = || DocumentKey {
+        source_set_id: String::new(),
+        language: String::new(),
+        path: String::new(),
+    };
+    for declaration in &mut input.declarations {
+        declaration.document = empty();
+        declaration.revision_id = String::new();
+        declaration.provenance_id = String::new();
+    }
+    for call in &mut input.calls {
+        call.document = empty();
+        call.revision_id = String::new();
+        call.provenance_id = String::new();
+    }
+    for region in regions {
+        region.document = empty();
+        region.revision_id = String::new();
+        region.provenance_id = String::new();
+    }
+}
+
 impl KeptNativeDocument {
-    /// Gives a kept document read at native revision `from` the revision-scoped IDs a read at
-    /// `native_revision` decodes: every row's native revision ID and the document's native
+    /// Whether any kept row still holds a copy of its document's key, native revision ID or
     /// proof ID.
-    pub(crate) fn rebase(&mut self, from: &str, native_revision: &str, producer_id: &str) {
-        if from == native_revision {
-            return;
-        }
-        let proof = crate::store::native_proof_id(producer_id, &self.input.key, native_revision);
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn holds_row_copies(&self) -> bool {
+        let empty = |document: &DocumentKey, revision: &str, proof: &str| {
+            document.source_set_id.is_empty()
+                && document.language.is_empty()
+                && document.path.is_empty()
+                && revision.is_empty()
+                && proof.is_empty()
+        };
+        !(self
+            .input
+            .declarations
+            .iter()
+            .all(|row| empty(&row.document, &row.revision_id, &row.provenance_id))
+            && self
+                .input
+                .calls
+                .iter()
+                .all(|row| empty(&row.document, &row.revision_id, &row.provenance_id))
+            && self
+                .regions
+                .iter()
+                .all(|row| empty(&row.document, &row.revision_id, &row.provenance_id)))
+    }
+
+    /// The kept document as a read at native revision `native_revision` decodes it: every
+    /// row gets the document's key, that native revision ID and the document's native proof
+    /// ID under `producer_id`, as the decoder writes them.
+    pub(crate) fn restore(
+        self,
+        native_revision: &str,
+        producer_id: &str,
+    ) -> (DocumentInput, Vec<crate::native_records::ControlRegion>) {
+        let Self {
+            table: _,
+            mut input,
+            mut regions,
+        } = self;
+        let proof = crate::store::native_proof_id(producer_id, &input.key, native_revision);
         let DocumentInput {
-            key: _,
+            key,
             file: _,
             declarations,
             calls,
             semantic: _,
-        } = &mut self.input;
+        } = &mut input;
         for declaration in declarations {
+            declaration.document.clone_from(key);
             declaration.revision_id = native_revision.to_owned();
             declaration.provenance_id.clone_from(&proof);
         }
         for call in calls {
+            call.document.clone_from(key);
             call.revision_id = native_revision.to_owned();
             call.provenance_id.clone_from(&proof);
         }
-        for region in &mut self.regions {
+        for region in &mut regions {
+            region.document.clone_from(key);
             region.revision_id = native_revision.to_owned();
             region.provenance_id.clone_from(&proof);
         }
+        (input, regions)
     }
 }

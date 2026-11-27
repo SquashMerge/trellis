@@ -1,22 +1,17 @@
 //! Ordered charge replay against fresh catalogs, retaining only completed source output.
 use super::*;
-use shared::{ChargeSite, SemanticChargeOutcome};
-
-#[derive(Clone, Serialize)]
-pub(crate) struct SourceChargePlan {
-    pub(crate) prepared_work: usize,
-    pub(crate) sites: Vec<ChargeSite>,
-}
+use shared::SemanticChargeOutcome;
 
 #[derive(Clone, Default)]
 pub(crate) struct SourceFacts {
     pub(crate) plan: Option<Arc<SourceChargePlan>>,
     pub(crate) work: usize,
     pub(crate) sites: usize,
-    pub(crate) endpoints: Vec<u32>,
+    /// Shared with the dependency index, and between cores while unchanged (#1313).
+    pub(crate) endpoints: Arc<[u32]>,
     /// A projected source's semantic endpoint documents: those whose eligibility its Read B
     /// reads under its producer at the current pin (#934, #1310). Empty for a current source.
-    pub(crate) eligibility: Vec<u32>,
+    pub(crate) eligibility: Arc<[u32]>,
 }
 
 /// Build-local owned state. All document borrows and request callbacks are made on the
@@ -218,58 +213,94 @@ pub(super) fn prepare_with_workers(
             }
         }
         let placeholder = syntax_bounds::unread_tree("");
-        let (mut trees, mut gaps): (Vec<_>, Vec<_>) = map_all(
-            &(0..docs.len()).collect::<Vec<_>>(),
-            workers,
-            &request,
-            |&i| match usable {
-                Some(kept) if !parsed[i] => Ok((placeholder.clone(), kept.gaps[i].clone())),
-                _ => syntax(docs[i]),
-            },
-        )?
-        .into_iter()
-        .unzip();
         let limit = work::reference_limit(docs.len(), total_bytes);
         let selected = docs
             .iter()
             .enumerate()
             .filter_map(|(i, doc)| (!snapshot.evidence_gaps.contains_key(&doc.key)).then_some(i))
             .collect::<Vec<_>>();
-        let mut built = None;
-        if let Some(kept) = usable {
-            built = build_catalogs(
-                ReadContext {
-                    snapshot,
-                    docs: &docs,
-                    trees: &trees,
-                    document_map: &document_map,
-                    selected: &selected,
-                    sample_limit: MAX_SAMPLE_LIMIT,
-                    workers,
-                    request: &request,
-                },
-                limit,
-                RustSource::Kept {
-                    prepared: &kept.rust,
-                    changed: &changed,
-                    parsed: &parsed,
-                },
-                check,
-            )?;
-        }
-        let (catalogs, prepared) = match built {
-            Some(built) => built,
-            None => {
-                // No kept catalog, or one that cannot take this change: parse the rest and
-                // build in full.
-                let rest: Vec<usize> = (0..docs.len()).filter(|&i| !parsed[i]).collect();
-                let reparsed = map_all(&rest, workers, &request, |&i| syntax(docs[i]))?;
-                for (i, (tree, gap)) in rest.into_iter().zip(reparsed) {
-                    trees[i] = tree;
-                    gaps[i] = gap;
-                    parsed[i] = true;
+        // A read whose syntax would not fit at once parses in lanes (#1321), keeping only the
+        // trees `finish_incremental` reads: its dirty sources, and the Rust sources it parsed,
+        // whose replay may read their syntax.
+        let plan = match dirty {
+            Some(_) => lanes(&docs, |i| usable.is_none() || parsed[i]),
+            None => vec![CATALOGS.to_vec()],
+        };
+        let (trees, gaps, catalogs, prepared) = if plan.len() > 1 {
+            let dirty = dirty.expect("lanes need the dirty sources");
+            let is_dirty: Vec<bool> = docs.iter().map(|doc| dirty.contains(&doc.key)).collect();
+            let read = ReadContext {
+                snapshot,
+                docs: &docs,
+                trees: &[],
+                document_map: &document_map,
+                selected: &selected,
+                sample_limit: MAX_SAMPLE_LIMIT,
+                workers,
+                request: &request,
+            };
+            let mut gaps = vec![None; docs.len()];
+            let mut built = None;
+            let mut trees = Vec::new();
+            if let Some(kept) = usable {
+                for (i, gap) in gaps.iter_mut().enumerate() {
+                    if !parsed[i] {
+                        gap.clone_from(&kept.gaps[i]);
+                    }
                 }
-                build_catalogs(
+                let keep = |i: usize| is_dirty[i] || (docs[i].key.language == "rust" && parsed[i]);
+                (built, trees) = catalogs_in_lanes(
+                    read,
+                    &plan,
+                    limit,
+                    RustSource::Kept {
+                        prepared: &kept.rust,
+                        changed: &changed,
+                        parsed: &parsed,
+                    },
+                    &|i| {
+                        if parsed[i] {
+                            syntax(docs[i]).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    &keep,
+                    &mut gaps,
+                    check,
+                )?;
+            }
+            if built.is_none() {
+                // No kept catalog, or one that cannot take this change: build in full.
+                let keep = |i: usize| is_dirty[i] || docs[i].key.language == "rust";
+                (built, trees) = catalogs_in_lanes(
+                    read,
+                    &lanes(&docs, |_| true),
+                    limit,
+                    RustSource::Fresh { keep: keeping },
+                    &|i| syntax(docs[i]).map(Some),
+                    &keep,
+                    &mut gaps,
+                    check,
+                )?;
+            }
+            let (catalogs, prepared) = built.context("store_unavailable: fresh Rust catalog")?;
+            (trees, gaps, catalogs, prepared)
+        } else {
+            let (mut trees, mut gaps): (Vec<_>, Vec<_>) = map_all(
+                &(0..docs.len()).collect::<Vec<_>>(),
+                workers,
+                &request,
+                |&i| match usable {
+                    Some(kept) if !parsed[i] => Ok((placeholder.clone(), kept.gaps[i].clone())),
+                    _ => syntax(docs[i]),
+                },
+            )?
+            .into_iter()
+            .unzip();
+            let mut built = None;
+            if let Some(kept) = usable {
+                built = build_catalogs(
                     ReadContext {
                         snapshot,
                         docs: &docs,
@@ -281,11 +312,45 @@ pub(super) fn prepare_with_workers(
                         request: &request,
                     },
                     limit,
-                    RustSource::Fresh { keep: keeping },
+                    RustSource::Kept {
+                        prepared: &kept.rust,
+                        changed: &changed,
+                        parsed: &parsed,
+                    },
                     check,
-                )?
-                .context("store_unavailable: fresh Rust catalog")?
+                )?;
             }
+            let (catalogs, prepared) = match built {
+                Some(built) => built,
+                None => {
+                    // No kept catalog, or one that cannot take this change: parse the rest and
+                    // build in full.
+                    let rest: Vec<usize> = (0..docs.len()).filter(|&i| !parsed[i]).collect();
+                    let reparsed = map_all(&rest, workers, &request, |&i| syntax(docs[i]))?;
+                    for (i, (tree, gap)) in rest.into_iter().zip(reparsed) {
+                        trees[i] = tree;
+                        gaps[i] = gap;
+                        parsed[i] = true;
+                    }
+                    build_catalogs(
+                        ReadContext {
+                            snapshot,
+                            docs: &docs,
+                            trees: &trees,
+                            document_map: &document_map,
+                            selected: &selected,
+                            sample_limit: MAX_SAMPLE_LIMIT,
+                            workers,
+                            request: &request,
+                        },
+                        limit,
+                        RustSource::Fresh { keep: keeping },
+                        check,
+                    )?
+                    .context("store_unavailable: fresh Rust catalog")?
+                }
+            };
+            (trees, gaps, catalogs, prepared)
         };
         let partial_files = docs
             .iter()
@@ -437,6 +502,7 @@ pub(crate) fn finish_incremental(
                     trace.file_references.push(docs[source].key.clone());
                     let completed = file_references(
                         read,
+                        &docs,
                         &mut catalogs,
                         prepared.next().expect("prepared dirty source"),
                         &locate,
@@ -566,8 +632,9 @@ pub(super) fn replay_source_charges(
     merge_work(&mut catalogs.rust_execution.work, plan.prepared_work, check)?;
     let mut packages = SourcePackageDescriptors::new();
     let mut sites = 0;
-    for retained in &plan.sites {
+    for retained in plan.sites() {
         check()?;
+        let retained = &retained;
         // Replay's locate accepts normalized indices; full construction's accepts snapshot
         // indices. Both use the complete current declaration eligibility index.
         let outcome = match retained.semantic.as_ref().map(|semantic| &semantic.outcome) {
@@ -717,7 +784,7 @@ impl SourceFacts {
             endpoints,
             eligibility,
         } = self;
-        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints, "eligibility": eligibility })
+        json!({ "plan": plan.as_deref(), "work": work, "sites": sites, "endpoints": endpoints.as_ref(), "eligibility": eligibility.as_ref() })
     }
 }
 
@@ -805,20 +872,6 @@ pub(super) fn normalize_document(read: ReadContext<'_, '_>, document: usize) -> 
         .copied()
         .unwrap_or(read.docs.len());
     Ok(u32::try_from(sorted)?)
-}
-
-impl SourceChargePlan {
-    pub(super) fn push(&mut self, read: ReadContext<'_, '_>, mut site: ChargeSite) -> Result<()> {
-        if let Some(shared::SemanticCharge {
-            outcome: SemanticChargeOutcome::Internal { document, sid: _ },
-            historical: _,
-        }) = &mut site.semantic
-        {
-            *document = normalize_document(read, *document as usize)?;
-        }
-        self.sites.push(site);
-        Ok(())
-    }
 }
 
 pub(super) fn resolution_endpoints(endpoints: &mut BTreeSet<usize>, charged: &shared::ChargedSite) {

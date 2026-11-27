@@ -1149,6 +1149,131 @@ fn incoming_reports_callers_omitted_as_bound_elsewhere() {
     }
 }
 
+/// #994 (owner ruling 2026-11-26, option B): each listed caller is tagged with what its
+/// selected binding says about the selected declaration, and `data.bindingMatches` counts
+/// the emitted callers per tag. No caller is removed or reordered: proven here; pointing
+/// here unproven (a fresh dispatch boundary, a possibly stale binding); pointing
+/// elsewhere unproven (a stale internal binding, an external one); no target (no binding,
+/// an ambiguous binding).
+#[test]
+fn incoming_tags_each_caller_with_what_its_binding_says() {
+    use crate::graph_query::BoundaryReason;
+    use crate::semantic_evidence::Freshness;
+    use crate::semantic_records::{Resolution, SymbolKey, SymbolScheme, SymbolScope, Target};
+    let run = |compact: bool| {
+        let (result, mut semantic) = incoming(7);
+        let selected = result.selected.selected.declaration.syntax_id.clone();
+        let other = "sid:v1:2301cdb0e7c351db88fecd8aa523edc9".to_owned();
+        let calls = &mut semantic.calls;
+        // 0: fresh, direct, located at the selected declaration.
+        let bound = calls[0].as_mut().unwrap();
+        bound.boundary_reason = BoundaryReason::None;
+        // 1: the fixture's fresh binding here behind a dispatch boundary stays unproven.
+        // 2: a possibly stale binding to the selected declaration.
+        let bound = calls[2].as_mut().unwrap();
+        bound.boundary_reason = BoundaryReason::Stale;
+        bound.effective_freshness = Freshness::PossiblyStale;
+        bound.target_id = None;
+        // 3: a stale binding to another same-name declaration.
+        let bound = calls[3].as_mut().unwrap();
+        bound.boundary_reason = BoundaryReason::Stale;
+        bound.effective_freshness = Freshness::Stale;
+        bound.target_id = None;
+        if let Some(Target::Internal { syntax_id, .. }) = &mut bound.binding.declared_target {
+            *syntax_id = other.clone();
+        }
+        // 4: a fresh external binding: no located target, so #724 keeps it.
+        let bound = calls[4].as_mut().unwrap();
+        bound.boundary_reason = BoundaryReason::External;
+        bound.target_id = None;
+        bound.binding.resolution = Resolution::External;
+        bound.binding.declared_target = Some(Target::External {
+            symbol: SymbolKey {
+                scheme: SymbolScheme::Scip,
+                symbol: "rust-analyzer cargo std 1.0.0 index_workspace().".into(),
+                scope: SymbolScope::Global,
+                document: None,
+            },
+        });
+        // 5: no selected binding.
+        calls[5] = None;
+        // 6: an ambiguous binding whose candidates include the selected declaration.
+        let bound = calls[6].as_mut().unwrap();
+        bound.boundary_reason = BoundaryReason::Ambiguous;
+        bound.target_id = None;
+        bound.binding.resolution = Resolution::Ambiguous;
+        let here = bound.binding.declared_target.take().unwrap();
+        let mut elsewhere = here.clone();
+        if let Target::Internal { syntax_id, .. } = &mut elsewhere {
+            *syntax_id = other;
+        }
+        bound.binding.candidates = vec![elsewhere, here];
+        assert!(
+            semantic
+                .calls
+                .iter()
+                .flatten()
+                .all(|bound| !bound.bound_elsewhere(&selected))
+        );
+        super::incoming(
+            &json!(1),
+            result,
+            &semantic,
+            &super::test_support::rust_semantic("fresh", [326, 14, 312, 0, 29]),
+            compact,
+            std::path::Path::new("/Users/someone/projects/trellis"),
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap()
+    };
+    for compact in [false, true] {
+        let page = run(compact);
+        let callers = page["data"]["callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 7, "every name match stays listed");
+        let tags: Vec<_> = callers.iter().map(|c| c["bindingMatch"].clone()).collect();
+        assert_eq!(
+            tags,
+            [
+                "boundHere",
+                "pointsHere",
+                "pointsHere",
+                "pointsElsewhere",
+                "pointsElsewhere",
+                "noTarget",
+                "noTarget"
+            ]
+            .map(Value::from)
+        );
+        assert_eq!(
+            page["data"]["bindingMatches"],
+            json!({"boundHere":1,"pointsHere":2,"pointsElsewhere":2,"noTarget":2})
+        );
+        assert_catalog_valid("trellis_incoming_calls", &[&page]);
+    }
+}
+
+/// #994: the counts cover the emitted callers only, so an empty page counts zero of each
+/// and a byte-clipped page counts the callers it kept.
+#[test]
+fn incoming_binding_match_counts_cover_the_emitted_callers() {
+    let empty = project(0, false);
+    assert_eq!(
+        empty["data"]["bindingMatches"],
+        json!({"boundHere":0,"pointsHere":0,"pointsElsewhere":0,"noTarget":0})
+    );
+    let clipped = project(20, false);
+    assert_eq!(clipped["truncationReason"], "response_bytes");
+    let kept = clipped["data"]["callers"].as_array().unwrap().len();
+    assert!(kept > 0 && kept < 20);
+    assert_eq!(
+        clipped["data"]["bindingMatches"],
+        json!({"boundHere":0,"pointsHere":kept,"pointsElsewhere":0,"noTarget":0})
+    );
+    assert_catalog_valid("trellis_incoming_calls", &[&empty, &clipped]);
+}
+
 /// #724: a scalar that crosses byte 1024 is dropped whole, not split: 1023 ASCII bytes
 /// then a two-byte `é` (bytes 1023..1025) clip to the 1023 ASCII bytes.
 #[test]

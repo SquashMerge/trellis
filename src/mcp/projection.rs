@@ -215,7 +215,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":34,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":36,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       // #851: the head's apps, when its architecture is read; the call fills them in.
       "apps":{"state":"unavailable","items":[],"noApp":null},
@@ -1464,6 +1464,27 @@ pub fn incoming(
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
     use std::collections::BTreeMap;
+    /// #994 (owner ruling 2026-11-26, option B): what a caller's selected binding says
+    /// about the selected declaration, as an index into `MATCHES`. It labels a listed
+    /// caller and removes none: proven here (the #724 test with the located target equal to
+    /// `selected`), then a declared target of `selected` without proof, then any other
+    /// declared target, else none (no binding, or an ambiguous or unresolved one).
+    const MATCHES: [&str; 4] = ["boundHere", "pointsHere", "pointsElsewhere", "noTarget"];
+    fn binding_match(bound: Option<&crate::store::CallSemantic>, selected: &str) -> usize {
+        use crate::semantic_records::Target;
+        let Some(bound) = bound else { return 3 };
+        if bound.boundary_reason == crate::graph_query::BoundaryReason::None
+            && bound.effective_freshness == crate::semantic_evidence::Freshness::Fresh
+            && bound.target_id.as_deref() == Some(selected)
+        {
+            return 0;
+        }
+        match &bound.binding.declared_target {
+            Some(Target::Internal { syntax_id, .. }) if syntax_id == selected => 1,
+            Some(_) => 2,
+            None => 3,
+        }
+    }
     let owner = &result.selected.selected;
     let basis = json!({"indexGeneration":owner.pin.index_generation.to_string(),
         "indexRevision":owner.pin.index_revision});
@@ -1493,6 +1514,8 @@ pub fn incoming(
         }
         let mut callers = Vec::new();
         let mut boundary = false;
+        // #994 (owner ruling 2026-11-26, option B): emitted callers per binding match.
+        let mut matches = [0_u64; 4];
         for (index, item) in result.calls[..count].iter().enumerate() {
             let call = &item.call;
             let version = &item.source.document;
@@ -1546,6 +1569,8 @@ pub fn incoming(
             boundary |= bound.is_none_or(|bound| {
                 bound.boundary_reason != crate::graph_query::BoundaryReason::None
             });
+            let tag = binding_match(bound, &owner.declaration.syntax_id);
+            matches[tag] += 1;
             let evidence = call_evidence(bound, call_projection(semantic, &call.document))?;
             callers.push(
                 json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
@@ -1557,7 +1582,8 @@ pub fn incoming(
                 "targetId":evidence.target_id,"boundaryReason":evidence.boundary_reason,
                 "evidenceTier":evidence.evidence_tier,"semanticBasis":evidence.semantic_basis,
                 "freshness":evidence.freshness,"staleBecause":[],
-                "historicalFreshness":evidence.historical_freshness,"projection":evidence.projection}),
+                "historicalFreshness":evidence.historical_freshness,"projection":evidence.projection,
+                "bindingMatch":MATCHES[tag]}),
             );
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
@@ -1608,13 +1634,20 @@ pub fn incoming(
                     .filter_map(|document| document["document"]["language"].as_str()),
             ),
         );
+        let binding_matches: serde_json::Map<String, Value> = MATCHES
+            .iter()
+            .zip(matches)
+            .map(|(tag, count)| ((*tag).to_owned(), json!(count)))
+            .collect();
         let mut data = json!({
             "symbolId":owner.declaration.syntax_id,"displayKey":crate::references::display_key(&owner.declaration),
             "stableLookupKey":result.selected.source.stable_lookup_key,
             "match":{"basis":"name","sameNameDeclarations":result.same_name_declarations,
                 "limitations":["aliases","functionValues","reExports","dynamicDispatch",
                     "opaqueMacros","sameNameDeclarations"]},
-            "callers":callers,"documents":documents,"semanticBases":bases,"coverage":coverage,
+            "callers":callers,
+            "bindingMatches":binding_matches,
+            "documents":documents,"semanticBases":bases,"coverage":coverage,
             "scopeCoverage":language_status(&result.scope, tiers),
             "provenance":provenance,"semanticDocuments":semantic.documents});
         // #724: callers excluded because their fresh, direct binding targets another
