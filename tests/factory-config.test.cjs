@@ -13,6 +13,8 @@ const ALLOWED = new Set([
   "publish",
   "pr_draft",
   "verify_timeout_ms",
+  "verify_unavailable_exit",
+  "verify_scope",
   "bootstrap",
   "bootstrap_timeout_ms",
   "max_retries",
@@ -345,34 +347,14 @@ if [ "$FAKE_FONTS" != missing ]; then echo "Liberation Sans Narrow"; echo "Liber
   }
 });
 
-test("verify runs tools/verify, behind FACTORY_VERIFY_WRAPPER when it is set", () => {
+// Verify runs on CI (tools/ci-verify.sh, checked by tools/ci-verify-test.py): once, on the
+// integrated top, with 75 meaning CI could not answer.
+test("verify waits for CI on the integrated top and names its unavailable exit", () => {
   const config = loadConfig();
-  assert.equal(config.verify, "${FACTORY_VERIFY_WRAPPER:-} ./tools/verify");
-  // The factory runs verify through a shell; a stand-in checkout records what ran.
-  const dir = mkdtempSync(join(tmpdir(), "trellis-factory-wrapper-"));
-  const log = join(dir, "ran.log");
-  try {
-    mkdirSync(join(dir, "tools"));
-    const recorder = (name) => `#!/bin/sh\nprintf '%s' ${name} >> "$RAN_LOG"\nfor a in "$@"; do printf ' %s' "$a" >> "$RAN_LOG"; done\necho >> "$RAN_LOG"\n`;
-    writeFileSync(join(dir, "tools", "verify"), recorder("verify"));
-    writeFileSync(join(dir, "wrapper"), recorder("wrapper") + 'exec "$@"\n');
-    chmodSync(join(dir, "tools", "verify"), 0o755);
-    chmodSync(join(dir, "wrapper"), 0o755);
-    const run = (wrapper) => {
-      rmSync(log, { force: true });
-      const env = { ...process.env, RAN_LOG: log };
-      delete env.FACTORY_VERIFY_WRAPPER;
-      if (wrapper !== undefined) env.FACTORY_VERIFY_WRAPPER = wrapper;
-      const result = spawnSync("/bin/sh", ["-c", config.verify], { cwd: dir, encoding: "utf8", env });
-      assert.equal(result.status, 0, result.stderr);
-      return readFileSync(log, "utf8").trimEnd().split("\n");
-    };
-    assert.deepEqual(run(undefined), ["verify"]);
-    assert.deepEqual(run(""), ["verify"]);
-    assert.deepEqual(run(join(dir, "wrapper")), ["wrapper ./tools/verify", "verify"]);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  assert.equal(config.verify, "sh tools/ci-verify.sh");
+  assert.equal(config.verify_scope, "integration");
+  assert.equal(config.verify_unavailable_exit, 75);
+  assert.equal(config.verify_timeout_ms, 5400000);
 });
 
 test("verify is one executable command and retains all checks", () => {
@@ -466,6 +448,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["python3", "tools/rules-ratchet-test.py"],
         ["python3", "tools/test-selected-test.py"],
         ["python3", "tools/verify-heavy-lease-test.py"],
+        ["python3", "tools/ci-verify-test.py"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs", "tests/mcp-smoke.test.mjs"],
         ["python3", "tools/stage3-watcher-runner-test.py"],
         ["python3", "tools/verify-67-mixed-performance-test.py"],
