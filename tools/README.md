@@ -14,6 +14,7 @@ through a shared lease.
   Python is not needed.
 - **When the run is already inside the lease** (an outer wrapper took it and set
   `MIMIR_HEAVY_LOCK_HELD`), verify runs directly, so nothing waits on itself.
+  `heavy_run.sh` and `heavy_run.py` do the same when they are called there.
 
 ### Tiers and the queue
 
@@ -50,11 +51,13 @@ security boundary.
 
 ### Where the scripts come from
 
-`heavy_run.sh` and `heavy_run.py` are unmodified copies of `scripts/heavy_run.sh`
-and `scripts/heavy_run.py` from the public SquashMerge/mimir repository at commit
-`495be6fe1866a4b49c73e2817a98494d79b3adbb`. Every participant must run the same
-protocol, so don't edit them here: change them in mimir and copy the new files
-over. Their SHA-256 hashes:
+`heavy_run.sh` and `heavy_run.py` are copies of `scripts/heavy_run.sh` and
+`scripts/heavy_run.py` from the public SquashMerge/mimir repository at commit
+`495be6fe1866a4b49c73e2817a98494d79b3adbb`. `heavy_run.sh` is unmodified.
+`heavy_run.py` has one Trellis change: when `MIMIR_HEAVY_LOCK_HELD` is non-empty,
+`run()` runs the command directly, as `heavy_run.sh` does. Every participant must
+run the same protocol, so don't change it here: change it in mimir, copy the new
+files over and keep that one change. The SHA-256 hashes of the mimir files:
 
 ```
 a7c52b56aa40214c17bdf79e51c8daa4753501b006b26984d394f211be98e5f7  heavy_run.sh
