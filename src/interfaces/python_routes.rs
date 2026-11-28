@@ -1,4 +1,4 @@
-//! Python server routes (#856): Flask and FastAPI route decorators on app, blueprint and
+//! Python server routes (#856): aiohttp registrations, Flask and FastAPI decorators on app, blueprint and
 //! router objects, under the prefixes their registrations mount them at, and Django URL
 //! patterns reached from a `ROOT_URLCONF`. Objects, mounts and views are followed across
 //! documents only through bindings that resolve; anything else registers nothing.
@@ -25,6 +25,8 @@ enum Kind {
     Blueprint,
     FastApi,
     Router,
+    AioApp,
+    AioTable,
 }
 
 /// A prefix as written: none, a readable string, or one that cannot be read.
@@ -122,7 +124,7 @@ pub(super) fn extract(
         }
         for (name, _) in doc.names.singles() {
             if let Some(object) = reading.object(at, name, work, check)?
-                && matches!(object.kind, Kind::Flask | Kind::FastApi)
+                && matches!(object.kind, Kind::Flask | Kind::FastApi | Kind::AioTable)
             {
                 roots.push(((at, name.to_owned()), object.kind));
             }
@@ -149,6 +151,7 @@ pub(super) fn extract(
         }
         for node in calls {
             reading.registration(at, node, &mut edges, work, check)?;
+            reading.aiohttp_registration(at, node, work, check)?;
         }
     }
     reading.mount(&roots, &sites, &edges, work, check)?;
@@ -254,7 +257,11 @@ impl<'t> Reading<'_, 't> {
             Some(("flask" | "flask.blueprints", "Blueprint")) => Kind::Blueprint,
             Some(("fastapi" | "fastapi.applications", "FastAPI")) => Kind::FastApi,
             Some(("fastapi" | "fastapi.routing", "APIRouter")) => Kind::Router,
-            _ => return Ok(None),
+            _ => match aiohttp_member(reader, function) {
+                Some("Application") => Kind::AioApp,
+                Some("RouteTableDef") => Kind::AioTable,
+                _ => return Ok(None),
+            },
         };
         let Some(args) = Args::of(*value, reader.source) else {
             return Ok(None);
@@ -264,7 +271,7 @@ impl<'t> Reading<'_, 't> {
             // url_prefix, ..)`; `APIRouter(*, prefix, ..)`.
             Kind::Blueprint => self.prefix(doc, args.get("url_prefix", Some(5)), work, check)?,
             Kind::Router => self.prefix(doc, args.keyword("prefix"), work, check)?,
-            Kind::Flask | Kind::FastApi => Prefix::Absent,
+            Kind::Flask | Kind::FastApi | Kind::AioApp | Kind::AioTable => Prefix::Absent,
         };
         Ok(Some(Object { kind, prefix }))
     }
@@ -384,6 +391,9 @@ impl<'t> Reading<'_, 't> {
             };
             let attribute = reader.text(attribute);
             let (methods, key) = match (object.kind, attribute) {
+                (Kind::AioTable, "get" | "post" | "put" | "delete" | "patch" | "head") => {
+                    (verb(attribute).map(|method| vec![method]), "path")
+                }
                 (Kind::Flask | Kind::Blueprint, "route") => (
                     self.methods(doc, args.keyword("methods"), work, check)?,
                     "rule",
@@ -422,6 +432,177 @@ impl<'t> Reading<'_, 't> {
                     start: decorator.start_byte(),
                 });
         }
+        Ok(())
+    }
+
+    /// Only an Application's `router` attribute (or a single binding to it) is a
+    /// router. Do not infer provenance from names or general Python dataflow.
+    fn aiohttp_receiver(
+        &self,
+        doc: usize,
+        mut node: Node<'t>,
+        router: bool,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let mut at = doc;
+        if router {
+            if let Some(Target::Binding(bound_doc, name)) =
+                self.py.resolve_expression(at, node, work)?
+            {
+                let Some(Bound::Assign { value, .. }) = self.py.docs[bound_doc].names.single(&name)
+                else {
+                    return Ok(false);
+                };
+                at = bound_doc;
+                node = *value;
+            }
+            if node.kind() != "attribute"
+                || node
+                    .child_by_field_name("attribute")
+                    .is_none_or(|attribute| self.py.docs[at].reader().text(attribute) != "router")
+            {
+                return Ok(false);
+            }
+            let Some(owner) = node.child_by_field_name("object") else {
+                return Ok(false);
+            };
+            node = owner;
+        }
+        let Some(Target::Binding(at, name)) = self.py.resolve_expression(at, node, work)? else {
+            return Ok(false);
+        };
+        Ok(self
+            .object(at, &name, work, check)?
+            .is_some_and(|object| object.kind == Kind::AioApp))
+    }
+
+    fn aiohttp_registration(
+        &mut self,
+        doc: usize,
+        call: Node<'t>,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let d = &self.py.docs[doc];
+        let reader = d.reader();
+        if call.has_error() || test_span(d.input, &range(call)) {
+            return Ok(());
+        }
+        let Some(function) = call.child_by_field_name("function") else {
+            return Ok(());
+        };
+        let (Some(owner), Some(attribute)) = (
+            function.child_by_field_name("object"),
+            function.child_by_field_name("attribute"),
+        ) else {
+            return Ok(());
+        };
+        let attribute = reader.text(attribute);
+        if !matches!(
+            attribute,
+            "add_routes"
+                | "add_route"
+                | "add_get"
+                | "add_post"
+                | "add_put"
+                | "add_patch"
+                | "add_delete"
+                | "add_head"
+        ) {
+            return Ok(());
+        }
+        let list = attribute == "add_routes";
+        if !self.aiohttp_receiver(doc, owner, !list, work, check)? {
+            return Ok(());
+        }
+        let Some(args) = Args::of(call, reader.source) else {
+            return Ok(());
+        };
+        if list {
+            let Arg::Given(routes) = args.get("routes", Some(0)) else {
+                return Ok(());
+            };
+            if routes.kind() != "list" {
+                return Ok(());
+            }
+            for entry in named(routes) {
+                check()?;
+                charge(work, 1)?;
+                if entry.kind() != "call" {
+                    continue;
+                }
+                let Some(function) = entry.child_by_field_name("function") else {
+                    continue;
+                };
+                let Some(method) = aiohttp_member(reader, function).and_then(aiohttp_verb) else {
+                    continue;
+                };
+                let Some(args) = Args::of(entry, reader.source) else {
+                    continue;
+                };
+                self.aiohttp_route(doc, entry, method, &args, 0, work, check)?;
+            }
+        } else {
+            let method = if attribute == "add_route" {
+                match args.get("method", Some(0)) {
+                    Arg::Given(node) => reader.exact(node, work, check)?.and_then(|s| verb(&s)),
+                    _ => None,
+                }
+            } else {
+                attribute.strip_prefix("add_").and_then(aiohttp_verb)
+            };
+            if let Some(method) = method {
+                self.aiohttp_route(
+                    doc,
+                    call,
+                    method,
+                    &args,
+                    usize::from(attribute == "add_route"),
+                    work,
+                    check,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn aiohttp_route(
+        &mut self,
+        doc: usize,
+        call: Node<'t>,
+        method: &str,
+        args: &Args<'t>,
+        path_index: usize,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let (Arg::Given(path), Arg::Given(handler)) = (
+            args.get("path", Some(path_index)),
+            args.get("handler", Some(path_index + 1)),
+        ) else {
+            return Ok(());
+        };
+        let Some(path) = self.py.docs[doc].reader().exact(path, work, check)? else {
+            return Ok(());
+        };
+        charge(work, path.len().saturating_add(ROUTE_COST))?;
+        let Some(template) = braces(&path).as_deref().and_then(finish) else {
+            return Ok(());
+        };
+        let handler = self.view(doc, handler, work)?;
+        self.found.push(Found {
+            path: self.py.docs[doc].input.key.path.clone(),
+            start: call.start_byte(),
+            route: Route {
+                method: method.into(),
+                segments: segments(&template),
+                path_template: template,
+                from_table: false,
+                handler,
+            },
+        });
         Ok(())
     }
 
@@ -789,6 +970,30 @@ impl<'t> Reading<'_, 't> {
             return Ok(self.declaration(at, *node, &name));
         }
         Ok(self.span(doc, range(view)))
+    }
+}
+
+/// A member imported directly or through an evidenced aiohttp `web` module alias.
+fn aiohttp_member<'n, 't: 'n>(
+    reader: super::python::Reader<'n, 't>,
+    node: Node<'_>,
+) -> Option<&'n str> {
+    if let Some(("aiohttp.web" | "aiohttp.web_app" | "aiohttp.web_routedef", member)) =
+        reader.external(node)
+    {
+        return Some(member);
+    }
+    let owner = node.child_by_field_name("object")?;
+    if reader.external(owner) != Some(("aiohttp", "web")) {
+        return None;
+    }
+    Some(reader.text(node.child_by_field_name("attribute")?))
+}
+
+fn aiohttp_verb(name: &str) -> Option<&'static str> {
+    match name {
+        "get" | "post" | "put" | "patch" | "delete" | "head" => verb(name),
+        _ => None,
     }
 }
 

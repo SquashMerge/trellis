@@ -16,7 +16,11 @@ const EVAL_DEPTH: usize = 32;
 const RESOLVE_DEPTH: usize = 16;
 
 /// Words that make a document a candidate for server routes. A route decorator line is too.
-const SERVER_WORDS: [&str; 13] = [
+const SERVER_WORDS: [&str; 17] = [
+    "aiohttp",
+    ".add_",
+    ".router",
+    "RouteTableDef",
     "flask",
     "Flask",
     "Blueprint",
