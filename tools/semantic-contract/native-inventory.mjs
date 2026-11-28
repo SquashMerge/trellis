@@ -8,7 +8,12 @@
 // under an existing version.
 const INVENTORIES = new Map([
   // Current production extractor. Its compiled grammars and normalization tables are
-  // versioned by native-v20; no external capture affects per-document measurement.
+  // versioned by native-v21; no external capture affects per-document measurement.
+  [
+    "trellis.native.syntax\u0000native-v21",
+    { java: [], rust: [], python: [], javascript: [], typescript: [] },
+  ],
+  // Retained conformance captures made before the import type-query grammar fix.
   [
     "trellis.native.syntax\u0000native-v20",
     { java: [], rust: [], python: [], javascript: [], typescript: [] },

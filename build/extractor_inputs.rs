@@ -116,6 +116,7 @@ pub fn extractor_hash(modules: &[(&str, &[u8])], cargo_lock: &str, test_support:
 }
 
 /// `name version checksum` for each selected `Cargo.lock` package, sorted.
+/// Git packages have no checksum: bind their source URL and resolved commit instead.
 /// Panics if a listed crate is absent, so a renamed dependency cannot drop
 /// out of the hash unnoticed.
 pub fn extraction_crate_lines(cargo_lock: &str) -> Vec<String> {
@@ -138,11 +139,13 @@ pub fn extraction_crate_lines(cargo_lock: &str) -> Vec<String> {
     for block in cargo_lock.split("[[package]]").skip(1) {
         let name = field(block, "name");
         if selected(&name) {
-            lines.push(format!(
-                "{name} {} {}",
-                field(block, "version"),
+            let source = field(block, "source");
+            let identity = if source.starts_with("git+") {
+                source
+            } else {
                 field(block, "checksum")
-            ));
+            };
+            lines.push(format!("{name} {} {identity}", field(block, "version")));
             found.push(name);
         }
     }

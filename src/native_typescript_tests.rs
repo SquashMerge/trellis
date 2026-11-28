@@ -1,5 +1,5 @@
 //! TypeScript native extraction: routing by path, the shared JavaScript constructs and
-//! lookup-key equivalence with JavaScript. These tests never name the parser crate.
+//! lookup-key equivalence with JavaScript, plus direct grammar regressions.
 use crate::{
     indexer::{IndexOptions, index_workspace_with_native},
     native_evidence::{self, Artifact, DeclarationRole},
@@ -832,6 +832,69 @@ fn override_modifier_is_measured() {
                 .header
                 .modifiers
                 .contains(&"override".to_owned()),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn call_site_import_type_queries_parse_with_both_grammars() {
+    for (path, source) in [
+        (
+            "mock.ts",
+            include_str!("../tests/fixtures/typescript-import-query/mock.ts"),
+        ),
+        (
+            "mock.tsx",
+            include_str!("../tests/fixtures/typescript-import-query/mock.tsx"),
+        ),
+    ] {
+        let mut parser = crate::measured_parse::parser();
+        parser
+            .set_language(&crate::indexer_ts::grammar(path))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{path}: {}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(tree.root_node().end_byte(), source.len(), "{path}");
+        let artifact = index(&[(path, source)]);
+        no_gap(path, &artifact);
+        assert_eq!(
+            measured(&artifact),
+            (
+                pairs(&[
+                    ("module", ""),
+                    ("anonymousFunction", ""),
+                    ("variable", "actual"),
+                ]),
+                vec!["mock".to_owned(), "importOriginal".to_owned()],
+            ),
+            "{path}"
+        );
+        let callback = artifact
+            .declarations
+            .iter()
+            .find(|d| d.kind == "anonymousFunction")
+            .unwrap();
+        assert_eq!(
+            callback.header.parameters[0].name.as_deref(),
+            Some("importOriginal"),
+            "{path}"
+        );
+        let original = &artifact.calls[1];
+        assert_eq!(original.owner_syntax_id, callback.syntax_id, "{path}");
+        assert_eq!(
+            &source[original.range.start..original.range.end],
+            "importOriginal<typeof import(\"./api/chat\")>()",
+            "{path}"
+        );
+        let callee = original.callee_range.as_ref().unwrap();
+        assert_eq!(
+            &source[callee.start..callee.end],
+            "importOriginal",
             "{path}"
         );
     }

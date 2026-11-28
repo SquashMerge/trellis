@@ -26,7 +26,7 @@ pub(crate) const LANGUAGES: [&str; 5] = ["java", "rust", "python", "javascript",
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v20";
+pub(crate) const NATIVE_VERSION: &str = "native-v21";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

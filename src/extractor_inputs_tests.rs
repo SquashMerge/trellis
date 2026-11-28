@@ -6,6 +6,25 @@ include!("../build/extractor_inputs.rs");
 
 use std::{collections::BTreeSet, path::Path};
 
+#[test]
+fn git_grammar_revision_changes_the_extractor_hash() {
+    let lock = include_str!("../Cargo.lock");
+    let lines = extraction_crate_lines(lock);
+    let grammar = lines
+        .iter()
+        .find(|line| line.starts_with("tree-sitter-typescript "))
+        .unwrap();
+    let source = grammar.split_whitespace().nth(2).unwrap();
+    assert!(source.starts_with("git+"), "{grammar}");
+    let (_, revision) = source.rsplit_once('#').unwrap();
+    let changed = lock.replace(revision, &"0".repeat(revision.len()));
+    assert_ne!(
+        extractor_hash(&[], lock, false),
+        extractor_hash(&[], &changed, false),
+        "a grammar commit change must invalidate retained native facts"
+    );
+}
+
 /// Crate modules the listed extraction modules may use without being hashed,
 /// each limited to the exact items named, with the reason it cannot change a
 /// stored fact for an unchanged capture.
