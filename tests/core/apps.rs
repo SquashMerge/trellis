@@ -169,23 +169,26 @@ fn trellis_layout_detects_daemon_herdr_mod_and_web_apps() {
     );
     let data = check(&files).expect("the Trellis layout validates");
     assert_eq!(limitation_count(&data), 0);
-    let apps: Vec<(&str, &str)> = data["apps"]
+    let apps: Vec<(&str, &str, Option<&str>)> = data["apps"]
         .as_array()
         .unwrap()
         .iter()
         .map(|app| {
             (
                 app["name"].as_str().unwrap(),
-                app["manifest"].as_str().unwrap(),
+                app["source"].as_str().unwrap(),
+                app["manifest"].as_str(),
             )
         })
         .collect();
+    // The mod is authored at its own root, under its own name, to declare `may_use` (#1131);
+    // authored apps come first.
     assert_eq!(
         apps,
         [
-            ("trellis", "Cargo.toml"),
-            ("trellis-herdr-mod", "herdr-mod/package.json"),
-            ("trellis-web", "web/package.json")
+            ("trellis-herdr-mod", "override", None),
+            ("trellis", "manifest", Some("Cargo.toml")),
+            ("trellis-web", "manifest", Some("web/package.json"))
         ]
     );
     // The stubs carry no references, so the inventory has no rule instances to count.

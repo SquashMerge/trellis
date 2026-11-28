@@ -9,10 +9,30 @@ test_features = ["test-support"]
 peers = "forbid"
 shared_outbound = "forbid"
 
-[layers.web]
+# The web app's three layers (owner ruling 2026-11-27, #1131 option a): controllers above the
+# Pele adapters above the pure modules. Inside web/ nothing is checked: the classic scripts
+# share `window` globals and expose no references between them (#993). The layers exist for
+# the Herdr mod's `may_use` below, which may use only the pure modules and the adapters.
+[layers.web-controllers]
 app = "trellis-web"
 order = 1
 paths = ["web/**"]
+
+[layers.web-adapters]
+app = "trellis-web"
+order = 2
+paths = [
+  "web/pele-svg.js", "web/architecture-pele.js", "web/sequence-pele.js", "web/vendor/**",
+]
+
+[layers.web-pure]
+app = "trellis-web"
+order = 3
+paths = [
+  "web/index-pin.js", "web/dto-core.js", "web/metric-heat.js", "web/architecture-display.js",
+  "web/architecture-apps.js", "web/deviations-model.js", "web/architecture-routing.js",
+  "web/source-witness.js", "web/sequence-model.js",
+]
 
 [layers.web-tests]
 app = "trellis-web"
@@ -232,6 +252,12 @@ suffix = ".js"
 exact = { pele = "web/vendor/pele-1.10.0-trellis.2.js", tokens = "web/style.css", controls = "web/index.html" }
 
 # --- app "trellis-herdr-mod" (herdr-mod/package.json): the Herdr app mod (#707, #909).
+# Authored at the detected root, under its own name, to declare what it may use of the web
+# app (#1131): only the pure modules and the Pele adapters, never a controller.
+[apps.trellis-herdr-mod]
+roots = ["herdr-mod"]
+may_use = { "trellis-web" = ["web-pure", "web-adapters"] }
+
 # Three layers by import direction (#998): the view, the adapters over the shared web
 # scripts and the daemon client, and the DOM and runtime stand-ins they run on.
 [layers.herdr-mod-tests]
