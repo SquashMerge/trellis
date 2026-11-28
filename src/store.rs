@@ -2052,6 +2052,13 @@ impl EvidenceResponse {
         let limits = ArchitectureByteLimits::current();
         let mut over = false;
         let mut documents_seen = 0usize;
+        // Fetched rows are decoded a chunk at a time (#1321), so only one chunk of raw rows is
+        // held beside the decoded documents. A decode failure is reported only after every
+        // bound, as when all rows were decoded after the loop; no row is fetched after it.
+        let mut fetched_documents = Vec::new();
+        let mut decoded_through = 0usize;
+        let mut chunk_bytes = 0u64;
+        let mut decode_failure = None;
         while let Some(row) = cursor.next()? {
             check()?;
             documents_seen += 1;
@@ -2132,8 +2139,10 @@ impl EvidenceResponse {
                 over = true;
                 pending = Vec::new();
                 tables = Vec::new();
+                fetched_documents = Vec::new();
+                decoded_through = 0;
             }
-            if over {
+            if over || decode_failure.is_some() {
                 continue;
             }
             if oversized {
@@ -2193,6 +2202,18 @@ impl EvidenceResponse {
             });
             pending.push((key, Some(std::sync::Mutex::new(Some(fetched)))));
             progress(pending.len(), total);
+            chunk_bytes = chunk_bytes.saturating_add(stored);
+            if chunk_bytes >= read_a_decode_chunk_bytes() {
+                decode_failure = decode_read_a(
+                    &pending[decoded_through..],
+                    &module_only,
+                    &mut *check,
+                    &mut fetched_documents,
+                )?
+                .err();
+                decoded_through = pending.len();
+                chunk_bytes = 0;
+            }
         }
         drop(cursor);
         // The retained dependency and config inputs are charged by their stored length with
@@ -2216,81 +2237,17 @@ impl EvidenceResponse {
             stored_bytes = stored_bytes.saturating_add(length);
         }
         limits.check_stored(stored_bytes)?;
-        // SQLite reads stay on this connection; decoding needs no connection, so
-        // it runs in parallel. The first decode failure in document order is reported.
-        let mut fetched_documents = Vec::new();
-        {
-            let stopped = std::sync::atomic::AtomicBool::new(false);
-            let progress_failure = Mutex::new(None);
-            let check = Mutex::new(&mut *check);
-            let expired = || {
-                if stopped.load(std::sync::atomic::Ordering::Acquire) {
-                    return true;
-                }
-                match (*check.lock().unwrap())() {
-                    Ok(()) => false,
-                    Err(error) => {
-                        *progress_failure.lock().unwrap() = Some(error);
-                        stopped.store(true, std::sync::atomic::Ordering::Release);
-                        true
-                    }
-                }
-            };
-            let fresh: Vec<_> = pending
-                .iter()
-                .filter_map(|(_, decode)| decode.as_ref())
-                .collect();
-            let decoded = crate::parallel::map_ordered(
-                &fresh,
-                crate::parallel::default_workers(),
-                &stopped,
-                |_, decode| {
-                    let decode = decode
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .take()
-                        .expect("each fetched document is decoded once");
-                    // Poll the shared request callback once per 256 rows per worker.
-                    let polls = std::cell::Cell::new(0usize);
-                    let poll = || {
-                        let due = polls.get() == 0;
-                        polls.set((polls.get() + 1) % 256);
-                        if due {
-                            expired()
-                        } else {
-                            stopped.load(std::sync::atomic::Ordering::Acquire)
-                        }
-                    };
-                    decode(Some(&poll))
-                },
-            );
-            if let Some(error) = progress_failure.lock().unwrap().take() {
-                return Err(error);
-            }
-            let mut decoded = decoded.into_iter();
-            fetched_documents.reserve(fresh.len());
-            for (key, decode) in &pending {
-                if decode.is_none() {
-                    continue;
-                }
-                let mut fetched = decoded
-                    .next()
-                    .flatten()
-                    .context("cancelled: architecture decode not started")??;
-                if module_only.contains(key) {
-                    fetched.declarations.retain(|declaration| {
-                        declaration.kind == "module" && declaration.ancestors.is_empty()
-                    });
-                    fetched.declarations.shrink_to_fit();
-                    fetched.calls = Vec::new();
-                    fetched.regions = Vec::new();
-                }
-                selected_ensure!(
-                    fetched.file.language == key.language,
-                    "incompatible_index: architecture language mismatch"
-                );
-                fetched_documents.push(fetched);
-            }
+        if decode_failure.is_none() {
+            decode_failure = decode_read_a(
+                &pending[decoded_through..],
+                &module_only,
+                &mut *check,
+                &mut fetched_documents,
+            )?
+            .err();
+        }
+        if let Some(failure) = decode_failure {
+            return Err(failure);
         }
         // Retained manifests belong to this selected row and this admitted transaction.
         // Their stored bytes were charged with the documents; source bytes are charged
@@ -11037,6 +10994,130 @@ pub(crate) fn v8_owner_scope_for(
 }
 /// Decode rows already read from one snapshot, polling `progress`; it needs no connection.
 trait Decode<T>: FnOnce(Option<&dyn Fn() -> bool>) -> Result<T> + Send {}
+
+/// Read A decodes its fetched rows after each chunk of this many read bytes (#1321).
+const READ_A_DECODE_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_READ_A_DECODE_CHUNK_BYTES: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The decode chunk a read on this thread uses: [`READ_A_DECODE_CHUNK_BYTES`], or a test's.
+fn read_a_decode_chunk_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_READ_A_DECODE_CHUNK_BYTES.get() {
+        return bytes;
+    }
+    READ_A_DECODE_CHUNK_BYTES
+}
+
+/// Lowers this thread's Read A decode chunk until the guard drops.
+#[cfg(test)]
+pub(crate) fn set_read_a_decode_chunk_bytes_for_tests(bytes: u64) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_READ_A_DECODE_CHUNK_BYTES.set(None);
+        }
+    }
+    TEST_READ_A_DECODE_CHUNK_BYTES.set(Some(bytes));
+    Reset
+}
+
+/// Decode `chunk`'s fetched documents in parallel, appending them to `out` in document order.
+/// SQLite reads stay on the caller's connection; decoding needs none. A document in
+/// `module_only` keeps only its file module (#1321). The request callback's own failure is the
+/// outer error; the first decode failure in document order is the inner.
+fn decode_read_a<D: Decode<FetchedDocument>>(
+    chunk: &[(
+        crate::native_records::DocumentKey,
+        Option<std::sync::Mutex<Option<D>>>,
+    )],
+    module_only: &BTreeSet<crate::native_records::DocumentKey>,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+    out: &mut Vec<FetchedDocument>,
+) -> Result<Result<()>> {
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let progress_failure = Mutex::new(None);
+    let check = Mutex::new(check);
+    let expired = || {
+        if stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        match (*check.lock().unwrap())() {
+            Ok(()) => false,
+            Err(error) => {
+                *progress_failure.lock().unwrap() = Some(error);
+                stopped.store(true, std::sync::atomic::Ordering::Release);
+                true
+            }
+        }
+    };
+    let fresh: Vec<_> = chunk
+        .iter()
+        .filter_map(|(_, decode)| decode.as_ref())
+        .collect();
+    let decoded = crate::parallel::map_ordered(
+        &fresh,
+        crate::parallel::default_workers(),
+        &stopped,
+        |_, decode| {
+            let decode = decode
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .expect("each fetched document is decoded once");
+            // Poll the shared request callback once per 256 rows per worker.
+            let polls = std::cell::Cell::new(0usize);
+            let poll = || {
+                let due = polls.get() == 0;
+                polls.set((polls.get() + 1) % 256);
+                if due {
+                    expired()
+                } else {
+                    stopped.load(std::sync::atomic::Ordering::Acquire)
+                }
+            };
+            decode(Some(&poll))
+        },
+    );
+    if let Some(error) = progress_failure.lock().unwrap().take() {
+        return Err(error);
+    }
+    let mut decoded = decoded.into_iter();
+    out.reserve(fresh.len());
+    for (key, decode) in chunk {
+        if decode.is_none() {
+            continue;
+        }
+        let fetched = (|| -> Result<FetchedDocument> {
+            let mut fetched = decoded
+                .next()
+                .flatten()
+                .context("cancelled: architecture decode not started")??;
+            if module_only.contains(key) {
+                fetched.declarations.retain(|declaration| {
+                    declaration.kind == "module" && declaration.ancestors.is_empty()
+                });
+                fetched.declarations.shrink_to_fit();
+                fetched.calls = Vec::new();
+                fetched.regions = Vec::new();
+            }
+            selected_ensure!(
+                fetched.file.language == key.language,
+                "incompatible_index: architecture language mismatch"
+            );
+            Ok(fetched)
+        })();
+        match fetched {
+            Ok(fetched) => out.push(fetched),
+            Err(failure) => return Ok(Err(failure)),
+        }
+    }
+    Ok(Ok(()))
+}
 impl<T, F: FnOnce(Option<&dyn Fn() -> bool>) -> Result<T> + Send> Decode<T> for F {}
 /// Pin a decoder's argument lifetime: any `progress` borrow, not one inferred.
 fn decoder<T, F>(decode: F) -> F
