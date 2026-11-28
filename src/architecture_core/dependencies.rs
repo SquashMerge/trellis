@@ -61,7 +61,7 @@ mod staged {
         if manifest_digest(&snapshot.manifests) != base.manifests {
             return Ok(Err(FullReason::ManifestsChanged));
         }
-        if root_config_digest(snapshot.root_tsconfig.as_ref()) != base.root_config {
+        if root_config_digest(snapshot) != base.root_config {
             return Ok(Err(FullReason::RootTsconfigChanged));
         }
         if fingerprints.producers != base.producers {
@@ -296,10 +296,12 @@ mod staged {
         hash.finish()
     }
 
-    pub(crate) fn root_config_digest(config: Option<&RootTsconfigInput>) -> [u8; 32] {
-        let mut hash = Fingerprint::new("architecture:root-config:v1");
+    /// The JavaScript and TypeScript resolution configuration: the root tsconfig and the rules
+    /// file's specifier mappings (#1131).
+    pub(crate) fn root_config_digest(snapshot: &Snapshot) -> [u8; 32] {
+        let mut hash = Fingerprint::new("architecture:root-config:v2");
         hash.optional(
-            config,
+            snapshot.root_tsconfig.as_ref(),
             |hash,
              RootTsconfigInput {
                  source_set_id,
@@ -311,6 +313,17 @@ mod staged {
                 hash.bytes(bytes);
             },
         );
+        hash.integer(snapshot.specifiers.len() as i64);
+        for mapping in &snapshot.specifiers {
+            hash.text(&mapping.prefix);
+            hash.optional(mapping.dir.as_deref(), |hash, dir| hash.text(dir));
+            hash.text(&mapping.suffix);
+            hash.integer(mapping.exact.len() as i64);
+            for (name, path) in &mapping.exact {
+                hash.text(name);
+                hash.text(path);
+            }
+        }
         hash.finish()
     }
 
@@ -464,7 +477,7 @@ mod staged {
                 javascript_catalog: references.javascript_catalog_digest(),
                 java_catalog: references.java_catalog_digest(),
                 manifests: manifest_digest(&snapshot.manifests),
-                root_config: root_config_digest(snapshot.root_tsconfig.as_ref()),
+                root_config: root_config_digest(snapshot),
                 producers,
                 selections,
                 global_semantic,
@@ -585,14 +598,27 @@ mod tests {
 
     #[test]
     fn root_config_and_sid_digest_fields() {
-        use crate::architecture_inputs::RootTsconfigInput;
+        use crate::architecture_inputs::{RootTsconfigInput, Snapshot, SpecifierMapping};
         let config = RootTsconfigInput {
             source_set_id: "source".into(),
             path: "tsconfig.json".into(),
             bytes: b"{}".to_vec(),
         };
-        let baseline = root_config_digest(Some(&config));
-        assert_ne!(baseline, root_config_digest(None));
+        let snapshot = |root_tsconfig: Option<RootTsconfigInput>,
+                        specifiers: Vec<SpecifierMapping>| Snapshot {
+            pin: crate::model::IndexPin {
+                index_generation: uuid::Uuid::nil(),
+                index_revision: 1,
+            },
+            documents: Vec::new(),
+            manifests: Vec::new(),
+            root_tsconfig,
+            specifiers,
+            evidence_gaps: Default::default(),
+            unparsed: Default::default(),
+        };
+        let baseline = root_config_digest(&snapshot(Some(config.clone()), Vec::new()));
+        assert_ne!(baseline, root_config_digest(&snapshot(None, Vec::new())));
         for mutate in [
             (|config: &mut RootTsconfigInput| config.source_set_id.push('2'))
                 as fn(&mut RootTsconfigInput),
@@ -601,7 +627,33 @@ mod tests {
         ] {
             let mut changed = config.clone();
             mutate(&mut changed);
-            assert_ne!(baseline, root_config_digest(Some(&changed)));
+            assert_ne!(
+                baseline,
+                root_config_digest(&snapshot(Some(changed), Vec::new()))
+            );
+        }
+        // #1131: the rules file's specifier mappings are resolution configuration too.
+        let mapping = SpecifierMapping {
+            prefix: "web:".into(),
+            dir: Some("web".into()),
+            suffix: ".js".into(),
+            exact: [("pele".to_owned(), "web/pele.js".to_owned())].into(),
+        };
+        let mapped = root_config_digest(&snapshot(Some(config.clone()), vec![mapping.clone()]));
+        assert_ne!(baseline, mapped);
+        for mutate in [
+            (|mapping: &mut SpecifierMapping| mapping.prefix.push('x'))
+                as fn(&mut SpecifierMapping),
+            |mapping| mapping.dir = None,
+            |mapping| mapping.suffix.clear(),
+            |mapping| mapping.exact.clear(),
+        ] {
+            let mut changed = mapping.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                mapped,
+                root_config_digest(&snapshot(Some(config.clone()), vec![changed]))
+            );
         }
         assert_eq!(
             sid_digest(["b", "a", "a"].into_iter()),

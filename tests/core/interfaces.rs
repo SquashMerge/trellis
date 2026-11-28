@@ -536,7 +536,11 @@ fn trellis_real_router_and_client() {
         .filter(|site| site["document"]["path"] == "web/app-status.js")
         .collect();
     assert!(!through_prefix.is_empty());
-    assert!(through_prefix.iter().all(|site| site["layer"] == "web"));
+    assert!(
+        through_prefix
+            .iter()
+            .all(|site| site["layer"] == "web-controllers")
+    );
     assert_eq!(status["confidence"], "wrapperInferred");
     let checkouts = route("/api/checkouts");
     assert_eq!(checkouts["confidence"], "exact");

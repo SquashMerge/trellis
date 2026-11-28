@@ -1525,3 +1525,10 @@ When a caller's binding is stale, possibly stale or absent, the [#724](#amendmen
 
   A head built for a read or after such a unit is not skipped again.
 
+## Amendment (#1131): import specifier mappings and declared cross-app use
+
+**Status:** owner ruling 2026-11-27 ([#1131](https://github.com/SquashMerge/trellis/issues/1131), options R2 and K1), for ratification. The rules are in [rules.md, Amendment (#1131)](rules.md#amendment-1131-import-specifier-mappings-and-declared-cross-app-use). No tool object, schema, field or bound changes, and `toolVersion` stays as it is.
+
+- **References.** `trellis_references` resolves JavaScript and TypeScript imports through the `[[specifiers]]` mappings of the checkout's rules file, read leniently as `test_features` is. A mapped import targets its file's module; one its mapping cannot place is unresolved with `javascript_specifier_unmapped` or `javascript_specifier_not_indexed`, and gets no package label.
+- **Check and explain.** A `$layers` instance between layers that share no app, which reported `unknown`/`cross_app`, now `conforms` or `deviates` when an app of its source layer declares `may_use` of an app of its destination layer: it conforms when such a declaration lists the destination layer, and deviates otherwise. Without such a declaration it stays `unknown`/`cross_app`. A judged instance still counts under `noApp`, since its layers share no app, so `Σ apps[].counts + noApp.counts = counts` holds as before, and a deviating one fails `trellis rules check` like any other.
+- **Prompt.** The `trellis_propose_rules` closed grammar line lists `specifiers` among the top-level keys and describes `[[specifiers]]`; the `APPS` section says `roots` is the one required key of an `[apps.<name>]` table and describes `may_use`; the `PER-APP LAYERS` instruction to leave references between apps alone now excepts a declared `may_use`.

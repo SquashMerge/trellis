@@ -428,6 +428,7 @@ mod tests {
                     documents,
                     manifests: Vec::new(),
                     root_tsconfig: None,
+                    specifiers: Default::default(),
                     evidence_gaps: BTreeMap::new(),
                     unparsed: BTreeSet::new(),
                 };

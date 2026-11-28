@@ -9,6 +9,9 @@ import makePeleSvg from "trellis-web:pele-svg";
 import makeArchitectureRouting from "trellis-web:architecture-routing";
 import makeArchitecturePele from "trellis-web:architecture-pele";
 import { readFileSync } from "node:fs";
+import { relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { WEB_MODULE_NAMES, webModule } from "../web-scripts.mjs";
 import { draw, hit, measure, segments, summarize } from "../src/diagram.js";
 import { drawSequence } from "../src/sequence.js";
 import { TrellisError, architecturePayload, createClient, detailPage, indexLabel, jobCause, pinLabel, pinOf, samePin } from "../src/client.js";
@@ -274,4 +277,24 @@ test("the trellis layout's Files button is enabled when the welcome left only Ch
   assert.deepEqual(ensureFilesPanel(deps), ["files", "changes"]);
   assert.deepEqual(store["workspace.panels"], ["files", "changes"]);
   assert.equal(ensureFilesPanel(deps), null, "a second start writes nothing");
+});
+
+// #1131: Trellis resolves `trellis-web:<name>` through the `[[specifiers]]` entry in
+// .trellis/rules.toml. It must name the file this loader serves for every name, and map no other.
+test("#1131 the rules file's trellis-web: mapping names the loader's file for every name", () => {
+  const rules = readFileSync(new URL("../../.trellis/rules.toml", import.meta.url), "utf8");
+  const block = /^\[\[specifiers\]\]\nprefix = "trellis-web:"\n((?:[a-z_]+ = .*\n)+)/m.exec(rules);
+  assert.ok(block, "a [[specifiers]] entry for trellis-web: in .trellis/rules.toml");
+  const value = (key) => new RegExp(`^${key} = (.*)$`, "m").exec(block[1])?.[1];
+  const dir = JSON.parse(value("dir")), suffix = JSON.parse(value("suffix"));
+  const exact = Object.fromEntries([...(value("exact") ?? "").matchAll(/([a-z-]+) = ("[^"]*")/g)].map((m) => [m[1], JSON.parse(m[2])]));
+  const root = fileURLToPath(new URL("../..", import.meta.url));
+  for (const name of WEB_MODULE_NAMES) {
+    const mapped = exact[name] ?? `${dir}/${name}${suffix}`;
+    assert.equal(mapped, relative(root, webModule(name).file).split(sep).join("/"), name);
+  }
+  for (const [name, file] of Object.entries(exact)) {
+    assert.ok(WEB_MODULE_NAMES.includes(name), `${name} is not a loader name`);
+    assert.notEqual(file, `${dir}/${name}${suffix}`, `${name} needs no exact entry`);
+  }
 });

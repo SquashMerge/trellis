@@ -71,6 +71,7 @@ fn expansion(test: impl FnOnce(&mut Resolver<'_>, usize, &mut Work)) {
         named_memo: BTreeMap::new(),
         workspaces: &js_workspace::Workspaces::default(),
         tsconfig: None,
+        specifiers: &[],
     };
     let mut work = Work::new(work::reference_limit(docs.len(), 0));
     for (document, doc) in docs.iter().enumerate() {
@@ -307,6 +308,7 @@ fn script_fixture(
         named_memo: BTreeMap::new(),
         workspaces: &js_workspace::Workspaces::default(),
         tsconfig: config.map(|text| (source_set, tsconfig::parse(text.as_bytes()))),
+        specifiers: &[],
     };
     let mut work = Work::new(work::reference_limit(docs.len(), 0));
     for (document, doc) in docs.iter().enumerate() {
@@ -596,6 +598,63 @@ fn paths_wildcard_first_match() {
             ("a.ts", "unmapped", Err("absolute_or_bare_import")),
             ("a.ts", "@app/missing", Err("absolute_or_bare_import")),
         ],
+    );
+}
+
+/// #1131: an authored specifier mapping owns its prefix, before `paths`, and names literal
+/// paths only.
+#[test]
+fn specifier_mappings_own_their_prefix() {
+    use crate::architecture_inputs::SpecifierMapping;
+    let mappings: &'static [SpecifierMapping] = Box::leak(Box::new([
+        SpecifierMapping {
+            prefix: "web:".into(),
+            dir: Some("web".into()),
+            suffix: ".js".into(),
+            exact: [("pele".to_owned(), "web/vendor/pele.js".to_owned())].into(),
+        },
+        SpecifierMapping {
+            prefix: "lit:".into(),
+            dir: None,
+            suffix: String::new(),
+            exact: [("a".to_owned(), "src/a.ts".to_owned())].into(),
+        },
+    ]));
+    script_fixture(
+        &[
+            ("src/a.ts", EMPTY),
+            ("web/lib.js", EMPTY),
+            ("web/lib.ts", EMPTY),
+            ("web/vendor/pele.js", EMPTY),
+            ("lib.js", EMPTY),
+        ],
+        // `paths` would map every `web:` specifier elsewhere; the mapping comes first.
+        Some(r#"{"compilerOptions":{"paths":{"web:*":["src/a.ts"],"lit:*":["src/a.ts"]}}}"#),
+        |resolver, index, work| {
+            resolver.specifiers = mappings;
+            for (specifier, expected) in [
+                ("web:lib", Ok("web/lib.js")),
+                ("web:pele", Ok("web/vendor/pele.js")),
+                ("lit:a", Ok("src/a.ts")),
+                // Literal: no extension candidates, no `index`, nothing outside `dir`.
+                ("web:lib.ts", Err("javascript_specifier_not_indexed")),
+                ("web:vendor", Err("javascript_specifier_not_indexed")),
+                ("web:../lib", Err("javascript_specifier_unmapped")),
+                ("web:", Err("javascript_specifier_unmapped")),
+                // A prefix without `dir` maps its `exact` names only.
+                ("lit:b", Err("javascript_specifier_unmapped")),
+                // Other specifiers resolve as before.
+                ("other", Err("absolute_or_bare_import")),
+            ] {
+                assert_eq!(
+                    resolve_from(resolver, index, work, "src/a.ts", specifier),
+                    expected.map(str::to_owned),
+                    "{specifier}"
+                );
+            }
+            assert!(!package_fallback("javascript_specifier_unmapped"));
+            assert!(!package_fallback("javascript_specifier_not_indexed"));
+        },
     );
 }
 
@@ -909,6 +968,7 @@ fn catalog_build_and_site_resolution_charge_exact_steps() {
             &external::JavascriptPackages::default(),
             &js_workspace::Workspaces::default(),
             None,
+            &[],
             &mut work,
             &request,
             workers,

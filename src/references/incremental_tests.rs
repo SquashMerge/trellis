@@ -542,6 +542,7 @@ fn copy_snapshot(snapshot: &Snapshot) -> Snapshot {
             .collect(),
         manifests: snapshot.manifests.clone(),
         root_tsconfig: snapshot.root_tsconfig.clone(),
+        specifiers: snapshot.specifiers.clone(),
         evidence_gaps: snapshot.evidence_gaps.clone(),
         unparsed: snapshot.unparsed.clone(),
     }

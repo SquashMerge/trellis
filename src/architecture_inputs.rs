@@ -83,6 +83,9 @@ pub struct Snapshot {
     pub manifests: Vec<ManifestInput>,
     /// The root `tsconfig.json`, else `jsconfig.json`, when the revision captured one.
     pub root_tsconfig: Option<RootTsconfigInput>,
+    /// The rules file's import specifier mappings (#1131), set by the build from the rules
+    /// file it uses; never captured with the revision.
+    pub specifiers: Vec<SpecifierMapping>,
     /// Documents published with no evidence but their file module, and their `partialFiles`
     /// reason: over the evidence budget (#564), or not read (#576).
     pub evidence_gaps: BTreeMap<DocumentKey, &'static str>,
@@ -445,6 +448,18 @@ pub struct ManifestInput {
     pub path: String,
     pub content_hash: Option<String>,
     pub bytes: Option<Vec<u8>>,
+}
+
+/// One authored `[[specifiers]]` entry of the rules file (#1131): JavaScript and TypeScript
+/// imports whose specifier starts with `prefix` name a checkout file. The rest of the
+/// specifier is the name: an `exact` entry maps it to its file, else `dir`/`<name><suffix>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpecifierMapping {
+    pub prefix: String,
+    /// A normalized checkout-relative directory; empty is the checkout root.
+    pub dir: Option<String>,
+    pub suffix: String,
+    pub exact: BTreeMap<String, String>,
 }
 
 /// The captured bytes of the selected root config of one source set.

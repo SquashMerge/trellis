@@ -143,6 +143,9 @@ struct Published {
     outcome: Result<Arc<ArchitectureCore>, CoreFailure>,
     /// An ordinary fault outlasted its retries: report it once, and let the next read retry.
     report_once: bool,
+    /// The import specifier mappings the build resolved through (#1131), whether it
+    /// succeeded or failed.
+    specifiers: Vec<crate::architecture_inputs::SpecifierMapping>,
 }
 impl Published {
     fn answers(&self, pin: IndexPin, rules: CoreRules<'_>) -> bool {
@@ -157,6 +160,8 @@ struct Running {
     /// A borrowed base belongs to the episode at selection. Once invalidated, this
     /// operation stays cancelled even if the live hash returns to its original value.
     base_cancelled: Option<Arc<AtomicBool>>,
+    /// The import specifier mappings the build resolves through (#1131).
+    specifiers: Vec<crate::architecture_inputs::SpecifierMapping>,
 }
 
 fn check_base_episode(cancelled: Option<&AtomicBool>) -> anyhow::Result<()> {
@@ -502,6 +507,7 @@ impl ArchitectureOwner {
                         },
                         outcome: Err(CoreFailure::panicked()),
                         report_once: true,
+                        specifiers: running.specifiers,
                     });
                 }
                 drop(state);
@@ -795,6 +801,19 @@ impl DaemonState {
         self.architecture_outcome(pin, rules, wait, check, true)
     }
 
+    /// #1131: whether the outcome, core or kept failure, that a read of `pin` under any rules
+    /// file would take now was built through other specifier mappings than `mappings`.
+    pub(crate) fn architecture_mappings_differ(
+        &self,
+        pin: IndexPin,
+        mappings: &[crate::architecture_inputs::SpecifierMapping],
+    ) -> bool {
+        let state = self.architecture.0.state.lock().unwrap();
+        state
+            .answer(pin, CoreRules::Any)
+            .is_some_and(|published| published.specifiers != mappings)
+    }
+
     /// Wait for what `architecture_core` would answer, leaving any failure to that read.
     pub(crate) fn architecture_wait(
         self: &Arc<Self>,
@@ -1003,11 +1022,16 @@ impl DaemonState {
         };
         // With this turn's read admitted: a test commits a write against it here.
         owner.hook("architecture_step_admitted");
-        // A rules file that does not load answers its own reads, and references and metrics
-        // do not depend on it: a core of this revision is enough.
+        // A rules file that does not load answers its own reads, and metrics do not depend on
+        // it, so a core of this revision is enough, unless that core resolved references through
+        // specifier mappings (#1131): a file that does not load maps nothing, so the owner then
+        // builds the core of no file.
         let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
         let unreadable = loaded.is_err();
         let config = loaded.ok().flatten();
+        let specifiers = config
+            .as_ref()
+            .map_or_else(Vec::new, |config| config.specifiers().to_vec());
         let head_key = CoreKey {
             pin: head,
             rules_hash: config.as_ref().map(|config| config.content_hash.clone()),
@@ -1020,10 +1044,9 @@ impl DaemonState {
             let mut state = owner.state.lock().unwrap();
             state.head = Some(head);
             state.observe_rules(&head_key);
-            let head_done = state
-                .published
-                .iter()
-                .any(|p| p.key == head_key || (unreadable && p.key.pin == head));
+            let head_done = state.published.iter().any(|p| {
+                p.key == head_key || (unreadable && p.key.pin == head && p.specifiers.is_empty())
+            });
             // The rules decide what an older revision shows, so that request is for this file.
             let older = state
                 .older
@@ -1069,6 +1092,7 @@ impl DaemonState {
                 rules_hash: key.rules_hash.clone(),
                 progress: None,
                 base_cancelled: base_cancelled.clone(),
+                specifiers: specifiers.clone(),
             });
             (key, bases, base_cancelled, defer)
         };
@@ -1205,6 +1229,7 @@ impl DaemonState {
                     key,
                     outcome: Ok(Arc::new(core)),
                     report_once: false,
+                    specifiers,
                 });
             }
             Err(error) if cancelled(&error) => {}
@@ -1219,6 +1244,7 @@ impl DaemonState {
                     key,
                     outcome: Err(CoreFailure::of(&error)),
                     report_once: false,
+                    specifiers,
                 });
             }
             Err(_) if state.retries < CONTENTION_RETRIES => {
@@ -1232,6 +1258,7 @@ impl DaemonState {
                     key,
                     outcome: Err(CoreFailure::of(&error)),
                     report_once: true,
+                    specifiers,
                 });
             }
         }
@@ -2137,6 +2164,7 @@ mod owner_state_tests {
             },
             outcome: Err(CoreFailure::panicked()),
             report_once: false,
+            specifiers: Vec::new(),
         }
     }
     /// #851 review: a core answers a rule read only under exactly its own rules file. A core
@@ -2207,6 +2235,7 @@ mod owner_state_tests {
                 rules_hash: original.rules_hash.clone(),
                 progress: None,
                 base_cancelled: Some(base_cancelled.clone()),
+                specifiers: Vec::new(),
             });
             let mut same_episode = original.clone();
             same_episode.pin.index_revision += 1;
@@ -2232,6 +2261,7 @@ mod owner_state_tests {
                 rules_hash: original.rules_hash.clone(),
                 progress: None,
                 base_cancelled: Some(next.clone()),
+                specifiers: Vec::new(),
             });
             state.observe_rules(&original);
             state.finish_running().unwrap();

@@ -53,6 +53,9 @@ const DATA = {
   } },
 };
 
+/** Every `trellis-web:<name>` the loader serves. `.trellis/rules.toml` maps the same names (#1131). */
+export const WEB_MODULE_NAMES = [...Object.keys(WEB), ...Object.keys(DATA)];
+
 /** The ES module source for `trellis-web:<name>`, and the file it comes from. */
 export function webModule(name) {
   if (DATA[name]) {

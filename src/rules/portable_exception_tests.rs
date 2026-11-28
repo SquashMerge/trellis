@@ -18,6 +18,7 @@ fn portable_scope_scan_is_cancellable_and_shares_existing_work_limit() {
             bytes: None,
         }],
         root_tsconfig: None,
+        specifiers: Default::default(),
         evidence_gaps: Default::default(),
         unparsed: Default::default(),
     };

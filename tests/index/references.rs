@@ -98,6 +98,7 @@ fn snapshot_with(files: &[(&str, Vec<u8>)], max_file_bytes: u64) -> Snapshot {
         documents,
         manifests: Vec::new(),
         root_tsconfig: None,
+        specifiers: Default::default(),
         evidence_gaps,
         unparsed: Default::default(),
     }
@@ -7644,6 +7645,7 @@ fn snapshot_javascript_manifest(files: &[(&str, &str)], manifest: &str) -> Snaps
         documents,
         manifests: vec![manifest],
         root_tsconfig: None,
+        specifiers: Default::default(),
         evidence_gaps: Default::default(),
         unparsed: Default::default(),
     }

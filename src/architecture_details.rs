@@ -318,10 +318,12 @@ impl EdgeKey<'_> {
 
 /// Visit every reference pair that a summary edge counts, production before test, in
 /// evaluation order, with its role and edge. Same-layer, unassigned and cross-app pairs draw
-/// no edge. The summary's `edges` and the details route's `edge` kind both come from here.
+/// no edge, including a cross-app pair a declared `may_use` judges (#1131), which `apps`
+/// tells apart. The summary's `edges` and the details route's `edge` kind both come from here.
 pub(crate) fn edge_pairs<'a>(
     references: &'a Value,
     rules: &'a Value,
+    apps: Option<&crate::rules::AppScope<'_>>,
     check: &mut (impl FnMut() -> Result<()> + Send),
     mut visit: impl FnMut(&'static str, EdgeKey<'a>, &'a Value) -> Result<()>,
 ) -> Result<()> {
@@ -359,6 +361,7 @@ pub(crate) fn edge_pairs<'a>(
                 || verdict["unresolved"]
                     .as_array()
                     .is_some_and(|reasons| reasons.iter().any(|reason| reason == "cross_app"))
+                || apps.is_some_and(|apps| !apps.share(source, destination))
             {
                 continue;
             }
@@ -567,12 +570,18 @@ pub(crate) fn page(
             }
         }
         Kind::Edge => {
-            edge_pairs(references, rules, check, |role, edge, pair| {
-                if query.key.as_deref() == Some(edge.key(role).as_str()) {
-                    admit(&|| pair.clone())?;
-                }
-                Ok(())
-            })?;
+            edge_pairs(
+                references,
+                rules,
+                layers.apps.as_ref(),
+                check,
+                |role, edge, pair| {
+                    if query.key.as_deref() == Some(edge.key(role).as_str()) {
+                        admit(&|| pair.clone())?;
+                    }
+                    Ok(())
+                },
+            )?;
             // Every summary edge counts at least one pair.
             ensure!(total > 0, "not_found: architecture edge");
         }
@@ -815,10 +824,16 @@ mod tests {
         assert_eq!(test, [references["tests"][0].clone()]);
         // Every reference pair counts under the same edges as the summary, keyed alike.
         let mut keys = BTreeMap::new();
-        edge_pairs(&references, &rules, &mut || Ok(()), |role, edge, _| {
-            *keys.entry(edge.key(role)).or_insert(0) += 1;
-            Ok(())
-        })
+        edge_pairs(
+            &references,
+            &rules,
+            None,
+            &mut || Ok(()),
+            |role, edge, _| {
+                *keys.entry(edge.key(role)).or_insert(0) += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(keys.values().sum::<i32>(), 7, "{keys:?}");
         assert_eq!(keys.len(), 5);

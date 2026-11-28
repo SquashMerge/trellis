@@ -1,11 +1,12 @@
 //! Loading and parsing `.trellis/rules.toml` into a `Config`. The authored types and
 //! `Config` stay in `rules.rs`.
 use super::{
-    AuthoredApp, COLLECTION_LIMIT, CONFIG_BYTES, Config, ConfigTarget, Constraint, Exception,
-    ExceptionKind, ExceptionTarget, ExternalSelector, InterfaceWrapper, Layer, LayerPattern,
-    PATTERN_LIMIT, RULES_PATH, Raw, RawApp, RawException, RawInterfaces, RawLayer, RawRole,
-    RawRule, Rule, Selector, WrapperMethod, error, languages,
+    AppUse, AuthoredApp, COLLECTION_LIMIT, CONFIG_BYTES, Config, ConfigTarget, Constraint,
+    Exception, ExceptionKind, ExceptionTarget, ExternalSelector, InterfaceWrapper, Layer,
+    LayerPattern, PATTERN_LIMIT, RULES_PATH, Raw, RawApp, RawAppUses, RawException, RawInterfaces,
+    RawLayer, RawRole, RawRule, RawSpecifier, Rule, Selector, WrapperMethod, error, languages,
 };
+use crate::architecture_inputs::SpecifierMapping;
 use anyhow::Result;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::{Value, json};
@@ -201,6 +202,7 @@ pub fn parse(text: &str) -> Result<Config> {
     let apps = authored_apps(text, raw.apps)?;
     let wrappers = interface_wrappers(text, raw.interfaces)?;
     let test_features = test_features(text, raw.test_features)?;
+    let specifiers = specifiers(text, raw.specifiers)?;
     let roles = parse_roles(text, raw.roles, &mut patterns)?;
     let (rules, ids) = parse_rules(text, raw.rules, &roles)?;
     let exceptions = parse_exceptions(text, raw.exceptions, &ids)?;
@@ -217,6 +219,7 @@ pub fn parse(text: &str) -> Result<Config> {
         apps,
         wrappers,
         test_features,
+        specifiers,
     })
 }
 /// The size bound, the TOML and schema decode, the version and the named collection bounds.
@@ -742,6 +745,179 @@ pub(crate) fn load_test_features(root: &Path) -> Vec<String> {
     }
 }
 
+/// The specifier mappings of the checkout's rules file for a read that does not otherwise
+/// load it (#1131). A missing or invalid file maps none, so such a read still answers.
+pub(crate) fn load_specifiers(root: &Path) -> Vec<SpecifierMapping> {
+    match load(root) {
+        Ok(Some(config)) => config.specifiers,
+        _ => Vec::new(),
+    }
+}
+
+/// The most `[[specifiers]]` entries a file may author.
+const SPECIFIER_LIMIT: usize = 64;
+/// The longest `prefix`, `suffix` and `exact` name.
+const SPECIFIER_TEXT_LIMIT: usize = 256;
+
+/// The authored `[[specifiers]]` entries (#1131), in written order. `prefix` is required: a
+/// nonempty specifier start that is not relative (`.`) or absolute (`/`). `dir` is a valid
+/// app root (`.` is the checkout); `suffix` needs `dir` and has no `/`; `exact` maps names to
+/// literal checkout-relative file paths. An entry has `dir` or `exact`, or both. No prefix
+/// starts another, so at most one entry owns a specifier.
+fn specifiers(text: &str, raw: Vec<Spanned<RawSpecifier>>) -> Result<Vec<SpecifierMapping>> {
+    if raw.len() > SPECIFIER_LIMIT {
+        return Err(error(
+            text,
+            raw[SPECIFIER_LIMIT].span(),
+            "too_large",
+            "token",
+            "specifiers exceeds 64 entries",
+        ));
+    }
+    let schema = |span: std::ops::Range<usize>, message: String| {
+        error(text, span, "schema", "token", message)
+    };
+    let plain = |value: &str| {
+        !value.is_empty()
+            && value.len() <= SPECIFIER_TEXT_LIMIT
+            && !value
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    };
+    let mut mappings: Vec<(SpecifierMapping, std::ops::Range<usize>)> = Vec::new();
+    for entry in raw {
+        let span = entry.span();
+        let RawSpecifier {
+            prefix,
+            dir,
+            suffix,
+            exact,
+        } = entry.into_inner();
+        let Some(prefix) = prefix else {
+            return Err(schema(span, "a specifier mapping requires prefix".into()));
+        };
+        let prefix_span = prefix.span();
+        let prefix = prefix.into_inner();
+        if !plain(&prefix) || prefix.starts_with(['.', '/']) {
+            return Err(schema(
+                prefix_span,
+                format!(
+                    "specifier prefix {prefix:?} must be 1 to 256 characters with no space, control or backslash, and not start with \".\" or \"/\""
+                ),
+            ));
+        }
+        if dir.is_none() && exact.is_none() {
+            return Err(schema(
+                span,
+                format!("specifier mapping {prefix} requires dir or exact"),
+            ));
+        }
+        let dir = match dir {
+            None => None,
+            Some(dir) => {
+                let dir_span = dir.span();
+                let dir = dir.into_inner();
+                if !valid_root(&dir) {
+                    return Err(schema(
+                        dir_span,
+                        format!(
+                            "specifier dir {dir:?} must be \".\" or a checkout-relative directory: no leading or trailing slash, no \".\" or \"..\" component, no glob, backslash or colon"
+                        ),
+                    ));
+                }
+                Some(if dir == "." { String::new() } else { dir })
+            }
+        };
+        let suffix = match suffix {
+            None => String::new(),
+            Some(suffix) => {
+                let suffix_span = suffix.span();
+                let suffix = suffix.into_inner();
+                if dir.is_none() {
+                    return Err(schema(
+                        suffix_span,
+                        format!("specifier mapping {prefix} has suffix without dir"),
+                    ));
+                }
+                if !plain(&suffix) || suffix.contains('/') {
+                    return Err(schema(
+                        suffix_span,
+                        format!(
+                            "specifier suffix {suffix:?} must be 1 to 256 characters with no slash, space, control or backslash"
+                        ),
+                    ));
+                }
+                suffix
+            }
+        };
+        let mut names = BTreeMap::new();
+        if let Some(exact) = exact {
+            let exact_span = exact.span();
+            let exact = exact.into_inner();
+            if exact.is_empty() {
+                return Err(schema(
+                    exact_span,
+                    format!("specifier mapping {prefix} has an empty exact table"),
+                ));
+            }
+            if exact.len() > COLLECTION_LIMIT {
+                return Err(error(
+                    text,
+                    exact_span,
+                    "too_large",
+                    "token",
+                    "specifier exact table exceeds 1024 entries",
+                ));
+            }
+            for (name, path) in exact {
+                let path_span = path.span();
+                let path = path.into_inner();
+                if !plain(&name) {
+                    return Err(schema(
+                        path_span,
+                        format!(
+                            "specifier name {name:?} must be 1 to 256 characters with no space, control or backslash"
+                        ),
+                    ));
+                }
+                if path == "." || !valid_root(&path) {
+                    return Err(schema(
+                        path_span,
+                        format!(
+                            "specifier file {path:?} must be a checkout-relative file path: no leading or trailing slash, no \".\" or \"..\" component, no glob, backslash or colon"
+                        ),
+                    ));
+                }
+                names.insert(name, path);
+            }
+        }
+        if let Some((other, _)) = mappings.iter().find(|(other, _)| {
+            other.prefix.starts_with(prefix.as_str()) || prefix.starts_with(other.prefix.as_str())
+        }) {
+            return Err(error(
+                text,
+                prefix_span,
+                "ambiguity",
+                "token",
+                format!(
+                    "specifier prefixes {} and {prefix} overlap: one starts the other",
+                    other.prefix
+                ),
+            ));
+        }
+        mappings.push((
+            SpecifierMapping {
+                prefix,
+                dir,
+                suffix,
+                exact: names,
+            },
+            span,
+        ));
+    }
+    Ok(mappings.into_iter().map(|(mapping, _)| mapping).collect())
+}
+
 /// The most wrappers `[interfaces]` may author.
 const WRAPPER_LIMIT: usize = 64;
 
@@ -921,7 +1097,8 @@ fn authored_apps(text: &str, raw: BTreeMap<String, Spanned<RawApp>>) -> Result<V
                 "app name must not be blank",
             ));
         }
-        let Some(list) = table.into_inner().roots else {
+        let RawApp { roots, may_use } = table.into_inner();
+        let Some(list) = roots else {
             return Err(error(
                 text,
                 span,
@@ -986,7 +1163,91 @@ fn authored_apps(text: &str, raw: BTreeMap<String, Spanned<RawApp>>) -> Result<V
             owners.insert(root.clone(), name.clone());
             roots.push((root, root_span));
         }
-        apps.push(AuthoredApp { name, span, roots });
+        let may_use = app_uses(text, &name, may_use)?;
+        apps.push(AuthoredApp {
+            name,
+            span,
+            roots,
+            may_use,
+        });
     }
     Ok(apps)
+}
+
+/// An authored app's `may_use` (#1131), checked without the snapshot: each key names another
+/// app and lists distinct, nonblank layer names. The apps and layers are resolved when the
+/// effective apps are known.
+fn app_uses(text: &str, name: &str, raw: Option<RawAppUses>) -> Result<Vec<AppUse>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let table_span = raw.span();
+    let raw = raw.into_inner();
+    if raw.is_empty() {
+        return Err(error(
+            text,
+            table_span,
+            "schema",
+            "token",
+            format!("app {name} has an empty may_use table"),
+        ));
+    }
+    if raw.len() > COLLECTION_LIMIT {
+        return Err(error(
+            text,
+            table_span,
+            "too_large",
+            "token",
+            "may_use exceeds 1024 apps",
+        ));
+    }
+    let mut uses = Vec::with_capacity(raw.len());
+    for (app, list) in raw {
+        let span = list.span();
+        if app.trim().is_empty() || app == name {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("app {name} may_use must name other apps, not {app:?}"),
+            ));
+        }
+        let list = list.into_inner();
+        if list.is_empty() {
+            return Err(error(
+                text,
+                span,
+                "schema",
+                "token",
+                format!("app {name} may_use {app} must list at least one layer"),
+            ));
+        }
+        if list.len() > COLLECTION_LIMIT {
+            return Err(error(
+                text,
+                list[COLLECTION_LIMIT].span(),
+                "too_large",
+                "token",
+                "may_use layers exceed 1024 entries",
+            ));
+        }
+        let mut layers: Vec<(String, std::ops::Range<usize>)> = Vec::with_capacity(list.len());
+        for layer in list {
+            let layer_span = layer.span();
+            let layer = layer.into_inner();
+            if layer.trim().is_empty() || layers.iter().any(|(seen, _)| *seen == layer) {
+                return Err(error(
+                    text,
+                    layer_span,
+                    "schema",
+                    "token",
+                    format!("app {name} may_use {app} lists layer {layer:?} twice or blank"),
+                ));
+            }
+            layers.push((layer, layer_span));
+        }
+        uses.push(AppUse { app, span, layers });
+    }
+    Ok(uses)
 }

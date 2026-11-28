@@ -285,6 +285,8 @@ pub(crate) struct ArchitectureCore {
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
     dependencies: dependencies::ArchitectureDependencies,
+    /// The import specifier mappings its references resolved through (#1131).
+    specifiers: Vec<crate::architecture_inputs::SpecifierMapping>,
 }
 
 impl ArchitectureCore {
@@ -360,6 +362,10 @@ impl ArchitectureCore {
     /// Metrics rows for a read that can compute its own if this core failed them.
     pub(crate) fn metrics_if_computed(&self) -> Option<&ArchitectureMetrics> {
         self.metrics.as_ref()?.as_ref().ok()
+    }
+    /// The import specifier mappings this core's references resolved through (#1131).
+    pub(crate) fn specifiers(&self) -> &[crate::architecture_inputs::SpecifierMapping] {
+        &self.specifiers
     }
     /// The rules file hash this core evaluated.
     pub(crate) fn rules_hash(&self) -> Option<&str> {
@@ -596,7 +602,9 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<ArchitectureCore> {
-        let input = self.architecture_input(pin, check, progress)?;
+        let mut input = self.architecture_input(pin, check, progress)?;
+        // A read without the rules still resolves through the file's specifiers (#1131).
+        input.snapshot.specifiers = self.specifiers(config);
         ArchitectureCore::compute(&self.store, input, config, measure, check, progress)
     }
 
@@ -612,12 +620,15 @@ impl ArchitectureCore {
     /// failures propagate.
     pub(crate) fn compute(
         store: &Store,
-        input: ArchitectureInput,
+        mut input: ArchitectureInput,
         config: Option<&Config>,
         measure: bool,
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<Self> {
+        if let Some(config) = config {
+            input.snapshot.specifiers = config.specifiers().to_vec();
+        }
         progress(ArchitectureProgress {
             phase: "resolving",
             completed: 0,
@@ -814,6 +825,7 @@ impl ArchitectureCore {
             interfaces,
             summaries: Mutex::default(),
             dependencies,
+            specifiers: snapshot.specifiers.clone(),
         })
     }
 }
@@ -836,6 +848,7 @@ pub enum FullReason {
     NoBase,
     DocumentSetChanged,
     ManifestsChanged,
+    /// The root tsconfig, or the rules file's import specifier mappings (#1131), changed.
     RootTsconfigChanged,
     ProducerSetChanged,
     RawSelectionsChanged,
@@ -937,6 +950,10 @@ mod engine {
         #[cfg(feature = "test-support")]
         let _work_limit = read_a.work_limit.apply();
         check()?;
+        // References resolve through the build's rules file specifiers (#1131).
+        if let Some(config) = read_a.config {
+            read_a.input.snapshot.specifiers = config.specifiers().to_vec();
+        }
         (read_a.progress)(ArchitectureProgress {
             phase: "resolving",
             completed: 0,
@@ -1573,6 +1590,7 @@ impl ArchitectureCore {
             interfaces,
             summaries: _,
             dependencies,
+            specifiers,
         } = self;
         let failure = |failure: &CoreFailure| {
             let CoreFailure {
@@ -1634,6 +1652,12 @@ impl ArchitectureCore {
             "appCandidates": app_candidates,
             "interfaces": interfaces,
             "dependencies": dependencies.canonical(),
+            "specifiers": specifiers
+                .iter()
+                .map(|mapping| {
+                    json!([mapping.prefix, mapping.dir, mapping.suffix, mapping.exact])
+                })
+                .collect::<Vec<_>>(),
         }))
     }
 }

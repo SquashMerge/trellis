@@ -77,6 +77,8 @@ struct Resolver<'a> {
         String,
         std::result::Result<tsconfig::RootTsconfig, &'static str>,
     )>,
+    /// The rules file's import specifier mappings (#1131).
+    specifiers: &'a [crate::architecture_inputs::SpecifierMapping],
 }
 impl Catalog {
     #[allow(clippy::too_many_arguments)]
@@ -88,6 +90,7 @@ impl Catalog {
         packages: &external::JavascriptPackages,
         workspaces: &js_workspace::Workspaces,
         root_tsconfig: Option<&tsconfig::RootTsconfigInput>,
+        specifiers: &[crate::architecture_inputs::SpecifierMapping],
         work: &mut Work,
         request: &parallel_check::RequestCheck<'_>,
         workers: usize,
@@ -104,6 +107,7 @@ impl Catalog {
             named_memo: BTreeMap::new(),
             workspaces,
             tsconfig,
+            specifiers,
         };
         resolver.inventory_units(docs, trees, work, check)?;
         resolver.selected_hazards(docs, trees, selected, work, request, workers, check)?;
@@ -283,6 +287,11 @@ fn local_resolution(
     let mut resolution = SiteResolution::default();
     if source.star {
         let own = stars.next().expect("star contribution");
+        // #1131: a mapping that cannot place the star's module keeps its own reason.
+        if let Some(reason) = resolver.mapping_failure(document, source, work, check)? {
+            resolution.residual = Some(reason);
+            return Ok(resolution);
+        }
         if own.unknown_set || unit.unknown_set || resolver.hazards[&document].dynamic {
             resolution.residual = Some("javascript_export_name_set_unknown");
         }
@@ -463,6 +472,9 @@ impl Resolver<'_> {
         if specifier.starts_with('/') {
             return Ok(Err(BARE_UNRESOLVED));
         }
+        if let Some(mapped) = self.specifier_target(document, specifier, work, check)? {
+            return Ok(mapped);
+        }
         let configured = self.config_target(document, specifier, work, check)?;
         if !configured.is_err_and(|reason| reason != "module_path_ambiguous") {
             return Ok(configured);
@@ -485,6 +497,84 @@ impl Resolver<'_> {
                 }
             },
         )
+    }
+    /// The file an authored specifier mapping names (#1131), or `None` when no mapping's
+    /// prefix starts `specifier`. A mapping owns every specifier under its prefix: its file,
+    /// or a typed reason, and no `paths`, workspace or package lookup follows. The mapped path
+    /// is literal: no extension or `index` candidates are tried.
+    fn specifier_target(
+        &self,
+        document: usize,
+        specifier: &str,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<std::result::Result<usize, &'static str>>> {
+        // Without mappings nothing is charged, so such a checkout's work is unchanged.
+        if self.specifiers.is_empty() {
+            return Ok(None);
+        }
+        charge(self.specifiers.len() + 1, work, check)?;
+        let Some(mapping) = self
+            .specifiers
+            .iter()
+            .find(|mapping| specifier.starts_with(mapping.prefix.as_str()))
+        else {
+            return Ok(None);
+        };
+        let name = &specifier[mapping.prefix.len()..];
+        let dir = mapping.dir.as_deref();
+        charge(
+            name.len() + mapping.suffix.len() + dir.map_or(0, str::len) + 1,
+            work,
+            check,
+        )?;
+        let path = match mapping.exact.get(name) {
+            Some(path) => Some(path.clone()),
+            None => dir
+                .filter(|_| !name.is_empty() && !name.contains(['\\', '\0']))
+                .and_then(|dir| {
+                    let path =
+                        tsconfig::normalize(&join(dir, &format!("{name}{}", mapping.suffix)))?;
+                    (dir.is_empty()
+                        || path
+                            .strip_prefix(dir)
+                            .is_some_and(|rest| rest.starts_with('/')))
+                    .then_some(path)
+                }),
+        };
+        let Some(path) = path else {
+            return Ok(Some(Err(SPECIFIER_UNMAPPED)));
+        };
+        let found = find_script(self.docs[document], &[path], self.documents);
+        Ok(Some(match found.as_slice() {
+            [target] => Ok(*target),
+            _ => Err(SPECIFIER_NOT_INDEXED),
+        }))
+    }
+    /// The typed reason an authored specifier mapping gives for `source`, when one owns its
+    /// specifier and cannot place it (#1131). Nothing is charged when no mapping's prefix
+    /// starts the specifier.
+    fn mapping_failure(
+        &self,
+        document: usize,
+        source: &Source,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<&'static str>> {
+        let Some(specifier) = source.specifier.as_deref().filter(|_| source.supported) else {
+            return Ok(None);
+        };
+        if !self
+            .specifiers
+            .iter()
+            .any(|mapping| specifier.starts_with(mapping.prefix.as_str()))
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .target(document, Some(specifier), work, check)?
+            .err()
+            .filter(|reason| reason.starts_with("javascript_specifier_")))
     }
     /// `paths`, then `baseUrl`, of a readable root config.
     fn config_target(
@@ -1070,10 +1160,16 @@ fn extend_proof(
     Ok(())
 }
 const BARE_UNRESOLVED: &str = "absolute_or_bare_import";
+/// A specifier under a mapping's prefix whose name the mapping does not map (#1131).
+const SPECIFIER_UNMAPPED: &str = "javascript_specifier_unmapped";
+/// A mapped specifier whose file is no indexed script (#1131).
+const SPECIFIER_NOT_INDEXED: &str = "javascript_specifier_not_indexed";
 /// Whether a bare specifier's failure lets an npm or Node label stand in: not when a local
-/// mapping was ambiguous, nor when a workspace member claims the name (#773).
+/// mapping was ambiguous, nor when a workspace member (#773) or an authored specifier
+/// mapping (#1131) claims the name.
 fn package_fallback(reason: &str) -> bool {
     reason != "module_path_ambiguous"
+        && !reason.starts_with("javascript_specifier_")
         && (!reason.starts_with("javascript_workspace_") || reason == js_workspace::UNREADABLE)
 }
 fn relative(specifier: &str) -> bool {

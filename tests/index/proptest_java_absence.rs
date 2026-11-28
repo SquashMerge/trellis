@@ -101,6 +101,7 @@ fn project(files: &Files, filter: &[String]) -> Value {
         documents,
         manifests: Vec::new(),
         root_tsconfig: None,
+        specifiers: Default::default(),
         evidence_gaps,
         unparsed: Default::default(),
     };

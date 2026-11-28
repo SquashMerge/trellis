@@ -32,8 +32,8 @@ pub use evaluate::{evaluate, explain};
 pub(crate) use evaluate::{evaluate_prepared, evaluate_with_layers, prepare};
 #[cfg(test)]
 use evaluate::{portable_source_set, semantic_evidence};
-pub(crate) use parse::load_test_features;
 pub use parse::{descriptor, load, parse};
+pub(crate) use parse::{load_specifiers, load_test_features};
 
 pub const RULES_PATH: &str = ".trellis/rules.toml";
 pub(crate) const CONFIG_BYTES: usize = 2 * 1024 * 1024;
@@ -117,6 +117,18 @@ struct Raw {
     interfaces: RawInterfaces,
     /// Cargo features whose gates mark test code for reference sites (#988).
     test_features: Option<Spanned<Vec<Spanned<String>>>>,
+    /// JavaScript and TypeScript import specifier mappings (#1131).
+    #[serde(default)]
+    specifiers: Vec<Spanned<RawSpecifier>>,
+}
+/// One `[[specifiers]]` entry (#1131).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSpecifier {
+    prefix: Option<Spanned<String>>,
+    dir: Option<Spanned<String>>,
+    suffix: Option<Spanned<String>>,
+    exact: Option<Spanned<BTreeMap<String, Spanned<String>>>>,
 }
 /// The `[interfaces]` table (#855). `wrappers` is its only key.
 #[derive(Deserialize, Default)]
@@ -136,12 +148,15 @@ struct RawWrapper {
     root: Option<Spanned<String>>,
     app: Option<Spanned<String>>,
 }
-/// An authored `[apps.<name>]` table (#794). `roots` is its only key.
+/// An authored `[apps.<name>]` table (#794): `roots`, and `may_use` (#1131).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawApp {
     roots: Option<Spanned<Vec<Spanned<String>>>>,
+    may_use: Option<RawAppUses>,
 }
+/// An authored app's `may_use` table (#1131): app name to its listed layers.
+type RawAppUses = Spanned<BTreeMap<String, Spanned<Vec<Spanned<String>>>>>;
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Policy {
@@ -305,6 +320,15 @@ struct AuthoredApp {
     name: String,
     span: std::ops::Range<usize>,
     roots: Vec<(String, std::ops::Range<usize>)>,
+    /// The layers of other apps this app may use (#1131), by app name in name order.
+    may_use: Vec<AppUse>,
+}
+/// One `may_use` entry of an authored app (#1131): the app used and the layers of it that
+/// may be used, located for errors.
+struct AppUse {
+    app: String,
+    span: std::ops::Range<usize>,
+    layers: Vec<(String, std::ops::Range<usize>)>,
 }
 pub struct Config {
     pub text: String,
@@ -322,6 +346,8 @@ pub struct Config {
     wrappers: Vec<InterfaceWrapper>,
     /// The authored `test_features`, sorted (#988).
     test_features: Vec<String>,
+    /// The authored `[[specifiers]]` entries in written order (#1131).
+    specifiers: Vec<crate::architecture_inputs::SpecifierMapping>,
 }
 
 /// Where a configured request wrapper reads its method (#855).
@@ -369,6 +395,11 @@ impl Config {
     /// The Cargo features whose `cfg` gates mark a Rust reference site as test (#988).
     pub(crate) fn test_features(&self) -> &[String] {
         &self.test_features
+    }
+
+    /// The import specifier mappings JavaScript and TypeScript references follow (#1131).
+    pub(crate) fn specifiers(&self) -> &[crate::architecture_inputs::SpecifierMapping] {
+        &self.specifiers
     }
 
     /// How many `[apps.<name>]` tables the file authors (#794).

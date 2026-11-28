@@ -2546,6 +2546,7 @@ impl EvidenceResponse {
                 documents,
                 manifests: manifests.into_values().collect(),
                 root_tsconfig,
+                specifiers: Default::default(),
                 evidence_gaps,
                 unparsed,
             },
