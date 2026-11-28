@@ -674,6 +674,12 @@ pub struct Store {
     #[cfg(feature = "test-support")]
     #[cfg(feature = "test-support")]
     semantic_publication_observer: Arc<Mutex<Option<SemanticPublicationObserver>>>,
+    /// Test seam: runs between a batch publication's pre-write transactions (#995).
+    #[cfg(feature = "test-support")]
+    batch_prewrite_hook: Arc<Mutex<Option<BatchPrewriteHook>>>,
+    /// Test seam: rows per pre-write transaction; zero keeps `PREWRITE_CHUNK_ROWS`.
+    #[cfg(feature = "test-support")]
+    prewrite_chunk_rows: Arc<AtomicU64>,
     /// Test seam: whether writers may key payloads for reuse. Per store, so one process can
     /// hold a reusing store and a non-reusing reference.
     #[cfg(feature = "test-support")]
@@ -2535,8 +2541,8 @@ impl EvidenceResponse {
                 });
                 continue;
             };
-            let (input, kept_regions) =
-                document.restore(&native_revision, &table.identity.producer_id);
+            let proof = native_proof_id(&table.identity.producer_id, &key, &native_revision);
+            let (input, kept_regions) = document.restore(&native_revision, &proof);
             regions.push(kept_regions);
             documents.push(input);
         }
@@ -7451,14 +7457,50 @@ fn write_import_coverage(
     batch: Option<(i64, &str)>,
     inputs: &semantic_payload::KeyInputs,
 ) -> Result<()> {
+    for coverage in &publication.coverage {
+        let plan = prewrite_coverage(db, key, coverage, publication, batch, inputs)?;
+        write_coverage_manifest(db, key, &plan)?;
+    }
+    Ok(())
+}
+
+/// One coverage tuple whose payload is written and whose manifest row is not (#995): what the
+/// publishing transaction still writes for it.
+struct CoveragePlan {
+    coverage: crate::semantic_records::Coverage,
+    producer_version: String,
+    /// The payload the manifest row names; none for a payload-less tuple.
+    payload: Option<i64>,
+    /// The freshness of each basis the payload records, by its stored basis ID.
+    freshness: Vec<(i64, crate::semantic_records::Freshness)>,
+    /// Test seam: a reused payload the FULL oracle checks once its manifest row is written.
+    #[cfg(feature = "test-support")]
+    oracle: Option<(String, crate::semantic_records::SemanticPublication)>,
+}
+
+/// Writes `coverage`'s payload, or finds the stored one its input key names, and returns what
+/// its manifest row needs. Nothing it writes is part of any revision until a manifest row
+/// names the payload (Decision 0021 item 1), so it may commit before the publication that
+/// names it (#995). Every revision row it reads is read at `documents_at`, which has the
+/// destination's documents and native revision: the destination itself, or the head whose
+/// documents the destination copies unchanged.
+fn prewrite_coverage(
+    db: &Connection,
+    documents_at: &str,
+    coverage: &crate::semantic_records::Coverage,
+    publication: &crate::semantic_records::SemanticPublication,
+    batch: Option<(i64, &str)>,
+    inputs: &semantic_payload::KeyInputs,
+) -> Result<CoveragePlan> {
     use crate::semantic_records as sem;
+    let key = documents_at;
     let native: String = query_row_cached(
         db,
         "SELECT native_revision_id FROM native_revisions WHERE id=?1",
         [key],
         |r| r.get(0),
     )?;
-    for coverage in &publication.coverage {
+    {
         let producer = publication
             .producers
             .iter()
@@ -7466,46 +7508,24 @@ fn write_import_coverage(
             .context("missing semantic producer")?;
         let language = semantic_variant(&coverage.language)?;
         let owns = semantic_payload::owned_provenance(coverage, publication);
-        let insert_manifest = |payload: Option<i64>| -> Result<i64> {
-            execute_cached(
-                db,
-                "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![
-                    key,
-                    coverage.producer_id,
-                    producer.version,
-                    language,
-                    coverage.document_path,
-                    coverage.requested,
-                    coverage.selected,
-                    semantic_variant(&coverage.state)?,
-                    coverage.diagnostic,
-                    payload
-                ],
-            )?;
-            Ok(db.last_insert_rowid())
+        let plan = |payload: Option<i64>, freshness| CoveragePlan {
+            coverage: coverage.clone(),
+            producer_version: producer.version.clone(),
+            payload,
+            freshness,
+            #[cfg(feature = "test-support")]
+            oracle: None,
         };
         if matches!(
             coverage.state,
             sem::CoverageState::NotRequested | sem::CoverageState::Omitted
         ) && owns.is_empty()
         {
-            let tuple = insert_manifest(None)?;
             ensure!(
                 coverage.observed_roles.is_empty(),
                 "payload-less coverage observed roles"
             );
-            for (ordinal, role) in coverage.supported_roles.iter().enumerate() {
-                execute_cached(
-                    db,
-                    "INSERT INTO semantic_coverage_roles(payload_id,tuple_id,kind,ordinal,role) VALUES(NULL,?1,'supported',?2,?3)",
-                    params![tuple, ordinal as i64, semantic_variant(role)?],
-                )?;
-            }
-            if let Some(reasons) = &coverage.reasons {
-                insert_coverage_reasons(db, None, Some(tuple), reasons)?;
-            }
-            continue;
+            return Ok(plan(None, Vec::new()));
         }
         let mut bases: BTreeMap<String, (&sem::SemanticBasis, sem::Freshness)> = BTreeMap::new();
         for proof in publication
@@ -7688,21 +7708,68 @@ fn write_import_coverage(
             )?;
             (payload, ids)
         };
-        let tuple = insert_manifest(Some(payload))?;
-        for (encoded, (_, freshness)) in &bases {
+        let mut freshness = Vec::with_capacity(bases.len());
+        for (encoded, (_, fresh)) in &bases {
             let basis_id = basis_ids.get(encoded).context("missing payload basis")?;
-            execute_cached(
-                db,
-                "INSERT INTO semantic_coverage_freshness VALUES(?1,?2,?3,?4)",
-                params![key, tuple, basis_id, semantic_variant(freshness)?],
-            )?;
+            freshness.push((*basis_id, *fresh));
         }
+        #[allow(unused_mut)]
+        let mut plan = plan(Some(payload), freshness);
         #[cfg(feature = "test-support")]
         if let (Some(_), Some((_, captured))) = (hit, batch)
             && inputs.check_hits()
         {
-            native_first::oracle::check_hit(db, key, captured, tuple, coverage, publication)?;
+            plan.oracle = Some((captured.to_owned(), publication.clone()));
         }
+        Ok(plan)
+    }
+}
+
+/// Writes the manifest row of a coverage tuple at revision `key`, with its freshness rows or,
+/// for a payload-less tuple, its roles and reasons. This is what makes the payload part of
+/// `key` (Decision 0021 item 1).
+fn write_coverage_manifest(db: &Connection, key: &str, plan: &CoveragePlan) -> Result<()> {
+    let coverage = &plan.coverage;
+    execute_cached(
+        db,
+        "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic,payload_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            key,
+            coverage.producer_id,
+            plan.producer_version,
+            semantic_variant(&coverage.language)?,
+            coverage.document_path,
+            coverage.requested,
+            coverage.selected,
+            semantic_variant(&coverage.state)?,
+            coverage.diagnostic,
+            plan.payload
+        ],
+    )?;
+    let tuple = db.last_insert_rowid();
+    if plan.payload.is_none() {
+        for (ordinal, role) in coverage.supported_roles.iter().enumerate() {
+            execute_cached(
+                db,
+                "INSERT INTO semantic_coverage_roles(payload_id,tuple_id,kind,ordinal,role) VALUES(NULL,?1,'supported',?2,?3)",
+                params![tuple, ordinal as i64, semantic_variant(role)?],
+            )?;
+        }
+        if let Some(reasons) = &coverage.reasons {
+            insert_coverage_reasons(db, None, Some(tuple), reasons)?;
+        }
+        return Ok(());
+    }
+    for (basis_id, freshness) in &plan.freshness {
+        execute_cached(
+            db,
+            "INSERT INTO semantic_coverage_freshness VALUES(?1,?2,?3,?4)",
+            params![key, tuple, basis_id, semantic_variant(freshness)?],
+        )?;
+    }
+    #[cfg(feature = "test-support")]
+    if let Some((captured, publication)) = &plan.oracle {
+        native_first::oracle::check_hit(db, key, captured, tuple, coverage, publication)?;
     }
     Ok(())
 }
@@ -7818,17 +7885,24 @@ const RAW_EXCLUSIONS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_exclusions 
 /// batch's refill, so a malformed staged digest fails the publication instead of dropping its
 /// row. A proof names its document by its `semantic_raw_proof_documents` key, written first from
 /// the same staged document (#1248 PR 4); a proof without one would be NULL and fail too.
-const RAW_PROOFS_SQL: &str = "INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,document_id) SELECT m.capture_id,CASE WHEN c.proof_id=lower(c.proof_id) THEN unhex(c.proof_id) END,c.record_kind,CASE WHEN c.fact_digest=lower(c.fact_digest) THEN unhex(c.fact_digest) END,(SELECT d.document_id FROM semantic_raw_proof_documents d WHERE d.capture_id=m.capture_id AND d.language=s.language AND d.path=s.path) FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact WHERE true ORDER BY c.claim_id ON CONFLICT DO NOTHING";
+const RAW_PROOFS_SQL: &str = "INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,document_id) SELECT m.capture_id,CASE WHEN c.proof_id=lower(c.proof_id) THEN unhex(c.proof_id) END,c.record_kind,CASE WHEN c.fact_digest=lower(c.fact_digest) THEN unhex(c.fact_digest) END,(SELECT d.document_id FROM semantic_raw_proof_documents d WHERE d.capture_id=m.capture_id AND d.language=s.language AND d.path=s.path) FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact WHERE c.claim_id>?1 AND c.claim_id<=?2 ORDER BY c.claim_id ON CONFLICT DO NOTHING";
 
 fn with_capture_ids(values: &str, statement: &str) -> String {
     format!("WITH capture_ids(ordinal,capture_id) AS (VALUES {values}) {statement}")
 }
 
-/// Writes the staged proofs of the captures `values` pairs (`RAW_PROOFS_SQL`). A staged row a
-/// raw proof column refuses, such as a proof ID or fact digest that is not 64 lowercase hex
-/// digits, is a typed failure of the publication, never a skipped row.
+/// Every staged proof of the captures `values` pairs, for tests of the proof statement.
+#[cfg(test)]
 fn write_raw_proofs(db: &Connection, values: &str) -> Result<()> {
-    match db.execute(&with_capture_ids(values, RAW_PROOFS_SQL), []) {
+    write_raw_proofs_range(db, values, i64::MIN, i64::MAX)
+}
+
+/// Writes the staged proofs with `low < claim_id <= high` of the captures `values` pairs
+/// (`RAW_PROOFS_SQL`), one pre-write transaction's range (#995). A staged row a raw proof
+/// column refuses, such as a proof ID or fact digest that is not 64 lowercase hex digits, is a
+/// typed failure of the publication, never a skipped row.
+fn write_raw_proofs_range(db: &Connection, values: &str, low: i64, high: i64) -> Result<()> {
+    match db.execute(&with_capture_ids(values, RAW_PROOFS_SQL), [low, high]) {
         Err(rusqlite::Error::SqliteFailure(info, message))
             if matches!(
                 info.extended_code,
@@ -7858,17 +7932,125 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
     statements
 }
 
+/// A batch publication's checks against the head and its stage (#995).
+struct BatchAdmission {
+    descriptor: crate::batch_descriptor::Descriptor,
+    descriptor_bytes: Vec<u8>,
+    header_sha: String,
+    producer: crate::semantic_records::Producer,
+    old_key: String,
+    captured_key: String,
+    documents: usize,
+}
+
+/// Changed rows per pre-write transaction of a batch publication (#995). Such a transaction still
+/// spills past the 16 MiB batch writer cache, but holds readers out for about two seconds at
+/// most, which a read waits out. Measured on a rust-analyzer import of this repository: 8,192
+/// rows made about 390 transactions and multiplied the write time by 7 (each one rewrote and
+/// journaled the random index pages it touched); 65,536 rows made about 73, each held at most
+/// 1.9 s, and the import's wall time stayed within 12% of one transaction's.
+const PREWRITE_CHUNK_ROWS: u64 = 65_536;
+
+/// Where a batch publication's pre-write is, for a test that reads or fails there (#995).
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchPrewriteStage {
+    /// A pre-write transaction has committed and the next has not begun.
+    BetweenChunks,
+    /// Every pre-write transaction has committed; the publishing transaction has not begun.
+    Prewritten,
+}
+#[cfg(feature = "test-support")]
+type BatchPrewriteHook = Box<dyn FnMut(BatchPrewriteStage) -> Result<()> + Send>;
+
+/// The short transactions a batch publication writes its unnamed rows in, before the one
+/// transaction that names them (#995): the raw batch, which only a selection makes part of a
+/// revision, and each document's payload, which only a manifest row does (Decision 0021 item
+/// 1). They run inside the publication's own permit, so no maintenance unit can collect them
+/// before that transaction. If the publication fails, they stay unnamed and the maintenance
+/// sweep collects them.
+struct PrewriteTransactions<'a> {
+    db: &'a Connection,
+    gate: &'a PublicationGate,
+    documents: usize,
+    chunk_rows: u64,
+    /// The open transaction's watch and the connection's change count when it began.
+    open: std::cell::RefCell<Option<(ReadersBlockedWatch<'a>, u64)>>,
+    #[cfg(feature = "test-support")]
+    hook: &'a Mutex<Option<BatchPrewriteHook>>,
+}
+impl<'a> PrewriteTransactions<'a> {
+    fn begin(&self) -> Result<()> {
+        let mut open = self.open.borrow_mut();
+        if open.is_none() {
+            // Declared before the transaction so it drops after it.
+            let watch = ReadersBlockedWatch::new(self.gate, self.documents);
+            storage_result(self.db.execute_batch("BEGIN IMMEDIATE"))?;
+            *open = Some((watch, self.db.total_changes()));
+        }
+        Ok(())
+    }
+    /// Marks the open transaction as holding readers out once it has spilled.
+    fn check(&self) {
+        if let Some((watch, _)) = self.open.borrow_mut().as_mut() {
+            watch.check(self.db);
+        }
+    }
+    fn commit(&self) -> Result<()> {
+        let mut open = self.open.borrow_mut();
+        if let Some((watch, _)) = open.as_mut() {
+            watch.check(self.db);
+            storage_result(self.db.execute_batch("COMMIT"))?;
+            // COMMIT released the lock: the watch clears its mark only now.
+            *open = None;
+        }
+        Ok(())
+    }
+    /// Commits the open transaction and opens the next.
+    fn next(&self) -> Result<()> {
+        self.commit()?;
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.hook.lock().unwrap().as_mut() {
+            hook(BatchPrewriteStage::BetweenChunks)?;
+        }
+        self.begin()
+    }
+    /// [`Self::next`] once the open transaction has changed `chunk_rows` rows.
+    fn next_if_full(&self) -> Result<()> {
+        let full =
+            self.open.borrow().as_ref().is_some_and(|(_, at)| {
+                self.db.total_changes().saturating_sub(*at) >= self.chunk_rows
+            });
+        if full {
+            self.next()?;
+        }
+        Ok(())
+    }
+}
+impl Drop for PrewriteTransactions<'_> {
+    fn drop(&mut self) {
+        // Roll back before the watch drops, so a reader is released only once the lock is.
+        if self.open.get_mut().is_some() {
+            let _ = self.db.execute_batch("ROLLBACK");
+            *self.open.get_mut() = None;
+        }
+    }
+}
+
 /// Writes the batch row, one capture per staged artifact, and the document, exclusion and proof
-/// rows. Rows of a batch that is already stored are refilled and never compared. Returns the
-/// batch id.
-fn write_staged_raw_rows(
-    db: &Connection,
+/// rows, in pre-write transactions (#995). Each capture commits with its whole BLOB, so a
+/// stored capture is always complete. Rows of a batch that is already stored are refilled and
+/// never compared. Returns the batch id.
+fn prewrite_raw_rows(
+    prewrite: &PrewriteTransactions<'_>,
     stage: &crate::store::staging::Stage,
     descriptor: &crate::batch_descriptor::Descriptor,
     descriptor_bytes: &[u8],
     descriptor_sha256: &str,
     gate: &dyn Fn() -> Result<()>,
 ) -> Result<i64> {
+    let db = prewrite.db;
     let producer_id = &descriptor.producer.name;
     let source_set_id = &descriptor.source_set.id;
     let captured_revision = &descriptor.source_revision;
@@ -7885,7 +8067,24 @@ fn write_staged_raw_rows(
     ensure!(!artifacts.is_empty(), "staged batch has no artifacts");
     let mut capture_ids = Vec::with_capacity(artifacts.len());
     for (ordinal, languages, sha256, length) in &artifacts {
-        let other: Option<i64> = db.query_row("SELECT batch_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![producer_id,sha256,source_set_id,captured_revision], |r| r.get(0)).optional()?;
+        let captured_by = || -> Result<Option<i64>> {
+            Ok(db.query_row("SELECT batch_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![producer_id,sha256,source_set_id,captured_revision], |r| r.get(0)).optional()?)
+        };
+        let mut other = captured_by()?;
+        if let Some(abandoned) = other.filter(|other| *other != batch_id)
+            && batch_unselected(db, abandoned)?
+        {
+            // Another batch's pre-write that never published (#995) holds the artifact. Nothing
+            // selects it, and this publication's permit keeps every other publication and
+            // maintenance out, so collect it now: an abandoned pre-write never rejects an import
+            // its rollback would have admitted. Rows a revision still names stay, and so does
+            // the rejection they cause.
+            while collect_unselected_batch_chunk(db, abandoned)? {
+                gate()?;
+                prewrite.next_if_full()?;
+            }
+            other = captured_by()?;
+        }
         ensure!(
             other.is_none_or(|other| other == batch_id),
             "invalid_request: artifact already captured by another batch"
@@ -7909,9 +8108,11 @@ fn write_staged_raw_rows(
                 *length,
                 &|| {
                     gate()?;
+                    prewrite.check();
                     Ok(())
                 },
             )?;
+            prewrite.next()?;
             capture_id
         };
         capture_ids.push((*ordinal, capture_id));
@@ -7927,33 +8128,67 @@ fn write_staged_raw_rows(
     db.execute(RAW_EXCLUSIONS_SQL, [batch_id])?;
     gate()?;
     db.execute(&with_capture_ids(&values, RAW_PROOF_DOCUMENTS_SQL), [])?;
-    write_raw_proofs(db, &values)?;
+    prewrite.next()?;
+    // Proofs in claim ranges of one pre-write transaction each.
+    let (first, last): (Option<i64>, Option<i64>) = db.query_row(
+        "SELECT min(claim_id),max(claim_id) FROM stage.claims",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if let (Some(first), Some(last)) = (first, last) {
+        let step = i64::try_from(prewrite.chunk_rows.max(1)).unwrap_or(i64::MAX);
+        let mut low = first.saturating_sub(1);
+        while low < last {
+            let high = low.saturating_add(step).min(last);
+            write_raw_proofs_range(db, &values, low, high)?;
+            prewrite.check();
+            gate()?;
+            prewrite.next()?;
+            low = high;
+        }
+    }
     Ok(batch_id)
 }
 
-/// Streams the staged `out_*` rows into the semantic tables one coverage tuple at a time:
-/// each family is read by one cursor in emission order, so memory is bounded by one document
-/// and the rows match what the in-memory writer produces.
-fn write_staged_semantic(
-    db: &Connection,
-    key: &str,
+/// Streams the staged `out_*` rows into payloads one coverage tuple at a time, in pre-write
+/// transactions (#995): each family is read by one cursor in emission order, so memory is
+/// bounded by one document, and a transaction commits only between documents. Returns what
+/// the publishing transaction writes for each tuple; the rows equal what the in-memory writer
+/// produces. `documents_at` is the head the destination copies its documents from.
+#[allow(clippy::too_many_arguments)]
+fn prewrite_staged_semantic(
+    prewrite: &PrewriteTransactions<'_>,
+    documents_at: &str,
     producer: &crate::semantic_records::Producer,
     batch: i64,
     captured_pin: &str,
     inputs: &semantic_payload::KeyInputs,
     gate: &dyn Fn() -> Result<()>,
-) -> Result<()> {
+) -> Result<Vec<CoveragePlan>> {
+    let db = prewrite.db;
     // The tuple writers' statements, each target table's included, stay prepared.
     db.set_prepared_statement_cache_capacity(64);
+    let mut plans = Vec::new();
     let mut index = 0u64;
     staging::publication::read_documents(db, "stage.", producer, &mut |publication| {
-        write_import_coverage(db, key, &publication, Some((batch, captured_pin)), inputs)?;
+        for coverage in &publication.coverage {
+            plans.push(prewrite_coverage(
+                db,
+                documents_at,
+                coverage,
+                &publication,
+                Some((batch, captured_pin)),
+                inputs,
+            )?);
+        }
         if index % 1000 == 999 {
             gate()?;
         }
         index += 1;
-        Ok(())
-    })
+        prewrite.check();
+        prewrite.next_if_full()
+    })?;
+    Ok(plans)
 }
 
 #[cfg(feature = "test-support")]
@@ -8042,6 +8277,20 @@ fn write_producer_descriptor(
     key: &str,
     producer: &crate::semantic_records::Producer,
 ) -> Result<()> {
+    write_producer_identity(db, producer)?;
+    db.execute(
+        "INSERT INTO semantic_revision_producers VALUES(?1,?2,?3,'fullCaptured',NULL,NULL)",
+        params![key, producer.id, producer.version],
+    )?;
+    Ok(())
+}
+
+/// The revision-neutral producer and producer-language rows a payload names, checked against
+/// any stored ones. A batch import writes them before its payloads (#995).
+fn write_producer_identity(
+    db: &Connection,
+    producer: &crate::semantic_records::Producer,
+) -> Result<()> {
     db.execute(
         "INSERT OR IGNORE INTO semantic_producers VALUES(?1,?2,?3,?4,?5,?6)",
         params![
@@ -8092,10 +8341,6 @@ fn write_producer_descriptor(
         persisted == supplied,
         "incompatible_index: semantic producer languages changed"
     );
-    db.execute(
-        "INSERT INTO semantic_revision_producers VALUES(?1,?2,?3,'fullCaptured',NULL,NULL)",
-        params![key, producer.id, producer.version],
-    )?;
     Ok(())
 }
 
@@ -8705,6 +8950,97 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
             return Ok(true);
         }
     }
+    release_unselected_raw_chunk(db)
+}
+
+/// A raw batch no revision selects and no pending selection names: written by a batch
+/// publication that did not publish, or left by a released revision (#995).
+const UNSELECTED_BATCH_SQL: &str = "SELECT b.batch_id FROM semantic_raw_batches b
+    WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=b.batch_id)
+    AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections p WHERE p.batch_id=b.batch_id)";
+
+/// A payload no manifest row names and no release journals. Whether its raw batch is selected
+/// does not matter: a failed replay of a selected batch can leave one (#995).
+const UNNAMED_PAYLOAD_SQL: &str = "SELECT p.payload_id FROM semantic_payloads p
+    WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)
+    AND NOT EXISTS(SELECT 1 FROM semantic_release_candidate_payloads r WHERE r.payload_id=p.payload_id)";
+
+/// One bounded chunk of collecting what a batch publication wrote and never named (#995):
+/// first a payload no manifest row names and no release journals, whatever its batch, then the
+/// raw rows of an unselected batch. True if it deleted anything. Only a maintenance unit runs
+/// it, and a maintenance unit never runs inside a publication's permit, so no live publication
+/// owns what it collects.
+fn collect_unpublished_chunk(db: &Connection) -> Result<bool> {
+    let payload: Option<i64> = db
+        .query_row(&format!("{UNNAMED_PAYLOAD_SQL} LIMIT 1"), [], |r| r.get(0))
+        .optional()?;
+    if let Some(payload) = payload {
+        semantic_payload::collect_payload_chunk(db, payload)?;
+        return Ok(true);
+    }
+    let batches: Vec<i64> = db
+        .prepare(&format!("{UNSELECTED_BATCH_SQL} LIMIT 8"))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for batch in batches {
+        if collect_unselected_batch_chunk(db, batch)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether no revision selects `batch` and no pending target names it.
+fn batch_unselected(db: &Connection, batch: i64) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE batch_id=?1)
+             AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections WHERE batch_id=?1)",
+        [batch],
+        |r| r.get(0),
+    )?)
+}
+
+/// One bounded chunk of collecting unselected raw batch `batch` (#995): one of its payloads no
+/// manifest row names and no release journals, else up to 4096 of its witness documents,
+/// proofs no provenance derives from and exclusions, its captures left without proofs (with
+/// their documents), its witness and its batch row once nothing names them. True if it
+/// deleted anything. The caller has checked that the batch is unselected and holds what keeps
+/// any live publication out: a maintenance permit, or the publication's own permit.
+fn collect_unselected_batch_chunk(db: &Connection, batch: i64) -> Result<bool> {
+    let payload: Option<i64> = db
+        .query_row(
+            &format!("{UNNAMED_PAYLOAD_SQL} AND p.batch_id=?1 LIMIT 1"),
+            [batch],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(payload) = payload {
+        semantic_payload::collect_payload_chunk(db, payload)?;
+        return Ok(true);
+    }
+    let mut deleted = 0;
+    for statement in [
+        "DELETE FROM semantic_batch_witness_documents WHERE rowid IN (SELECT rowid FROM semantic_batch_witness_documents WHERE batch_id=?1 LIMIT 4096)",
+        "DELETE FROM semantic_batch_witnesses WHERE batch_id=?1 AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents WHERE batch_id=?1)",
+        "DELETE FROM semantic_raw_proofs WHERE rowid IN (SELECT p.rowid FROM semantic_raw_captures c CROSS JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.batch_id=?1 AND NOT EXISTS(SELECT 1 FROM semantic_provenance v WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id) LIMIT 4096)",
+        "DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE c.batch_id=?1 AND NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) LIMIT 64)",
+        "DELETE FROM semantic_raw_exclusions WHERE rowid IN (SELECT rowid FROM semantic_raw_exclusions WHERE batch_id=?1 LIMIT 4096)",
+        "DELETE FROM semantic_raw_batches WHERE batch_id=?1
+         AND NOT EXISTS(SELECT 1 FROM semantic_raw_captures WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_raw_exclusions WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_batch_witnesses WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_payloads WHERE batch_id=?1)",
+    ] {
+        deleted += db.execute(statement, [batch])?;
+    }
+    Ok(deleted > 0)
+}
+
+/// Up to 64 rows of each raw table that only unselected batches own. True if it deleted any.
+fn release_unselected_raw_chunk(db: &Connection) -> Result<bool> {
     db.execute(
             "DELETE FROM semantic_batch_witnesses WHERE batch_id IN (
                 SELECT d.batch_id FROM semantic_batch_witness_documents d
@@ -11796,6 +12132,10 @@ impl Store {
             #[cfg(feature = "test-support")]
             semantic_publication_observer: Arc::default(),
             #[cfg(feature = "test-support")]
+            batch_prewrite_hook: Arc::default(),
+            #[cfg(feature = "test-support")]
+            prewrite_chunk_rows: Arc::default(),
+            #[cfg(feature = "test-support")]
             payload_reuse_disabled: Arc::default(),
             #[cfg(feature = "test-support")]
             payload_join_inputs: Arc::default(),
@@ -14110,6 +14450,98 @@ impl Store {
         .map_err(typed_storage_full)
     }
 
+    /// The pre-write transactions of one batch publication on writer connection `db` (#995).
+    fn prewrite_transactions<'a>(&'a self, db: &'a Connection) -> PrewriteTransactions<'a> {
+        #[allow(unused_mut)]
+        let mut chunk_rows = PREWRITE_CHUNK_ROWS;
+        #[cfg(feature = "test-support")]
+        {
+            let rows = self.prewrite_chunk_rows.load(Ordering::Acquire);
+            if rows > 0 {
+                chunk_rows = rows;
+            }
+        }
+        PrewriteTransactions {
+            db,
+            gate: &self.publication_gate,
+            documents: 0,
+            chunk_rows,
+            open: std::cell::RefCell::new(None),
+            #[cfg(feature = "test-support")]
+            hook: &self.batch_prewrite_hook,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn run_batch_prewrite_hook(&self, stage: BatchPrewriteStage) -> Result<()> {
+        match self.batch_prewrite_hook.lock().unwrap().as_mut() {
+            Some(hook) => hook(stage),
+            None => Ok(()),
+        }
+    }
+
+    /// What a batch publication checks against the head and the attached stage before it
+    /// writes: once in its first pre-write transaction and again in its publishing transaction,
+    /// whose exact-head check is the publication's compare-and-swap (#995).
+    fn batch_publication_admission(
+        &self,
+        db: &Connection,
+        joined: &batch_input::JoinedBatch,
+        expected: IndexPin,
+    ) -> Result<BatchAdmission> {
+        use crate::batch_descriptor::Descriptor;
+        let current = self.recovery_baseline_preflight(db)?;
+        ensure!(
+            current.pin == Some(expected),
+            "revision conflict: semantic batch destination changed"
+        );
+        let (header_sha, descriptor_bytes): (String, Vec<u8>) = db.query_row(
+            "SELECT descriptor_sha256,descriptor_bytes FROM stage.header",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let attempt: i64 =
+            db.query_row("SELECT attempt FROM stage.join_state", [], |row| row.get(0))?;
+        ensure!(
+            attempt == joined.attempt() && header_sha == joined.descriptor_sha256(),
+            "joined batch superseded by a later join attempt"
+        );
+        let descriptor = Descriptor::parse(&descriptor_bytes)?;
+        let documents = usize::try_from(descriptor.totals.source_documents).unwrap_or(usize::MAX);
+        let producer = descriptor.check_producer()?.producer();
+        let old_key = semantic_pin_key(expected);
+        let head_native: String = db.query_row(
+            "SELECT native_revision_id FROM native_revisions WHERE id=?1",
+            [&old_key],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            head_native == joined.destination_revision_id(),
+            "revision conflict: semantic batch destination changed"
+        );
+        let captured_key = semantic_pin_key(joined.captured_pin());
+        let retained: Option<String> = db
+            .query_row(
+                "SELECT native_revision_id FROM native_revisions r WHERE id=?1 AND source_set_id=?2 AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs WHERE revision_id=r.id AND input_key IN ('__released:v1','__pending_release:v1'))",
+                params![captured_key, descriptor.source_set.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(
+            retained.as_deref() == Some(descriptor.source_revision.as_str()),
+            "capture_unavailable: captured revision not retained"
+        );
+        Ok(BatchAdmission {
+            descriptor,
+            descriptor_bytes,
+            header_sha,
+            producer,
+            old_key,
+            captured_key,
+            documents,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn publish_semantic_batch_statements(
         &self,
@@ -14121,7 +14553,6 @@ impl Store {
         mut before_commit: impl FnMut(&Connection) -> Result<()>,
         commit_loss: Option<CommitLoss>,
     ) -> Result<IndexPin> {
-        use crate::batch_descriptor::Descriptor;
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         check_cancel(cancel)?;
@@ -14142,16 +14573,7 @@ impl Store {
         let _intent = self.write_intent();
         let conn = self.cache_write()?;
         let db: &Connection = &conn;
-        #[allow(unused_mut)]
-        let mut cache_kib = i64::try_from(crate::semantic_batch::limits::BATCH_WRITER_CACHE_KIB)?;
-        // A tiny writer cache makes a small test batch spill like a large producer's (#905).
-        #[cfg(feature = "test-support")]
-        if let Some(kib) = std::env::var("TRELLIS_TEST_BATCH_WRITER_CACHE_KIB")
-            .ok()
-            .and_then(|kib| kib.parse().ok())
-        {
-            cache_kib = kib;
-        }
+        let cache_kib = i64::try_from(crate::semantic_batch::limits::BATCH_WRITER_CACHE_KIB)?;
         storage_result(db.pragma_update(None, "cache_size", -cache_kib))?;
         storage_result(db.execute("ATTACH DATABASE ?1 AS stage", [&stage_uri]))?;
         let attachment = StageAttachment(db);
@@ -14166,60 +14588,65 @@ impl Store {
             stage.budget(&batch_limits).check()?;
             Ok(())
         };
+        // #995: everything no revision names yet, the raw batch and the documents' payloads,
+        // commits first in short transactions, so readers of the prior head wait out only
+        // those COMMITs. The publishing transaction below names them.
+        let mut prewrite = self.prewrite_transactions(db);
+        prewrite.begin()?;
+        let admitted = self.batch_publication_admission(db, joined, expected)?;
+        let documents = admitted.documents;
+        prewrite.documents = documents;
+        // The producer rows every payload names.
+        write_producer_identity(db, &admitted.producer)?;
+        let plans = {
+            let (descriptor, header_sha, descriptor_bytes) = (
+                &admitted.descriptor,
+                &admitted.header_sha,
+                &admitted.descriptor_bytes,
+            );
+            gate()?;
+            let batch_id = prewrite_raw_rows(
+                &prewrite,
+                stage,
+                descriptor,
+                descriptor_bytes,
+                header_sha,
+                &gate,
+            )?;
+            gate()?;
+            let plans = prewrite_staged_semantic(
+                &prewrite,
+                &admitted.old_key,
+                &admitted.producer,
+                batch_id,
+                &admitted.captured_key,
+                &self.payload_key_inputs(),
+                &gate,
+            )?;
+            prewrite.commit()?;
+            (batch_id, plans)
+        };
+        let (batch_id, plans) = plans;
+        drop(prewrite);
+        #[cfg(feature = "test-support")]
+        self.run_batch_prewrite_hook(BatchPrewriteStage::Prewritten)?;
         // Declared before the transaction so it drops after it: on an error or unwind the
-        // mark stays set until the rollback has released the lock (#905).
-        let mut blocked = ReadersBlockedWatch::new(&self.publication_gate, 0);
+        // mark stays set until the rollback has released the lock (#905). The transaction
+        // writes only the manifest, freshness, selection and revision rows, so it is marked
+        // only if it spills.
+        let mut blocked = ReadersBlockedWatch::new(&self.publication_gate, documents);
         let tx = storage_result(Transaction::new_unchecked(
             db,
             TransactionBehavior::Immediate,
         ))?;
-        let current = self.recovery_baseline_preflight(&tx)?;
-        ensure!(
-            current.pin == Some(expected),
-            "revision conflict: semantic batch destination changed"
-        );
-        let (header_sha, descriptor_bytes): (String, Vec<u8>) = tx.query_row(
-            "SELECT descriptor_sha256,descriptor_bytes FROM stage.header",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let attempt: i64 =
-            tx.query_row("SELECT attempt FROM stage.join_state", [], |row| row.get(0))?;
-        ensure!(
-            attempt == joined.attempt() && header_sha == joined.descriptor_sha256(),
-            "joined batch superseded by a later join attempt"
-        );
-        let descriptor = Descriptor::parse(&descriptor_bytes)?;
-        // A large batch spills to `index.db` long before COMMIT, holding every reader of the
-        // prior head out for the rest of the transaction (#210, #905). Readers that SQLite
-        // finds locked from here on wait on the gate's signal and fail typed
-        // `rebuild_in_progress`, never as untyped contention retried to a deadline.
-        blocked.documents =
-            usize::try_from(descriptor.totals.source_documents).unwrap_or(usize::MAX);
-        blocked.mark();
-        let producer = descriptor.check_producer()?.producer();
-        let old_key = semantic_pin_key(expected);
-        let head_native: String = tx.query_row(
-            "SELECT native_revision_id FROM native_revisions WHERE id=?1",
-            [&old_key],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            head_native == joined.destination_revision_id(),
-            "revision conflict: semantic batch destination changed"
-        );
-        let captured_key = semantic_pin_key(joined.captured_pin());
-        let retained: Option<String> = tx
-            .query_row(
-                "SELECT native_revision_id FROM native_revisions r WHERE id=?1 AND source_set_id=?2 AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs WHERE revision_id=r.id AND input_key IN ('__released:v1','__pending_release:v1'))",
-                params![captured_key, descriptor.source_set.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        ensure!(
-            retained.as_deref() == Some(descriptor.source_revision.as_str()),
-            "capture_unavailable: captured revision not retained"
-        );
+        let BatchAdmission {
+            descriptor,
+            header_sha,
+            producer,
+            old_key,
+            captured_key,
+            ..
+        } = self.batch_publication_admission(&tx, joined, expected)?;
         gate()?;
         let next = IndexPin {
             index_generation: expected.index_generation,
@@ -14266,24 +14693,10 @@ impl Store {
             )?;
         }
         gate()?;
-        let batch_id = write_staged_raw_rows(
-            &tx,
-            stage,
-            &descriptor,
-            &descriptor_bytes,
-            &header_sha,
-            &gate,
-        )?;
-        gate()?;
-        write_staged_semantic(
-            &tx,
-            &next_key,
-            &producer,
-            batch_id,
-            &captured_key,
-            &self.payload_key_inputs(),
-            &gate,
-        )?;
+        for plan in &plans {
+            write_coverage_manifest(&tx, &next_key, plan)?;
+        }
+        blocked.check(&tx);
         tx.execute(
             "INSERT INTO semantic_revision_raw_selections VALUES(?1,?2,?3,?4)",
             params![next_key, producer.id, batch_id, captured_key],
@@ -14307,6 +14720,7 @@ impl Store {
         leader.verify()?;
         self.identity.verify()?;
         check_cancel(cancel)?;
+        blocked.check(&tx);
         #[cfg(all(feature = "test-support", unix))]
         if let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_PAUSE_BEFORE_COMMIT_SOCKET") {
             use std::os::unix::net::UnixListener;
@@ -18688,6 +19102,25 @@ impl Store {
         inputs
     }
 
+    /// Runs `hook` at each point of a batch publication's pre-write (#995): after each of its
+    /// transactions commits, and once all have, before the publishing transaction. An error
+    /// fails the publication there.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_batch_prewrite_hook_for_tests(
+        &self,
+        hook: impl FnMut(BatchPrewriteStage) -> Result<()> + Send + 'static,
+    ) {
+        *self.batch_prewrite_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Rows per pre-write transaction of a batch publication; zero restores the default.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_prewrite_chunk_rows_for_tests(&self, rows: u64) {
+        self.prewrite_chunk_rows.store(rows, Ordering::Release);
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn set_semantic_publication_observer_for_tests(
@@ -18871,7 +19304,7 @@ impl Store {
             }
             return Err(error);
         }
-        let selected_read = (|| -> Result<(IndexPin, i64, Option<String>)> {
+        let selected_read = (|| -> Result<(IndexPin, i64, Option<String>, bool)> {
             let head = ReadRevision::current(&db)?.pin;
             let max_stamp: Option<i64> = db.query_row(
                 "SELECT max(superseded_at) FROM native_revision_supersessions",
@@ -18901,12 +19334,28 @@ impl Store {
             } else {
                 None
             };
-            Ok((head, now, pending.or(due)))
+            let selected = pending.or(due);
+            // Revisions first: a release itself collects the batches it unselects. With none
+            // due, rows a publication pre-wrote and never named are collected (#995).
+            let unpublished = selected.is_none()
+                && (db
+                    .query_row(&format!("{UNSELECTED_BATCH_SQL} LIMIT 1"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .optional()?
+                    .is_some()
+                    || db
+                        .query_row(&format!("{UNNAMED_PAYLOAD_SQL} LIMIT 1"), [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .optional()?
+                        .is_some());
+            Ok((head, now, selected, unpublished))
         })();
         drop(db);
         guard.verify()?;
         drop(guard);
-        let (head, now, selected) = match selected_read {
+        let (head, now, selected, unpublished) = match selected_read {
             Ok(read) => read,
             Err(error) if maintenance_contention(&error) => {
                 self.record_maintenance_busy(&error);
@@ -18914,9 +19363,9 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
-        let Some(selected) = selected else {
+        if selected.is_none() && !unpublished {
             return Ok(MaintenanceOutcome::Idle);
-        };
+        }
         self.maintenance_before_writer_hook.run();
         if !self.maintenance_priority(permit, probe, &mut priority) {
             return Ok(MaintenanceOutcome::Deferred);
@@ -18955,6 +19404,35 @@ impl Store {
                 current.pin == head,
                 "revision conflict: maintenance head changed"
             );
+            let Some(selected) = selected else {
+                // #995: unnamed pre-written rows, in chunks until the unit budget passes or a
+                // higher class has work. Nothing collected means nothing is left to collect.
+                let budget =
+                    Duration::from_micros(self.maintenance_unit_budget_us.load(Ordering::Acquire));
+                let started = Instant::now();
+                let mut collected = false;
+                while collect_unpublished_chunk(&tx)? {
+                    collected = true;
+                    if started.elapsed() >= budget
+                        || !progress.check()
+                        || !self.maintenance_priority(permit, probe, &mut priority)
+                    {
+                        break;
+                    }
+                }
+                leader.verify()?;
+                self.identity.verify()?;
+                guard.verify()?;
+                if !progress.check() || !self.maintenance_priority(permit, probe, &mut priority) {
+                    return Ok(MaintenanceOutcome::Deferred);
+                }
+                tx.commit()?;
+                return Ok(if collected {
+                    MaintenanceOutcome::Progress
+                } else {
+                    MaintenanceOutcome::Idle
+                });
+            };
             ensure!(
                 selected != current.key,
                 "revision conflict: maintenance selected head"

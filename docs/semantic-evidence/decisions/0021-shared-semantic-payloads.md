@@ -2,6 +2,7 @@
 
 - **Status:** accepted design (owner, 2026-11-08); ratified on merge. The owner accepted every recommendation of the [#680](https://github.com/SquashMerge/trellis/issues/680) design note, D1–D8, on 2026-11-08. Implementation follows in separate reviewed work (see [Implementation impact](#implementation-impact)).
 - **Amended:** D1 and D4, 2026-11-21 (owner decision, [#1279](https://github.com/SquashMerge/trellis/issues/1279), option A): the "unchanged since capture" demotion of a method call is applied at read time. See the amendment notes under items 1 and 4.
+- **Amended:** atomicity and GC, 2026-11-27 (owner ruling, [#995](https://github.com/SquashMerge/trellis/issues/995), option C2): a batch import commits its payloads and raw batch before the transaction that names them, and unnamed pre-written rows are collected. See the amendment note after item 8.
 - **Amends:**
   - [Decision 0003](0003-per-document-occurrence-ids.md) item 5: storage may share a validated semantic payload across revisions; validity stays revision-scoped (item 1 below).
   - [contract v1](../contract-v1.md): the "never crosses revisions" paragraph of [Basis and freshness](../contract-v1.md#basis-and-freshness), the #669 copy rule in [Native-first publication](../contract-v1.md#native-first-publication-and-older-basis-reads-620), and the new [Shared semantic payloads (#680)](../contract-v1.md#shared-semantic-payloads-680) section.
@@ -34,6 +35,8 @@ The #620 payload experiment keyed reuse on the settled output, so every document
 8. **Schema 42, recreated (D8); schema 43 records which targets are symbol declarations (#863, owner ratified 2026-11-11), also recreated.** The schema change is disposable derived state. Older indexes are recreated, never migrated (#253 GC old-schema ruling).
 
 A payload that no retained manifest row names is collected like an unreferenced document version (local topology T06).
+
+*Amendment, 2026-11-27 (owner, #995, option C2).* A payload is part of a revision only through that revision's manifest row (item 1), and a raw batch only through its selection, so neither needs to commit in the transaction that names it. A batch import writes them first, in short transactions inside its publication permit, and then publishes the manifest and freshness rows, the selection, the revision rows and the pin in one transaction under the exact-head CAS. That transaction is still the only publication point: no reader sees part of the import. A crash, a failed publishing transaction or a lost CAS leaves unnamed payloads and, for a batch nothing selected, an unselected raw batch. Once no revision release is due, a maintenance unit collects every payload no manifest row names and no release journals, whether or not its batch is selected, and every unselected raw batch (local topology T06, *Unpublished rows*). An import whose artifact an unselected batch holds collects that batch first, inside its own permit. A retry writes them again, or reuses a complete payload its input key names, since each pre-write transaction commits whole payloads and whole captures. Validation, reuse keys, wire bytes and the #669 S = FULL oracle are unchanged.
 
 The #669 rule that a completed S equals a from-scratch FULL is unchanged and remains the oracle for wrong reuse.
 

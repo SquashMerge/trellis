@@ -186,3 +186,103 @@ The benchmark harness is local evidence, not part of the repository. In outline:
 3. Embed the cards with each local model, rank by cosine similarity, and score.
 
 The results and the recommendation are on #211.
+
+## Parity reference corpus
+
+The Candle parity check ([`semantic-search-candle.md`](../semantic-search-candle.md)) compares
+against a saved reference corpus: the 6,722 cards, the voyage-4-nano reference vectors and the
+saved evaluation. The corpus, the evaluation venv and the weights stay **outside Git**.
+[`reference-corpus.json`](reference-corpus.json) is its manifest: the source commit and index
+identity, the card and query hashes and ordered-ID hashes, the harness script hashes, the
+resolved Python packages, the vector and `eval.json` hashes, and the model pin manifest.
+`tools/semantic-search/check-parity.py` pins the same hashes.
+
+**Location.** The corpus is a local evidence root outside Git on the release machine, passed to
+the checker as `--evidence-root`. It holds `results/cards.jsonl`, `results/emb/`,
+`results/eval.json`, `eval/queries.json`, `scripts/`, `venv/`, `models/voyage-4-nano/`,
+`verified-download-manifest.json` and `local-manifest.json`. The last one records the literal
+local inputs, such as the original workspace path, that this public manifest keeps only as
+hashes.
+
+**History.** The original #214 evidence root was lost in November 2026 with no backup. #1323
+regenerated it by the original method. The four harness scripts were recovered verbatim from the
+#214 session record and are now committed, unchanged, in
+[`tools/semantic-search/reference/`](../../tools/semantic-search/reference/). The Python packages
+were resolved as of the original install time.
+The result is byte-identical to the pins the checker held before the loss:
+`scripts/evaluate.py`, `results/cards.jsonl` and all four voyage-4-nano `.npy` arrays. Only
+`results/eval.json` is new: it was re-run for voyage-4-nano alone, without the other models'
+entries, which the checker never reads.
+
+### Rebuilding it
+
+Run every step from the evidence root `<root>`, and every build and embedding step under the
+shared heavy-run lease. Never run the 693c32c `trellis` under your real `HOME`, and never use an
+installed `trellis` for the index: its extractor and IDs differ.
+
+1. **Scripts.** Copy the four files in `tools/semantic-search/reference/` to `<root>/scripts/`
+   without modification. Their hashes are the `scripts` pins in the manifest and in the
+   checker's `SOURCE_HASHES`; do not reformat them.
+2. **Venv.** `uv venv --python 3.12 <root>/venv`, then
+   `uv pip install --python <root>/venv/bin/python --exclude-newer 2026-10-19T19:33:00Z` with
+   the package list in `environment.resolution`. Check the resolved versions against
+   `environment.packages`. Every later `python` is `<root>/venv/bin/python -I`.
+3. **Indexer binary.** Build the release `trellis` from the source commit, outside any checkout,
+   and keep it in the evidence root:
+
+   ```sh
+   mkdir <scratch>/src-693c32c
+   git -C <trellis checkout> archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93 | tar -x -C <scratch>/src-693c32c
+   (cd <scratch>/src-693c32c && CARGO_TARGET_DIR=<scratch>/target cargo build --locked --release --bin trellis)
+   cp <scratch>/target/release/trellis <root>/trellis-693c32c
+   ```
+
+   The pinned `rust-toolchain.toml` in the snapshot selects Rust 1.99.1.
+4. **Index.** The snapshot has no `.git`, so the source-set ID, and with it every `sid:v1` ID,
+   hashes the canonical workspace path. Re-index at the original canonical workspace path
+   recorded in the local reference manifest (`local-manifest.json` in the evidence root). That
+   path may belong to someone's real directory, so the recipe claims it with an exclusive
+   `mkdir` and removes only what it created. Run it as one script; it stops at the first error:
+
+   ```sh
+   set -e
+   W='<workspaceRoot from local-manifest.json>'
+   exists() { [ -e "$1" ] || [ -L "$1" ]; }   # -L also catches a dangling symlink
+   top=$W   # the highest ancestor of W that does not exist yet
+   while ! exists "$(dirname "$top")"; do top=$(dirname "$top"); done
+   created=
+   mkdir "$top" || { echo "refusing: $top already exists or cannot be created" >&2; exit 1; }
+   created=$top   # set only after this run's exclusive mkdir succeeded
+   [ "$top" = "$W" ] || mkdir -p "$W"   # descendants inside the directory just created
+   git -C <trellis checkout> archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93 | tar -x -C "$W"
+   HOME=<root>/home XDG_CACHE_HOME= <root>/trellis-693c32c index --workspace "$W"
+   ```
+
+   Then stop the daemon that binary started (find its PID with `ps -axo pid,command`, confirm it
+   is `<root>/trellis-693c32c daemon`, then signal that PID only), and remove only what this run
+   created: `if [ -n "$created" ]; then rm -rf "$created"; fi`. The index key must equal
+   `79e73f12…` (`inputs.indexKey`), and the index's source set must equal `inputs.sourceSetId`.
+5. **Cards.** `python scripts/cards.py <index.db> results/cards.jsonl`, where `<index.db>` is
+   `<root>/home/Library/Caches/dev.squashmerge.trellis/indexes/<index key>/index.db`. The output
+   must match `cards.sha256` byte for byte; if it doesn't, stop: the inputs differ.
+6. **Model.** `HF_HOME=<root>/hf-home python scripts/download.py <root>/models voyage-4-nano`
+   fetches the evaluation pin `433ece5e…`. The weight SHA-256 must equal the pin, and every file
+   in the Candle runtime's model directory must be byte-identical to the snapshot. Record both in
+   `verified-download-manifest.json`.
+7. **Vectors and evaluation.** Copy `docs/semantic-search-eval/queries.json` to
+   `eval/queries.json`, then run
+   `python scripts/embed.py voyage-4-nano <root>/models results/cards.jsonl eval/queries.json results/emb a,b,c 512`
+   and `python scripts/evaluate.py results/cards.jsonl eval/queries.json results/emb results/eval.json voyage-4-nano`
+   (MPS).
+8. **Pin it.** Update `reference-corpus.json` and the checker's `SOURCE_HASHES` together, and
+   re-run the CPU and Metal parity check against the new reference.
+
+A rebuild that doesn't reproduce the pinned vector hashes is a new reference, not a restore. It
+replaces the reference only with that complete CPU/Metal re-run recorded.
+
+To check that the corpus is present and unchanged (the release checklist item):
+
+```sh
+<root>/venv/bin/python tools/semantic-search/check-parity.py --verify-reference \
+  --evidence-root <root> --model-pin-manifest <root>/verified-download-manifest.json
+```

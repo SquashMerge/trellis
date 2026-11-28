@@ -664,6 +664,34 @@ pub(in crate::store) fn cleanup_payload_candidates(
     tx: &Connection,
     revision: &str,
 ) -> Result<bool> {
+    let mut progress = false;
+    for _ in 0..64 {
+        let candidate: Option<i64> = tx
+            .query_row(
+                "SELECT payload_id FROM semantic_release_candidate_payloads WHERE revision_id=?1 ORDER BY payload_id LIMIT 1",
+                [revision],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(payload) = candidate else {
+            return Ok(progress);
+        };
+        progress = true;
+        if collect_payload_chunk(tx, payload)? {
+            return Ok(true);
+        }
+        tx.execute(
+            "DELETE FROM semantic_release_candidate_payloads WHERE revision_id=?1 AND payload_id=?2",
+            params![revision, payload],
+        )?;
+    }
+    Ok(progress)
+}
+
+/// One bounded chunk of collecting `payload` if no manifest row names it: up to 256 rows of one
+/// child table, or the payload row itself once its children are gone. True while more of the
+/// payload remains, so the caller's unit continues with it; false once it is gone or named.
+pub(in crate::store) fn collect_payload_chunk(tx: &Connection, payload: i64) -> Result<bool> {
     const CHILDREN: [(&str, &str); 13] = [
         ("semantic_reference_roles", "payload"),
         ("semantic_reference_candidates", "payload"),
@@ -711,56 +739,39 @@ pub(in crate::store) fn cleanup_payload_candidates(
         ("semantic_coverage_roles", "payload"),
         ("semantic_coverage_reasons", "payload"),
     ];
-    let mut progress = false;
-    for _ in 0..64 {
-        let candidate: Option<i64> = tx
-            .query_row(
-                "SELECT payload_id FROM semantic_release_candidate_payloads WHERE revision_id=?1 ORDER BY payload_id LIMIT 1",
-                [revision],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(payload) = candidate else {
-            return Ok(progress);
-        };
-        progress = true;
-        let named: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE payload_id=?1)",
-            [payload],
-            |r| r.get(0),
-        )?;
-        if !named {
-            // The key goes first: once collection starts no writer hit can reach the payload.
-            tx.execute(
-                "UPDATE semantic_payloads SET payload_key=NULL WHERE payload_id=?1 AND payload_key IS NOT NULL",
-                [payload],
-            )?;
-            for (table, filter) in CHILDREN.iter().chain(TAIL.iter()) {
-                let filter = if *filter == "payload" {
-                    "payload_id=?1"
-                } else {
-                    filter
-                };
-                let key = chunk_key(table);
-                let deleted = tx.execute(
-                    &format!("DELETE FROM {table} WHERE ({key}) IN (SELECT {key} FROM {table} WHERE {filter} LIMIT 256)"),
-                    [payload],
-                )?;
-                if deleted == 256 {
-                    return Ok(true);
-                }
-            }
-            tx.execute(
-                "DELETE FROM semantic_payloads WHERE payload_id=?1",
-                [payload],
-            )?;
-        }
-        tx.execute(
-            "DELETE FROM semantic_release_candidate_payloads WHERE revision_id=?1 AND payload_id=?2",
-            params![revision, payload],
-        )?;
+    let named: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE payload_id=?1)",
+        [payload],
+        |r| r.get(0),
+    )?;
+    if named {
+        return Ok(false);
     }
-    Ok(progress)
+    // The key goes first: once collection starts no writer hit can reach the payload.
+    tx.execute(
+        "UPDATE semantic_payloads SET payload_key=NULL WHERE payload_id=?1 AND payload_key IS NOT NULL",
+        [payload],
+    )?;
+    for (table, filter) in CHILDREN.iter().chain(TAIL.iter()) {
+        let filter = if *filter == "payload" {
+            "payload_id=?1"
+        } else {
+            filter
+        };
+        let key = chunk_key(table);
+        let deleted = tx.execute(
+            &format!("DELETE FROM {table} WHERE ({key}) IN (SELECT {key} FROM {table} WHERE {filter} LIMIT 256)"),
+            [payload],
+        )?;
+        if deleted == 256 {
+            return Ok(true);
+        }
+    }
+    tx.execute(
+        "DELETE FROM semantic_payloads WHERE payload_id=?1",
+        [payload],
+    )?;
+    Ok(false)
 }
 
 #[cfg(test)]

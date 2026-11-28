@@ -1,0 +1,216 @@
+{
+  "format": "trellis-semantic-search-reference-corpus/v1",
+  "issue": "https://github.com/SquashMerge/trellis/issues/1323",
+  "regenerated": "2026-11-27",
+  "method": "The #214 Python SentenceTransformer pipeline, regenerated with the original harness scripts, recovered verbatim from the #214 session record and committed under tools/semantic-search/reference/.",
+  "matchesPreLossPins": {
+    "identical": [
+      "results/cards.jsonl",
+      "eval/queries.json",
+      "scripts/evaluate.py",
+      "results/emb/voyage-4-nano.a.docs.npy",
+      "results/emb/voyage-4-nano.b.docs.npy",
+      "results/emb/voyage-4-nano.c.docs.npy",
+      "results/emb/voyage-4-nano.queries.npy"
+    ],
+    "changed": {
+      "results/eval.json": "Re-run for voyage-4-nano only. The lost file also held qwen3-embedding-0.6b, jina-v2-base-code and nomic-embed-text-v2-moe entries, which the parity check never reads; its voyage-4-nano and BM25 entries are computed by the same script from identical inputs."
+    }
+  },
+  "location": "A local evidence root outside Git, passed to check-parity.py as --evidence-root.",
+  "inputs": {
+    "sourceCommit": "693c32cb2d47a16cf69c8265ae7a1291b71fbd93",
+    "indexer": "release `trellis` built from the same commit: cargo build --locked --release --bin trellis (default features, Rust 1.99.1)",
+    "workspaceRoot": "The original #214 canonical workspace path, recorded only in local-manifest.json inside the evidence root.",
+    "workspaceRootNote": "`git archive` snapshot with no .git, so the source-set ID and every sid:v1 declaration ID hash the canonical root path. Re-index at the original canonical workspace path (create it, index, remove it); the index key must equal indexKey.",
+    "indexKey": "79e73f121e23a118631a8796a238a34aacb916c681fa4151f093237b382cd207",
+    "extractorVersion": "native-v6-delta-v1",
+    "indexRevision": 2,
+    "sourceSetId": "source-set:v1:path-79e73f121e23a118631a8796a238a34aacb916c681fa4151f093237b382cd207"
+  },
+  "cards": {
+    "path": "results/cards.jsonl",
+    "sha256": "4ca5a9d3588944094ad2e7ee12a454b60498a3ffff7783d78ee99cb4eb28abe0",
+    "count": 6722,
+    "orderedIdSha256": "87d8f149103449876e5bf781c20ed96f6d7ee2736c1b5eb538f7d20ede1db1dd",
+    "forms": [
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  "queries": {
+    "path": "eval/queries.json",
+    "sha256": "b4cf25fbfd7ba8b91c7c49f11a558de6defe4d78f22642a1ef9249eaa13e5e55",
+    "count": 50,
+    "orderedIdSha256": "7cbc016b8ab034ddca29ded94454cff6c2db555046b7ed98bd092a62cf97107f",
+    "sameBytesAs": "docs/semantic-search-eval/queries.json"
+  },
+  "scripts": {
+    "scripts/cards.py": "71384b41e2a689a93698939b7a89acaf1c9ccbcf87ac12941f911609da043fda",
+    "scripts/embed.py": "c3f185bb263eab10fac8cc9d33f80c2224cc25dc0257e7228cd93e6003cd1886",
+    "scripts/evaluate.py": "1a76389a368fc823c6ba68f1ac206ca345cc11cedb15179cc041798322e41b1d",
+    "scripts/download.py": "2d44038187ccdedd0700614f91ebc51e628de2159cfe54f187509706f20045e2"
+  },
+  "scriptsCommittedAt": "tools/semantic-search/reference/ (verbatim; byte-identical to the hashes above)",
+  "environment": {
+    "python": "3.12.14",
+    "resolution": "uv venv --python 3.12; uv pip install --exclude-newer 2026-10-19T19:33:00Z torch sentence-transformers transformers onnxruntime tokenizers numpy huggingface_hub, then einops",
+    "packages": {
+      "torch": "2.14.1",
+      "sentence-transformers": "6.1.0",
+      "transformers": "5.20.2",
+      "tokenizers": "0.23.3",
+      "numpy": "2.5.4",
+      "safetensors": "0.8.0",
+      "huggingface-hub": "1.33.0",
+      "einops": "0.8.2"
+    },
+    "lockFile": "requirements.lock.txt",
+    "lockSha256": "3d3f46f8533b72d559e55c1dae29922ff594b59ed6d907a89e9f5214e851f2c7",
+    "device": "mps",
+    "maxTokens": 512,
+    "batch": 16,
+    "order": "each form sorted by text length for encoding, then restored to card order"
+  },
+  "embeddings": {
+    "results/emb/voyage-4-nano.a.docs.npy": "4c80fc0658344ae5427427fc21186087edc0b235896502090ee3b874d4bc0c3d",
+    "results/emb/voyage-4-nano.b.docs.npy": "1e6757ed955de1d7b2816b98e2031b14f65dd8f1363a49bfe3938ad03a102529",
+    "results/emb/voyage-4-nano.c.docs.npy": "55de9fe1ca2aa0b42a5ddb23d67df2b6ca4a0cffbcedcf8a454e79e1865bb72f",
+    "results/emb/voyage-4-nano.queries.npy": "a42f4e5d9cbd6ccb65cd339dd2dff3addf099cd53ca504400f546139bf6efb3f"
+  },
+  "evaluation": {
+    "path": "results/eval.json",
+    "sha256": "78af93939d742974af8b2a4c5bf9b61aac2b24d0236f8f42908f6fe1adcf318f",
+    "models": [
+      "voyage-4-nano"
+    ],
+    "voyage-4-nano/c/vector": {
+      "recall@5": 0.44,
+      "recall@10": 0.56,
+      "mrr": 0.286,
+      "n": 50
+    }
+  },
+  "modelPinManifest": {
+    "path": "verified-download-manifest.json",
+    "sha256": "84605f14234fa5e0388a96127eea9bd4de91c6c9298a4d80872212ae1b3371be",
+    "content": {
+      "format": "trellis-semantic-search-model-pin/v1",
+      "model": "voyageai/voyage-4-nano",
+      "license": "Apache-2.0",
+      "reference": {
+        "role": "Python SentenceTransformer reference embedding (#214 method, regenerated for #1323)",
+        "revision": "433ece5e27a1611e9360dd7134ecaaf79fb3681d",
+        "source": "huggingface_hub.snapshot_download(repo_id, revision) via scripts/download.py",
+        "files": {
+          "1_Pooling/config.json": {
+            "sha256": "2bc529695125f68de57d1fd347e3d2920b993bc635c5f4f09a45e130c102a989",
+            "bytes": 313
+          },
+          "LICENSE.txt": {
+            "sha256": "6128fb091df68c86035ebf80fde97956e9126c47ad90c19631f34cd98afbfe6c",
+            "bytes": 11343
+          },
+          "NOTICE.txt": {
+            "sha256": "f30cf8ced2476cbd4ddea495156f33deaf1c2245c5bed0ea46dab895c3aa59d5",
+            "bytes": 797
+          },
+          "README.md": {
+            "sha256": "f7b71804663ba2b34b372bac4ddc4e0342a5aa8818fd9ef9daff3f9a59f9944a",
+            "bytes": 9889
+          },
+          "config.json": {
+            "sha256": "bcba1ed5644d9bc592aa6bf0e36e11c6642294b5aef0fe65fdc2d0c8cf098cae",
+            "bytes": 1041
+          },
+          "config_sentence_transformers.json": {
+            "sha256": "4b0f3b9dea0ccb018b705084289d09ad1c4a02ddd277bf2e80bde9887539ef08",
+            "bytes": 378
+          },
+          "docs/MongoDB_Spring-Green.svg": {
+            "sha256": "6441c0c4027760a21d8e6e8d87ff045694af433109f3c148f0319ae4e9537566",
+            "bytes": 11382
+          },
+          "merges.txt": {
+            "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+            "bytes": 1671839
+          },
+          "model.safetensors": {
+            "sha256": "3dae0c63c81dcab79ac213af331940a1bf2b8a53ec8646be878552890291ad30",
+            "bytes": 692919112
+          },
+          "modeling_qwen3_bidirectional.py": {
+            "sha256": "425304da2571d17bf04add3b70fab46d4b7d4466abbe118ef553ccb6fe8fadfe",
+            "bytes": 3491
+          },
+          "modules.json": {
+            "sha256": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+            "bytes": 349
+          },
+          "sentence_bert_config.json": {
+            "sha256": "ae8658c7cf91db1a3ceee800af0f9bda2c7ad60a88b5c2b4d6d5cb0a4394c9c1",
+            "bytes": 59
+          },
+          "tokenizer.json": {
+            "sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+            "bytes": 7031645
+          },
+          "tokenizer_config.json": {
+            "sha256": "58c4abbc36eeccd8b3c8453f262225e8f2803855c88790760b618f4cd9e43be9",
+            "bytes": 7228
+          },
+          "vocab.json": {
+            "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+            "bytes": 2776833
+          }
+        }
+      },
+      "candleRuntime": {
+        "role": "Candle parity candidate model directory",
+        "revision": "5fb34e870f49f19e79c94d5e118f5ee730133279",
+        "files": {
+          "1_Pooling/config.json": {
+            "sha256": "2bc529695125f68de57d1fd347e3d2920b993bc635c5f4f09a45e130c102a989",
+            "bytes": 313
+          },
+          "config.json": {
+            "sha256": "bcba1ed5644d9bc592aa6bf0e36e11c6642294b5aef0fe65fdc2d0c8cf098cae",
+            "bytes": 1041
+          },
+          "config_sentence_transformers.json": {
+            "sha256": "4b0f3b9dea0ccb018b705084289d09ad1c4a02ddd277bf2e80bde9887539ef08",
+            "bytes": 378
+          },
+          "model.safetensors": {
+            "sha256": "3dae0c63c81dcab79ac213af331940a1bf2b8a53ec8646be878552890291ad30",
+            "bytes": 692919112
+          },
+          "modeling_qwen3_bidirectional.py": {
+            "sha256": "425304da2571d17bf04add3b70fab46d4b7d4466abbe118ef553ccb6fe8fadfe",
+            "bytes": 3491
+          },
+          "modules.json": {
+            "sha256": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+            "bytes": 349
+          },
+          "sentence_bert_config.json": {
+            "sha256": "ae8658c7cf91db1a3ceee800af0f9bda2c7ad60a88b5c2b4d6d5cb0a4394c9c1",
+            "bytes": 59
+          },
+          "tokenizer.json": {
+            "sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+            "bytes": 7031645
+          },
+          "tokenizer_config.json": {
+            "sha256": "58c4abbc36eeccd8b3c8453f262225e8f2803855c88790760b618f4cd9e43be9",
+            "bytes": 7228
+          }
+        }
+      },
+      "weightSha256": "3dae0c63c81dcab79ac213af331940a1bf2b8a53ec8646be878552890291ad30",
+      "runtimeFilesIdenticalToReferenceSnapshot": true,
+      "note": "Every file in the Candle runtime directory is byte-identical to the evaluation snapshot; the snapshot adds README/LICENSE/NOTICE/docs/vocab/merges only."
+    }
+  }
+}
