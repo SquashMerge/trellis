@@ -143,6 +143,153 @@ fn client_paths(client: &str) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn aiohttp_registration_patterns_extract_every_supported_verb() {
+    for method in ["get", "post", "put", "patch", "delete", "head"] {
+        for registration in [
+            format!("app.router.add_{method}(\"/items/{{id}}\", handler)"),
+            format!("router.add_{method}(path=\"/items/{{id}}\", handler=handler)"),
+            format!(
+                "app.router.add_route(\"{}\", \"/items/{{id}}\", handler)",
+                method.to_uppercase()
+            ),
+            format!("app.add_routes([web.{method}(\"/items/{{id}}\", handler)])"),
+            format!("@routes.{method}(\"/items/{{id}}\")\nasync def handler(request):\n    pass"),
+        ] {
+            let definition = if registration.starts_with('@') {
+                ""
+            } else {
+                "async def handler(request):\n    pass\n"
+            };
+            let source = format!(
+                "from aiohttp import web\napp = web.Application()\nrouter = app.router\nroutes = web.RouteTableDef()\n{definition}{registration}\n"
+            );
+            assert_eq!(
+                routes(&[("svc/app.py", &source)]),
+                [format!(
+                    "{} /items/{{id}} <- svc/app.py:handler",
+                    method.to_uppercase()
+                )],
+                "{registration}"
+            );
+        }
+    }
+    let source = "from aiohttp import web\napp = web.Application()\nasync def handler(request): pass\napp.router.add_route(method=\"OPTIONS\", path=\"/options\", handler=handler)\n";
+    assert_eq!(
+        routes(&[("svc/app.py", source)]),
+        ["OPTIONS /options <- svc/app.py:handler"]
+    );
+}
+
+#[test]
+fn aiohttp_import_aliases_preserve_binding_evidence() {
+    for (imports, application, get, table) in [
+        (
+            "from aiohttp import web as aw",
+            "aw.Application",
+            "aw.get",
+            "aw.RouteTableDef",
+        ),
+        (
+            "import aiohttp.web as aw",
+            "aw.Application",
+            "aw.get",
+            "aw.RouteTableDef",
+        ),
+        (
+            "import aiohttp",
+            "aiohttp.web.Application",
+            "aiohttp.web.get",
+            "aiohttp.web.RouteTableDef",
+        ),
+        (
+            "from aiohttp.web import Application as App, get as route, RouteTableDef as Table",
+            "App",
+            "route",
+            "Table",
+        ),
+    ] {
+        let source = format!(
+            "{imports}\nservice = {application}()\nregistry = {table}()\nasync def handler(request): pass\nservice.add_routes([{get}(\"/list\", handler)])\n@registry.post(\"/decorated\")\nasync def create(request): pass\n"
+        );
+        assert_eq!(
+            routes(&[("svc/app.py", &source)]),
+            [
+                "GET /list <- svc/app.py:handler",
+                "POST /decorated <- svc/app.py:create",
+            ],
+            "{imports}"
+        );
+    }
+}
+
+#[test]
+fn aiohttp_router_variables_can_be_imported_from_an_evidenced_application() {
+    assert_eq!(
+        routes(&[
+            (
+                "svc/app.py",
+                "from aiohttp import web\nservice = web.Application()\nrouter = service.router\n"
+            ),
+            (
+                "svc/registration.py",
+                "from .app import router as registry\nasync def handler(request): pass\nregistry.add_post(\"/imported\", handler)\n"
+            ),
+        ]),
+        ["POST /imported <- svc/registration.py:handler"]
+    );
+}
+
+#[test]
+fn aiohttp_unproven_receivers_and_dynamic_arguments_register_nothing() {
+    let prelude = "from aiohttp import web\napp = web.Application()\nroutes = web.RouteTableDef()\nasync def handler(request): pass\n";
+    for invalid in [
+        "data = {}\ndata.get(\"/dict\", handler)",
+        "app.add_route(\"GET\", \"/not-router\", handler)",
+        "router = unknown.router\nrouter.add_get(\"/unknown\", handler)",
+        "router = app.other\nrouter.add_post(\"/other\", handler)",
+        "router = {}\nrouter.add_route(\"GET\", \"/dict\", handler)",
+        "def register(router):\n    router.add_get(\"/param\", handler)",
+        "app.router.add_get(path, handler)",
+        "app.router.add_route(method, \"/dynamic\", handler)",
+        "app.router.add_route(\"FETCH\", \"/unsupported\", handler)",
+        "app.router.add_route(\"GET\", path, handler)",
+        "app.add_routes([web.get(path, handler)])",
+        "app.add_routes([other.get(\"/other\", handler)])",
+        "other.add_routes([web.get(\"/other\", handler)])",
+        "@routes.get(path)\nasync def dynamic(request): pass",
+        "@unknown.get(\"/unknown\")\nasync def unknown_handler(request): pass",
+        "web = fake\napp.add_routes([web.get(\"/rebound\", handler)])",
+        "app = fake\napp.router.add_get(\"/rebound\", handler)",
+        "routes = fake\n@routes.get(\"/rebound\")\nasync def rebound(request): pass",
+    ] {
+        let source = format!("{prelude}{invalid}\n");
+        assert!(routes(&[("svc/app.py", &source)]).is_empty(), "{invalid}");
+    }
+    let fake = "from other import web\napp = web.Application()\nroutes = web.RouteTableDef()\nasync def handler(request): pass\napp.router.add_get(\"/fake\", handler)\napp.add_routes([web.get(\"/fake-list\", handler)])\n@routes.get(\"/fake-decorator\")\nasync def fake_handler(request): pass\n";
+    assert!(routes(&[("svc/app.py", fake)]).is_empty());
+}
+
+#[test]
+fn aiohttp_parameterized_routes_match_client_calls_end_to_end() {
+    assert_eq!(
+        calls(&[
+            (
+                "svc/app.py",
+                "from aiohttp import web\napp = web.Application()\nasync def item(request): pass\napp.router.add_get(\"/items/{item_id}\", item)\n"
+            ),
+            (
+                "cli/client.py",
+                "import requests\ndef run(item_id):\n    requests.get(f\"http://localhost/items/{item_id}\")\n    requests.get(\"http://localhost/items/42\")\n"
+            ),
+        ]),
+        [
+            "GET /items/{} -> /items/{item_id} Template",
+            "GET /items/42 -> /items/{item_id} Template",
+        ]
+    );
+}
+
 const FLASK_APP: &str = r#"
 from flask import Flask
 from .users import users
