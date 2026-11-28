@@ -984,8 +984,6 @@ impl std::io::Write for EncodedSourceBudget {
 pub(crate) struct ArchitectureByteLimits {
     /// One document's captured source.
     pub(crate) document: u64,
-    /// All admitted captured source, plus present retained-manifest and root-config bytes.
-    pub(crate) source: u64,
     /// All stored bytes the read charges: each document's source and the native rows the read
     /// decodes, plus the retained dependency and config inputs (owner ruling 2026-11-26,
     /// #1321). Rows the read never decodes (references, class rows, capability, macro and
@@ -1002,8 +1000,7 @@ thread_local! {
 impl ArchitectureByteLimits {
     pub(crate) const READ_A: Self = Self {
         document: 2 * 1024 * 1024,
-        source: 256 * 1024 * 1024,
-        stored: 512 * 1024 * 1024,
+        stored: 2 * 1024 * 1024 * 1024,
     };
 
     /// The limits a read on this thread applies: [`Self::READ_A`], or a test's own.
@@ -1035,15 +1032,6 @@ impl ArchitectureByteLimits {
         )
     }
 
-    fn check_source(self, total: u64) -> Result<()> {
-        ensure!(
-            total <= self.source,
-            "bounded_work: architecture source total: {total} bytes, over the {} limit",
-            limit_text(self.source)
-        );
-        Ok(())
-    }
-
     fn check_stored(self, total: u64) -> Result<()> {
         ensure!(
             total <= self.stored,
@@ -1064,10 +1052,13 @@ impl ArchitectureByteLimits {
     }
 }
 
-/// `512 MiB` for a whole number of MiB, else `100-byte`.
+/// `2 GiB` or `512 MiB` for a whole number of either, else `100-byte`.
 fn limit_text(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
-    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes}-byte")
@@ -2059,11 +2050,10 @@ impl EvidenceResponse {
         let mut evidence_gaps = BTreeMap::new();
         let mut unparsed = BTreeSet::new();
         let mut pending = Vec::new();
-        let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
-        // A refusal names the limit it hit and the whole revision's total (#1321). Once a total
-        // is over its limit the read can only fail: it frees the rows it fetched, fetches no
-        // more, and charges the remaining documents' sizes for the total it reports.
+        // A refusal names the limit it hit and the whole revision's total (#1321). Once the
+        // stored total is over its limit the read can only fail: it frees the rows it fetched,
+        // fetches no more, and charges the remaining documents' sizes for the total it reports.
         let limits = ArchitectureByteLimits::current();
         let mut over = false;
         let mut documents_seen = 0usize;
@@ -2145,9 +2135,8 @@ impl EvidenceResponse {
             if document_bytes > limits.document {
                 return Err(limits.document_refusal(&key.path, document_bytes));
             }
-            source_bytes = source_bytes.saturating_add(document_bytes);
             stored_bytes = stored_bytes.saturating_add(stored);
-            if !over && (source_bytes > limits.source || stored_bytes > limits.stored) {
+            if !over && stored_bytes > limits.stored {
                 over = true;
                 pending = Vec::new();
                 tables = Vec::new();
@@ -2225,7 +2214,6 @@ impl EvidenceResponse {
             let length = u64::try_from(length).context(SelectedIntegrity(corrupt.into()))?;
             stored_bytes = stored_bytes.saturating_add(length);
         }
-        limits.check_source(source_bytes)?;
         limits.check_stored(stored_bytes)?;
         // SQLite reads stay on this connection; decoding needs no connection, so
         // it runs in parallel. The first decode failure in document order is reported.
@@ -2354,9 +2342,7 @@ impl EvidenceResponse {
                 RetainedInput::Present {
                     bytes, byte_length, ..
                 } => {
-                    source_bytes = source_bytes.saturating_add(byte_length);
                     ArchitectureByteLimits::check_retained(path, byte_length)?;
-                    limits.check_source(source_bytes)?;
                     selected_ensure!(
                         byte_length.checked_mul(2) == Some(bytes.len() as u64),
                         "incompatible_index: corrupt retained {} length",
@@ -2462,9 +2448,7 @@ impl EvidenceResponse {
             if path == "jsconfig.json" && root_tsconfig.is_some() {
                 continue;
             }
-            source_bytes = source_bytes.saturating_add(byte_length);
             ArchitectureByteLimits::check_retained(path, byte_length)?;
-            limits.check_source(source_bytes)?;
             selected_ensure!(
                 byte_length.checked_mul(2) == Some(bytes.len() as u64),
                 "incompatible_index: corrupt retained {} length",

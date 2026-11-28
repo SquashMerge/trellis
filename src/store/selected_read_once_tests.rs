@@ -381,37 +381,6 @@ fn read_a_under(store: &Store, limits: ArchitectureByteLimits) -> (Result<()>, S
 }
 
 #[test]
-fn architecture_read_a_names_the_source_total_it_exceeds() {
-    // #1321: the total is the whole revision's, not the sum where the limit was crossed.
-    let (_state, root, store) = published_store(3);
-    let total: u64 = (0..3)
-        .map(|n| {
-            fs::metadata(root.path().join(format!("f{n}.js")))
-                .unwrap()
-                .len()
-        })
-        .sum();
-    let limits = ArchitectureByteLimits {
-        source: total - 1,
-        ..ArchitectureByteLimits::READ_A
-    };
-    let (read, counts) = read_a_under(&store, limits);
-    assert_eq!(
-        read.unwrap_err().to_string(),
-        format!(
-            "bounded_work: architecture source total: {total} bytes, over the {}-byte limit",
-            total - 1
-        )
-    );
-    assert_eq!(counts.document_reads, 3, "every header is read");
-    let limits = ArchitectureByteLimits {
-        source: total,
-        ..ArchitectureByteLimits::READ_A
-    };
-    read_a_under(&store, limits).0.unwrap();
-}
-
-#[test]
 fn architecture_read_a_names_the_stored_total_it_exceeds() {
     // #1321: the whole revision's stored total, whichever document crossed the limit.
     let (_state, _root, store) = published_store(3);
@@ -501,4 +470,12 @@ fn architecture_read_a_charges_only_the_rows_it_decodes() {
     assert_eq!(charged, decoded + retained as u64);
     // A limit at that total admits the revision, below what every row would charge.
     read_a_under(&store, stored_limit(charged)).0.unwrap();
+}
+
+#[test]
+fn architecture_byte_limits_name_whole_gib_and_mib() {
+    // #1321: the stored total is 2 GiB (owner ruling 2026-11-26), and its refusal says so.
+    assert_eq!(limit_text(ArchitectureByteLimits::READ_A.stored), "2 GiB");
+    assert_eq!(limit_text(ArchitectureByteLimits::READ_A.document), "2 MiB");
+    assert_eq!(limit_text(100), "100-byte");
 }

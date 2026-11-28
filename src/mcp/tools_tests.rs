@@ -1177,7 +1177,7 @@ fn spec_table_names_are_the_catalog_names() {
 /// value, as `input_bounds_exceeded` names its bound (#1119 follow-up).
 #[test]
 fn bounded_work_names_its_bound() {
-    let bound = "architecture stored total: 672452376 bytes, over the 512 MiB limit";
+    let bound = "architecture stored total: 2400000000 bytes, over the 2 GiB limit";
     let error = anyhow::anyhow!("bounded_work: {bound}");
     let named = format!("Architecture projection work bound exceeded: {bound}");
     let envelope = crate::mcp::architecture::failure(&json!(7), &error);
