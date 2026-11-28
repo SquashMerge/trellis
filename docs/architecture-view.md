@@ -1108,7 +1108,8 @@ comparison and final publication.
 A build accounts for references and prepares declaration rules for the whole revision, under the
 existing budgets; layer-edge and exception work is charged per read, on the references that
 read selects. A revision over those budgets fails `bounded_work` for the summary, details and
-unscoped reads. A path-scoped MCP or CLI read then computes on the request: it reads the
+unscoped reads; the browser answer is 503 with code `bounded_work` and a message that names the
+bound and, for the snapshot's byte bounds, the observed value (#1321). A path-scoped MCP or CLI read then computes on the request: it reads the
 revision itself, resolves references and evaluates rules only for its own paths, and answers
 under the budgets of that scope and its usual deadline. That read holds a read transaction
 while it computes. If it cannot finish in time it fails `deadline_exceeded`, which is retryable.

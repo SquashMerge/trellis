@@ -186,7 +186,7 @@ pub fn failure(id: &Value, error: &anyhow::Error) -> Value {
             .find(|code| message.starts_with(code))
             .unwrap_or_else(|| super::evidence_failure_code(error))
     };
-    let mut envelope = super::tools::failure(id, code);
+    let mut envelope = super::tools::failure_for(id, code, error);
     if let Some(diagnostic) = diagnostic {
         envelope["error"]["diagnostic"] = diagnostic;
     }
