@@ -51,6 +51,9 @@ paths = [
   # per-revision core, the Architecture operations and the metrics projection, with the tests
   # that moved with them. Storage keeps the read they start from.
   "src/architecture_core.rs", "src/architecture_read.rs", "src/architecture_read_apps_tests.rs",
+  # The core's submodules, such as its dependency projection (#1308), are query code with it
+  # (#1393).
+  "src/architecture_core/**",
   "src/metrics_read.rs", "src/metrics_read_parallel_tests.rs",
   # The Sequence, graph and navigation reads, moved up from storage (S6, #1048): the snapshot
   # graph source and Sequence enrichment, the Sequence boundary hops, and the read bodies and
@@ -175,6 +178,11 @@ paths = [
   # model and native records. Storage builds them for one revision; the references read
   # (query) takes them in and re-exports them at their old paths.
   "src/architecture_inputs.rs",
+  # The admitted input identities storage computes and the Architecture core compares
+  # (#1393): the typed fingerprint encoding, the semantic-input, producer-projection and
+  # syntax-ID digests, and the semantic read charges. Pure over shared records, no I/O;
+  # moved out of src/architecture_core/dependencies.rs (query).
+  "src/architecture_identity.rs",
   # The producer selection and call-binding core (S12, #997): the per-language default
   # producers and their notes (#483), the snapshot facts and the `GraphSource` trait the
   # call graph reads through, and `call_disposition`, the binding selection (#466). Pure

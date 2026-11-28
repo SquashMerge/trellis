@@ -15,11 +15,11 @@ Only first-party references are counted. `rules check` gives every instance a
 with an `externalPackage` destination are left out of every figure, so a new
 `import json` in a tool changes nothing here.
 
-The run fails when deviating pairs, deviating references or partial files rise above
-the record, and when a deviating pair is measured that the record does not have. It also
-fails on lost coverage, as spec G1 words it, decided per pair (#1140): a recorded pair
-has fewer deviating references than recorded, or is gone, and its source file has more
-unknown references than recorded for that file. That is what a deviating reference
+The run fails when deviating pairs, deviating references, partial files or unlayered
+files rise above the record, and when a deviating pair is measured that the record does
+not have. It also fails on lost coverage, as spec G1 words it, decided per pair (#1140):
+a recorded pair has fewer deviating references than recorded, or is gone, and its source
+file has more unknown references than recorded for that file. That is what a deviating reference
 that became unresolvable instead of being fixed looks like; the check compares counts
 and does not prove it is the same reference. Unknown references are the references of
 the instances whose status is `unknown`; each has a source file, the instance's `target`.
@@ -27,6 +27,12 @@ Any other rise in unknown references is only a notice: they are over a third of 
 population's references, so ordinary new code raises them. The record keeps the
 deviating references of each pair and the unknown references of each of those pairs'
 source files for this comparison.
+
+An unlayered file is a source file of the population that the payload's `unassigned`
+list names: no layer of `.trellis/rules.toml` covers it (#1393). A null `sourceLayer`
+is not that signal, since declaration-rule instances have none. Every reference from it is
+unknown, so without this figure a file left out of the layers is only a rise in unknown
+references. The failure names each such file.
 
 Excepted pairs, the pairs a reviewed `[[exceptions]]` entry of `.trellis/rules.toml`
 approves, are in no total, but their source files are checked for lost coverage too
@@ -65,8 +71,8 @@ producers `ready`; otherwise it prints a notice and exits 0. The nightly job pas
 
 Exit status: 0, the record holds (or the run was not made, without
 `--require-producers`); 1, the measurement is worse than the record: deviations rose,
-more files are partial, or coverage was lost (or `--update` refused to rewrite the
-record); 3, no comparison was made: a producer is missing or failed, the build, the
+more files are partial or have no layer, or coverage was lost (or `--update` refused to
+rewrite the record); 3, no comparison was made: a producer is missing or failed, the build, the
 daemon or the index failed, the record or the binary is missing or unreadable, the
 cleanup failed, or anything else went wrong. An exit of 3 says nothing about the
 layering. 2 is a usage error.
@@ -96,7 +102,8 @@ RECORD = ROOT / "docs/refactoring/0.2.x/rules-ratchet.json"
 PRODUCERS = (("rust-analyzer", "trusted"), ("scip-typescript", "restricted"))
 # Record keys, in file order. A rise in any of RATCHETED fails; the pair totals after
 # them describe the population and are information only.
-RATCHETED = ("deviatingPairs", "deviatingReferences", "unknownReferences", "partialFiles")
+RATCHETED = ("deviatingPairs", "deviatingReferences", "unknownReferences", "partialFiles",
+             "unlayeredFiles")
 KEYS = (*RATCHETED, "comparablePairs", "conformingPairs", "unknownPairs")
 # What the per-pair comparison needs (#1140): the deviating references of each pair, as
 # {source path: {destination path: references}}, the same for each excepted pair (#1211),
@@ -104,10 +111,13 @@ KEYS = (*RATCHETED, "comparablePairs", "conformingPairs", "unknownPairs")
 # record keeps the last only for the sources of its deviating and excepted pairs.
 BY_PAIR, EXCEPTED = "deviatingReferencesByPair", "exceptedReferencesByPair"
 BY_SOURCE = "unknownReferencesBySource"
+# The paths of the unlayered files, which a measurement has so a failure can name them;
+# the record keeps only their number (#1393).
+UNLAYERED = "unlayeredPaths"
 # The pair maps the per-pair lost-coverage rule reads, each with how a line names it.
 PAIR_MAPS = ((BY_PAIR, "deviating references", ""),
              (EXCEPTED, "excepted references", " (excepted)"))
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # What the record's figures count and how they were measured, written into the record
 # so it can be read without this script.
 DESCRIPTION = {
@@ -120,9 +130,9 @@ DESCRIPTION = {
                   "templates, tools/synthetic-cohorts/templates/{small,medium,large}/"
                   "{java.java,javascript.js,python.py,rust.rs}: they are fixtures, not "
                   "product code (owner ruling 2026-11-19, #1236).",
-    "rule": "A run fails when deviatingPairs, deviatingReferences or partialFiles is "
-            "above this record, or when it measures a deviating pair that is not in "
-            "deviatingReferencesByPair. It also fails as lost coverage, decided per "
+    "rule": "A run fails when deviatingPairs, deviatingReferences, partialFiles or "
+            "unlayeredFiles is above this record, or when it measures a deviating pair "
+            "that is not in deviatingReferencesByPair. It also fails as lost coverage, decided per "
             "pair: a pair in deviatingReferencesByPair or exceptedReferencesByPair "
             "(source path, then destination path) has fewer references than that map "
             "records for it, or is gone from it, while its source file has more "
@@ -134,7 +144,9 @@ DESCRIPTION = {
             "instance with status deviates, a pair a reviewed exception in "
             ".trellis/rules.toml approves, which no total counts; "
             "unknownReferencesBySource is the unknown sum for each source file of a "
-            "recorded deviating or excepted pair. Pairs are compared by path "
+            "recorded deviating or excepted pair. unlayeredFiles is the number of the "
+            "population's source files that the payload's unassigned list names, files "
+            "no layer of .trellis/rules.toml covers (#1393). Pairs are compared by path "
             "and renames are not detected: a deviating pair whose source or "
             "destination file was renamed, split or merged is a pair this record does "
             "not have, so the run fails until the record is updated, and the pair "
@@ -256,6 +268,11 @@ def summarize(payload):
     first_party = [row for row in internal if not is_template(row)]
     deviating, unknown = having(first_party, "deviates"), having(first_party, "unknown")
     excepted = [row for row in first_party if row["status"] == "deviates" and row["excepted"]]
+    # A null sourceLayer does not say a file is unmapped: declaration-rule instances carry
+    # none on any file. The tool's own list of the modules no layer covers does.
+    unassigned = {each["path"] for each in payload["unassigned"]
+                  if each.get("kind") != "externalPackage"}
+    unlayered = sorted({row["target"]["path"] for row in first_party} & unassigned)
     by_pair, by_excepted, by_source = {}, {}, {}
     for rows, into in ((deviating, by_pair), (excepted, by_excepted)):
         for row in rows:
@@ -270,12 +287,14 @@ def summarize(payload):
         "deviatingReferences": sum(row["referenceCount"] for row in deviating),
         "unknownReferences": sum(row["referenceCount"] for row in unknown),
         "partialFiles": len(payload["partialFiles"]),
+        "unlayeredFiles": len(unlayered),
         "comparablePairs": len(first_party),
         "conformingPairs": len(having(first_party, "conforms")),
         "unknownPairs": len(unknown),
         BY_PAIR: by_pair,
         EXCEPTED: by_excepted,
         BY_SOURCE: by_source,
+        UNLAYERED: unlayered,
     }, (len(instances) - len(internal), len(internal) - len(first_party))
 
 
@@ -331,9 +350,9 @@ def unknown_change(record, measured):
 def compare(record, measured):
     """Returns (verdict, lines); verdict is `fail`, `lower` or `equal`.
 
-    A rise in deviating pairs, deviating references or partial files fails, and so does
-    a deviating pair the record does not have. So does lost coverage: a recorded
-    deviating or excepted pair with fewer references and more unknown references from
+    A rise in deviating pairs, deviating references, partial files or unlayered files
+    fails, and so does a deviating pair the record does not have. So does lost coverage:
+    a recorded deviating or excepted pair with fewer references and more unknown references from
     its source file. Any other rise in unknown references is a notice, as is any other
     difference, in an excepted pair too. Pair totals never fail: they move when a file
     is split, merged, renamed or deleted.
@@ -347,8 +366,9 @@ def compare(record, measured):
               for (source, destination), references in sorted(now.items())
               if (source, destination) not in before]
     partial = measured["partialFiles"] > record["partialFiles"]
+    unlayered = measured["unlayeredFiles"] > record["unlayeredFiles"]
     lost = lost_coverage(record, measured)
-    if rises or partial or lost:
+    if rises or partial or unlayered or lost:
         lines = []
         if rises:
             lines.append("rules ratchet FAILED: deviations rose")
@@ -356,13 +376,19 @@ def compare(record, measured):
         if partial:
             lines.append("rules ratchet FAILED: more files are partial")
             lines.append(f"  {change('partialFiles')}")
+        if unlayered:
+            lines.append("rules ratchet FAILED: source files have no layer")
+            lines.append(f"  {change('unlayeredFiles')}")
+            lines += [f"  no layer of .trellis/rules.toml covers {path}"
+                      for path in measured[UNLAYERED]]
         if lost:
             lines.append("rules ratchet FAILED: the comparison population lost coverage: "
                          "fewer deviating or excepted references in a pair on more "
                          "unknown references from its source file")
             lines += [f"  {line}" for line in lost]
-        lines.append("  Remove the added deviation or restore the coverage. A reviewed "
-                     f"re-baseline or exception updates the record explicitly: {UPDATE}")
+        lines.append("  Remove the added deviation, map the file to a layer or restore the "
+                     "coverage. A reviewed re-baseline or exception updates the record "
+                     f"explicitly: {UPDATE}")
         return "fail", lines
     if recorded(measured) != recorded(record):
         lines = ["rules ratchet NOTICE: the record can be updated"]
