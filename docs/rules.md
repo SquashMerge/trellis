@@ -1483,7 +1483,8 @@ never parses it, and reads on: the revision is not refused. `range` is the whole
 `subtrees` is 0, and every rule above for a source that wasn't read applies.
 
 Reference work has one request-wide allowance of
-`min(100_000_000, 5_000_000 + 20_000*N + 512*K)` units. Rules use a separate
+`min(100_000_000, 6_250_000 + 25_000*N + 640*K)` units: 1.25 times the earlier
+`5_000_000 + 20_000*N + 512*K` (owner ruling 2026-11-27, #1359, option A). Rules use a separate
 allowance of `min(50_000_000, 5_000_000 + 10_000*N + 256*K)` units, shared by
 layer assignment, exact glob comparisons, declaration evaluation and evidence.
 `N` counts all admitted source documents, including empty documents and

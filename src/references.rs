@@ -562,52 +562,48 @@ fn resolve_keeping(
     let early: Early = (0..docs.len())
         .map(|_| std::sync::Mutex::new(None))
         .collect();
-    let built =
-        if lanes.len() == 1 {
-            let read = ReadContext {
-                snapshot,
-                docs: &docs,
-                trees: &trees,
-                document_map: &document_map,
-                selected: &selected,
-                sample_limit,
-                workers,
-                request,
-            };
-            build_catalogs(read, limit, rust_source, check)?
-        } else {
-            let read = ReadContext {
-                snapshot,
-                docs: &docs,
-                trees: &[],
-                document_map: &document_map,
-                selected: &selected,
-                sample_limit,
-                workers,
-                request,
-            };
-            let (built, placeholders) =
-                catalogs_in_lanes(
-                    read,
-                    &lanes,
-                    limit,
-                    rust_source,
-                    &|i| {
-                        let (tree, gap) = parse(docs[i])?;
-                        if is_selected[i] {
-                            *early[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(
-                                prepare_file(i, docs[i], &tree, limit, &mut request.worker()),
-                            );
-                        }
-                        Ok(Some((tree, gap)))
-                    },
-                    &|_| false,
-                    &mut gaps,
-                    check,
-                )?;
-            trees = placeholders;
-            built
+    let built = if lanes.len() == 1 {
+        let read = ReadContext {
+            snapshot,
+            docs: &docs,
+            trees: &trees,
+            document_map: &document_map,
+            selected: &selected,
+            sample_limit,
+            workers,
+            request,
         };
+        build_catalogs(read, limit, rust_source, check)?
+    } else {
+        let read = ReadContext {
+            snapshot,
+            docs: &docs,
+            trees: &[],
+            document_map: &document_map,
+            selected: &selected,
+            sample_limit,
+            workers,
+            request,
+        };
+        let (built, placeholders) = catalogs_in_lanes(
+            read,
+            &lanes,
+            limit,
+            rust_source,
+            &|i| parse(docs[i]).map(Some),
+            Some(&|i, tree| {
+                if is_selected[i] {
+                    *early[i].lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(prepare_file(i, docs[i], tree, limit, &mut request.worker()));
+                }
+            }),
+            &|_| false,
+            &mut gaps,
+            check,
+        )?;
+        trees = placeholders;
+        built
+    };
     let (mut catalogs, prepared) = built.context("store_unavailable: fresh Rust catalog")?;
     // Every snapshot document feeds resolution, so path filters do not narrow this list.
     let partial_files: Vec<_> = docs
@@ -1144,6 +1140,9 @@ fn lanes(docs: &[&DocumentInput], parsed: impl Fn(usize) -> bool) -> Vec<Vec<u8>
     lanes
 }
 
+/// What a lane does with each document's tree while its catalogs are built (#1321).
+type LanePrepare<'p> = dyn Fn(usize, &Tree) + Sync + 'p;
+
 /// Parse and build the catalogs lane by lane (#1321), each lane's syntax dropped once its
 /// catalogs are built, except the trees `keep` names. Returns the catalogs (or `None` for a
 /// declined kept Rust catalog), every document's tree (a placeholder unless kept) and gap.
@@ -1154,6 +1153,7 @@ fn catalogs_in_lanes(
     limit: usize,
     rust_source: RustSource<'_>,
     parse: &(dyn Fn(usize) -> Result<Option<(Tree, Option<syntax_bounds::SyntaxGap>)>> + Sync),
+    prepare: Option<&LanePrepare<'_>>,
     keep: &(dyn Fn(usize) -> bool + Sync),
     gaps: &mut [Option<syntax_bounds::SyntaxGap>],
     check: &mut impl FnMut() -> Result<()>,
@@ -1174,16 +1174,30 @@ fn catalogs_in_lanes(
                 gaps[i] = gap;
             }
         }
-        let built = map_batch(lane, read.workers, read.request, |&language| {
-            build_catalog(
-                language,
-                ReadContext {
-                    trees: &trees,
-                    ..read
-                },
-                limit,
-                rust_source,
-            )
+        // A lane's catalogs are built while its sources are prepared: both only read its
+        // trees, and a catalog build leaves most workers idle.
+        let built = std::thread::scope(|scope| {
+            let trees = &trees;
+            let members = &members;
+            let preparing = prepare.map(|prepare| {
+                scope.spawn(move || {
+                    crate::parallel::map_ordered(
+                        members,
+                        read.workers,
+                        &read.request.stopped,
+                        |_, &i| prepare(i, &trees[i]),
+                    );
+                })
+            });
+            let built = map_batch(lane, read.workers, read.request, |&language| {
+                build_catalog(language, ReadContext { trees, ..read }, limit, rust_source)
+            });
+            if let Some(preparing) = preparing {
+                preparing
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("store_unavailable: reference preparation"))?;
+            }
+            built
         })?;
         for (&language, job) in lane.iter().zip(built) {
             jobs[usize::from(language)] = Some(job);
