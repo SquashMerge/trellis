@@ -3994,6 +3994,68 @@ fn rules_check_json_per_app_and_cross_app_exit_zero() {
     assert_eq!(payload["noApp"]["counts"], payload["counts"]);
 }
 
+/// #1131 review: a plain references read follows the current rules file's specifier mappings.
+/// After the daemon has published a core with `web:` mapped, an invalid edit of the rules
+/// file at the same pin maps nothing, as a missing file does.
+#[test]
+fn references_follow_the_current_specifier_mappings_after_an_invalid_rules_edit() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(
+        root.join("a/main.js"),
+        "import lib from \"web:lib\";\nlib();\n",
+    )
+    .unwrap();
+    fs::write(root.join("b/lib.js"), "window.Lib = function () {};\n").unwrap();
+    fs::write(
+        root.join(".trellis/rules.toml"),
+        "version = 1\n[[specifiers]]\nprefix = \"web:\"\ndir = \"b\"\nsuffix = \".js\"\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    crate::child::assert_cli_success(&indexed, "indexed");
+    let read = || -> Value {
+        let references = command(&root, &home, "references")
+            .args(["--path", "a/main.js"])
+            .output()
+            .unwrap();
+        crate::child::assert_cli_success(&references, "references");
+        serde_json::from_slice::<Value>(&references.stdout).unwrap()["payload"].clone()
+    };
+    let targets = |payload: &Value| -> Vec<String> {
+        payload["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|edge| edge["target"]["path"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let mapped = read();
+    assert_eq!(targets(&mapped), ["b/lib.js"], "{mapped}");
+    // The owner's core for this pin and file is published; the next file does not load.
+    fs::write(
+        root.join(".trellis/rules.toml"),
+        "version = 1\n[[specifiers]]\n",
+    )
+    .unwrap();
+    let unmapped = read();
+    assert_eq!(unmapped["indexGeneration"], mapped["indexGeneration"]);
+    assert_eq!(unmapped["indexRevision"], mapped["indexRevision"]);
+    assert!(targets(&unmapped).is_empty(), "{unmapped}");
+    let reasons: Vec<&str> = unmapped["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["absolute_or_bare_import"], "{unmapped}");
+}
+
 #[test]
 fn architecture_cli_invalid_rules_is_a_located_json_failure_not_a_verdict() {
     let temp = TempDir::new().unwrap();

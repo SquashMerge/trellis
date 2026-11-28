@@ -1141,7 +1141,7 @@ app = "gamma"
 order = 1
 paths = ["c/**"]
 "#;
-const USE_FILES: [(&str, &str); 9] = [
+const USE_FILES: [(&str, &str); 10] = [
     A_PACKAGE,
     B_PACKAGE,
     ("c/package.json", "{\"name\":\"gamma\"}\n"),
@@ -1154,6 +1154,8 @@ const USE_FILES: [(&str, &str); 9] = [
     ("b/vendor/pele.js", "var pele = 1;\n"),
     ("b/style.css", ":root { --x: #000000; }\n"),
     ("c/lib.js", "export function g() {}\n"),
+    // A wildcard re-export through the mapping whose file is not indexed.
+    ("a/reexport.js", "export * from \"web:missing\";\n"),
 ];
 
 /// The `$layers` row from `a/main.js` to `destination`.
@@ -1327,5 +1329,58 @@ fn invalid_specifiers_and_may_use_are_invalid_rules() {
     assert_eq!(
         invalid(&with(&overlapping, &USE_FILES))["kind"],
         "ambiguity"
+    );
+}
+
+/// #1131 review: the path-scoped fallback a read takes when a whole-revision core is over its
+/// budget resolves through the same mappings and judges the same `may_use`.
+#[test]
+fn the_scoped_fallback_follows_specifier_mappings_and_may_use() {
+    let (_state, _root, store, pin) = publish(&with(USE_RULES, &USE_FILES));
+    let args = json!({"expectedBasis": pin, "paths": ["a/main.js"]});
+    let data = store
+        .architecture_scoped_response_for_tests("check", &args)
+        .unwrap();
+    assert_eq!(use_row(&data, "b/lib.js")["status"], "conforms");
+    assert_eq!(use_row(&data, "b/vendor/pele.js")["status"], "conforms");
+    assert_eq!(use_row(&data, "b/other.js")["status"], "deviates");
+    let references = store
+        .architecture_scoped_response_for_tests("references", &args)
+        .unwrap();
+    let targets: Vec<&str> = references["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|edge| edge["target"]["path"].as_str())
+        .collect();
+    for path in ["b/lib.js", "b/vendor/pele.js", "b/other.js"] {
+        assert!(targets.contains(&path), "{path}: {targets:?}");
+    }
+}
+
+/// #1131 review: `export * from` a mapped specifier that the mapping cannot place keeps the
+/// mapping's reason, not an unknown export-name set.
+#[test]
+fn a_wildcard_reexport_keeps_the_mappings_reason() {
+    let (_state, _root, store, pin) = publish(&with(USE_RULES, &USE_FILES));
+    let response = store.evidence_response().unwrap();
+    let value = response
+        .architecture_response(
+            "references",
+            &json!({"expectedBasis": pin, "paths": ["a/reexport.js"]}),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let references = response.finish(value).unwrap();
+    let reasons: Vec<&str> = references["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        reasons,
+        ["javascript_specifier_not_indexed"],
+        "{references}"
     );
 }

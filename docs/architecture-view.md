@@ -81,9 +81,11 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
   counted under `noApp`; they still draw no layer arrow. See
   [rules.md Amendment (#1131)](rules.md#amendment-1131-import-specifier-mappings-and-declared-cross-app-use).)
 - **Counts equal the CLI per app.** A band's counts are sums over that app's `$layers`
-  instances on the same pin and rules hash. A cross-app pair is never a deviation, so the
-  apps' deviation totals cover every deviation in `rules.counts.deviates`. A deviation
-  involving a shared layer counts under each app that the pair's layers have in common.
+  instances on the same pin and rules hash. A cross-app pair is a deviation only when a
+  declared `may_use` judges it (#1131), and such a deviation counts under `noApp`, not under
+  either app: the apps' deviation totals plus `noApp.counts.deviates` make
+  `rules.counts.deviates`. A deviation involving a shared layer counts under each app that the
+  pair's layers have in common.
 - **Exceptions are unchanged:** one file pair, previewed and applied through the existing
   routes.
 

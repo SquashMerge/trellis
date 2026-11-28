@@ -162,6 +162,19 @@ impl EvidenceResponse {
         }
     }
 
+    /// The import specifier mappings a read resolves through (#1131): those of the rules file
+    /// it loaded, else the checkout's file's, read leniently; a missing or invalid file maps
+    /// nothing.
+    pub(crate) fn specifiers(
+        &self,
+        config: Option<&crate::rules::Config>,
+    ) -> Vec<crate::architecture_inputs::SpecifierMapping> {
+        match config {
+            Some(config) => config.specifiers().to_vec(),
+            None => crate::rules::load_specifiers(Path::new(self.store.workspace_root())),
+        }
+    }
+
     /// One architecture operation over a computed core.
     pub(crate) fn architecture_response_at(
         &self,
@@ -454,9 +467,11 @@ impl EvidenceResponse {
         config: Option<&crate::rules::Config>,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<serde_json::Value> {
-        let snapshot = self
+        let mut snapshot = self
             .architecture_snapshot(parsed.pin, check)
             .map_err(|error| self.store.report_index_failure(error))?;
+        // #1131: the scope resolves through the same mappings as a whole-revision core.
+        snapshot.specifiers = self.specifiers(config);
         // #851: an `app` filter assigns every document of the snapshot.
         let assigned = match &parsed.app {
             Some(app) => {

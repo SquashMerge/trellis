@@ -322,19 +322,46 @@ impl CheckoutRuntime {
         } else {
             crate::http::architecture::CoreRules::Any
         };
-        let scheduler = self.resources()?.scheduler.clone();
+        // #1131: any other read still resolves references through the current file's specifier
+        // mappings, none when it is missing or does not load. It takes a core of another file
+        // whose mappings are the same; otherwise the current file's core, or one of none.
+        let resources = self.resources()?;
+        let current = (!needs.rules).then(|| {
+            match crate::rules::load(Path::new(resources.store.workspace_root())) {
+                Ok(Some(config)) => (
+                    Some(config.content_hash.clone()),
+                    config.specifiers().to_vec(),
+                ),
+                _ => (None, Vec::new()),
+            }
+        });
+        let fits = |core: &crate::architecture_core::ArchitectureCore| {
+            current
+                .as_ref()
+                .is_none_or(|(_, mappings)| core.specifiers() == mappings.as_slice())
+        };
+        let exact = match &current {
+            Some((hash, _)) => crate::http::architecture::CoreRules::Exactly(hash.as_deref()),
+            None => rules,
+        };
+        let scheduler = resources.scheduler.clone();
         if pin == response.selected_pin(None)? {
-            return scheduler.architecture_core(pin, rules, Duration::ZERO, check);
+            let core = scheduler.architecture_core(pin, rules, Duration::ZERO, check)?;
+            if fits(&core) {
+                return Ok(core);
+            }
+            return scheduler.architecture_core(pin, exact, Duration::ZERO, check);
         }
         if let Some(core) =
             scheduler.architecture_core_if_available(pin, Duration::ZERO, &mut || Ok(()))
             && rules.admits(core.rules_hash())
+            && fits(&core)
         {
             return Ok(core);
         }
         if !needs.compute_older_pin {
-            scheduler.architecture_request_older(pin, rules);
-            return scheduler.architecture_core(pin, rules, Duration::ZERO, check);
+            scheduler.architecture_request_older(pin, exact);
+            return scheduler.architecture_core(pin, exact, Duration::ZERO, check);
         }
         response
             .architecture_core_at(pin, config, needs.metrics, check, &|_| {})

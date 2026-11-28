@@ -285,6 +285,8 @@ pub(crate) struct ArchitectureCore {
     /// Finished summaries; one per valid role, aggregate and workbench choice.
     summaries: Mutex<BTreeMap<SummaryKey, Arc<serde_json::Value>>>,
     dependencies: dependencies::ArchitectureDependencies,
+    /// The import specifier mappings its references resolved through (#1131).
+    specifiers: Vec<crate::architecture_inputs::SpecifierMapping>,
 }
 
 impl ArchitectureCore {
@@ -360,6 +362,10 @@ impl ArchitectureCore {
     /// Metrics rows for a read that can compute its own if this core failed them.
     pub(crate) fn metrics_if_computed(&self) -> Option<&ArchitectureMetrics> {
         self.metrics.as_ref()?.as_ref().ok()
+    }
+    /// The import specifier mappings this core's references resolved through (#1131).
+    pub(crate) fn specifiers(&self) -> &[crate::architecture_inputs::SpecifierMapping] {
+        &self.specifiers
     }
     /// The rules file hash this core evaluated.
     pub(crate) fn rules_hash(&self) -> Option<&str> {
@@ -598,10 +604,7 @@ impl EvidenceResponse {
     ) -> Result<ArchitectureCore> {
         let mut input = self.architecture_input(pin, check, progress)?;
         // A read without the rules still resolves through the file's specifiers (#1131).
-        if config.is_none() {
-            input.snapshot.specifiers =
-                crate::rules::load_specifiers(std::path::Path::new(self.store.workspace_root()));
-        }
+        input.snapshot.specifiers = self.specifiers(config);
         ArchitectureCore::compute(&self.store, input, config, measure, check, progress)
     }
 
@@ -822,6 +825,7 @@ impl ArchitectureCore {
             interfaces,
             summaries: Mutex::default(),
             dependencies,
+            specifiers: snapshot.specifiers.clone(),
         })
     }
 }
@@ -1586,6 +1590,7 @@ impl ArchitectureCore {
             interfaces,
             summaries: _,
             dependencies,
+            specifiers,
         } = self;
         let failure = |failure: &CoreFailure| {
             let CoreFailure {
@@ -1647,6 +1652,12 @@ impl ArchitectureCore {
             "appCandidates": app_candidates,
             "interfaces": interfaces,
             "dependencies": dependencies.canonical(),
+            "specifiers": specifiers
+                .iter()
+                .map(|mapping| {
+                    json!([mapping.prefix, mapping.dir, mapping.suffix, mapping.exact])
+                })
+                .collect::<Vec<_>>(),
         }))
     }
 }

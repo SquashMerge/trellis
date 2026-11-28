@@ -935,8 +935,9 @@ impl DaemonState {
             }
         };
         // A rules file that does not load answers its own reads, and metrics do not depend on
-        // it; references depend on it only through its import specifier mappings (#1131), and
-        // an unloadable file keeps those of a published core: a core of this revision is enough.
+        // it, so a core of this revision is enough, unless that core resolved references through
+        // specifier mappings (#1131): a file that does not load maps nothing, so the owner then
+        // builds the core of no file.
         let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
         let unreadable = loaded.is_err();
         let config = loaded.ok().flatten();
@@ -948,10 +949,14 @@ impl DaemonState {
             let mut state = owner.state.lock().unwrap();
             state.head = Some(head);
             state.observe_rules(&head_key);
-            let head_done = state
-                .published
-                .iter()
-                .any(|p| p.key == head_key || (unreadable && p.key.pin == head));
+            let head_done = state.published.iter().any(|p| {
+                p.key == head_key
+                    || (unreadable
+                        && p.key.pin == head
+                        && p.outcome
+                            .as_ref()
+                            .map_or(true, |core| core.specifiers().is_empty()))
+            });
             // The rules decide what an older revision shows, so that request is for this file.
             let older = state
                 .older

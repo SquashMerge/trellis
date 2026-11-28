@@ -379,6 +379,7 @@ fn a_kept_failure_is_part_of_the_canonical_core() {
         interfaces,
         summaries,
         dependencies,
+        specifiers,
     } = core;
     let rules = rules.map(|part| RulesPart {
         content_hash: part.content_hash,
@@ -393,6 +394,7 @@ fn a_kept_failure_is_part_of_the_canonical_core() {
         interfaces,
         summaries,
         dependencies,
+        specifiers,
     }
     .canonical()
     .unwrap();

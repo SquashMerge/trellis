@@ -287,6 +287,11 @@ fn local_resolution(
     let mut resolution = SiteResolution::default();
     if source.star {
         let own = stars.next().expect("star contribution");
+        // #1131: a mapping that cannot place the star's module keeps its own reason.
+        if let Some(reason) = resolver.mapping_failure(document, source, work, check)? {
+            resolution.residual = Some(reason);
+            return Ok(resolution);
+        }
         if own.unknown_set || unit.unknown_set || resolver.hazards[&document].dynamic {
             resolution.residual = Some("javascript_export_name_set_unknown");
         }
@@ -545,6 +550,31 @@ impl Resolver<'_> {
             [target] => Ok(*target),
             _ => Err(SPECIFIER_NOT_INDEXED),
         }))
+    }
+    /// The typed reason an authored specifier mapping gives for `source`, when one owns its
+    /// specifier and cannot place it (#1131). Nothing is charged when no mapping's prefix
+    /// starts the specifier.
+    fn mapping_failure(
+        &self,
+        document: usize,
+        source: &Source,
+        work: &mut Work,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<&'static str>> {
+        let Some(specifier) = source.specifier.as_deref().filter(|_| source.supported) else {
+            return Ok(None);
+        };
+        if !self
+            .specifiers
+            .iter()
+            .any(|mapping| specifier.starts_with(mapping.prefix.as_str()))
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .target(document, Some(specifier), work, check)?
+            .err()
+            .filter(|reason| reason.starts_with("javascript_specifier_")))
     }
     /// `paths`, then `baseUrl`, of a readable root config.
     fn config_target(
