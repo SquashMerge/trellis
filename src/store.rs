@@ -7828,10 +7828,13 @@ struct BatchAdmission {
     documents: usize,
 }
 
-/// Changed rows per pre-write transaction of a batch publication (#995). A transaction this size
-/// keeps its dirty pages near the batch writer cache, so readers of the prior head wait out
-/// only its short COMMIT, or a short spill.
-const PREWRITE_CHUNK_ROWS: u64 = 8192;
+/// Changed rows per pre-write transaction of a batch publication (#995). Such a transaction still
+/// spills past the 16 MiB batch writer cache, but holds readers out for about two seconds at
+/// most, which a read waits out. Measured on a rust-analyzer import of this repository: 8,192
+/// rows made about 390 transactions and multiplied the write time by 7 (each one rewrote and
+/// journaled the random index pages it touched); 65,536 rows made about 73, each held at most
+/// 1.9 s, and the import's wall time stayed within 12% of one transaction's.
+const PREWRITE_CHUNK_ROWS: u64 = 65_536;
 
 /// Where a batch publication's pre-write is, for a test that reads or fails there (#995).
 #[cfg(feature = "test-support")]
