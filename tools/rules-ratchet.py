@@ -28,8 +28,9 @@ population's references, so ordinary new code raises them. The record keeps the
 deviating references of each pair and the unknown references of each of those pairs'
 source files for this comparison.
 
-An unlayered file is a source file of the population whose instances have no source
-layer: no layer of `.trellis/rules.toml` covers it (#1393). Every reference from it is
+An unlayered file is a source file of the population that the payload's `unassigned`
+list names: no layer of `.trellis/rules.toml` covers it (#1393). A null `sourceLayer`
+is not that signal, since declaration-rule instances have none. Every reference from it is
 unknown, so without this figure a file left out of the layers is only a rise in unknown
 references. The failure names each such file.
 
@@ -144,8 +145,8 @@ DESCRIPTION = {
             ".trellis/rules.toml approves, which no total counts; "
             "unknownReferencesBySource is the unknown sum for each source file of a "
             "recorded deviating or excepted pair. unlayeredFiles is the number of the "
-            "population's source files whose instances have no source layer, files no "
-            "layer of .trellis/rules.toml covers (#1393). Pairs are compared by path "
+            "population's source files that the payload's unassigned list names, files "
+            "no layer of .trellis/rules.toml covers (#1393). Pairs are compared by path "
             "and renames are not detected: a deviating pair whose source or "
             "destination file was renamed, split or merged is a pair this record does "
             "not have, so the run fails until the record is updated, and the pair "
@@ -267,7 +268,11 @@ def summarize(payload):
     first_party = [row for row in internal if not is_template(row)]
     deviating, unknown = having(first_party, "deviates"), having(first_party, "unknown")
     excepted = [row for row in first_party if row["status"] == "deviates" and row["excepted"]]
-    unlayered = sorted({row["target"]["path"] for row in first_party if row["sourceLayer"] is None})
+    # A null sourceLayer does not say a file is unmapped: declaration-rule instances carry
+    # none on any file. The tool's own list of the modules no layer covers does.
+    unassigned = {each["path"] for each in payload["unassigned"]
+                  if each.get("kind") != "externalPackage"}
+    unlayered = sorted({row["target"]["path"] for row in first_party} & unassigned)
     by_pair, by_excepted, by_source = {}, {}, {}
     for rows, into in ((deviating, by_pair), (excepted, by_excepted)):
         for row in rows:

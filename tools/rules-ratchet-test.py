@@ -80,8 +80,9 @@ def row(status, references, excepted=False, destination=NATIVE, source="src/http
             "sourceLayer": layer}
 
 
-def payload(*instances):
-    """A `rules check` payload whose counts agree with its instances."""
+def payload(*instances, unassigned=()):
+    """A `rules check` payload whose counts agree with its instances. `unassigned` names the
+    modules no layer covers; the list also has an external package, as the tool's does."""
     def count(status):
         return sum(1 for each in instances if each["status"] == status and not each["excepted"])
     return {
@@ -90,6 +91,7 @@ def payload(*instances):
                    "excepted": sum(1 for each in instances if each["excepted"])},
         "instances": list(instances),
         "partialFiles": [],
+        "unassigned": [{**NATIVE, "path": path} for path in unassigned] + [stdlib("os")],
     }
 
 
@@ -347,7 +349,8 @@ class Ratchet(unittest.TestCase):
         def added(layer):
             status = "unknown" if layer is None else "conforms"
             return payload(*TREE, row("unknown", 3, destination=None, source=new, layer=layer),
-                           row(status, 9, source=new, layer=layer))
+                           row(status, 9, source=new, layer=layer),
+                           unassigned=[new] if layer is None else [])
 
         measured, _ = RR.summarize(added(None))
         self.assertEqual((measured["unlayeredFiles"], measured["unlayeredPaths"]), (1, [new]))
@@ -367,12 +370,28 @@ class Ratchet(unittest.TestCase):
         # A file whose only instances have an external destination, and a synthetic cohort
         # template, are not in the population, so they are not unlayered files either.
         record, _ = RR.summarize(payload(*TREE))
+        template = "tools/synthetic-cohorts/templates/small/rust.rs"
         measured, left_out = RR.summarize(payload(
             *TREE, row("unknown", 1, destination=stdlib("os"), source="tools/x.py", layer=None),
-            row("unknown", 2, destination=None, layer=None,
-                source="tools/synthetic-cohorts/templates/small/rust.rs")))
+            row("unknown", 2, destination=None, layer=None, source=template),
+            # Unassigned with no production instance, such as a test-only file.
+            unassigned=["tools/x.py", template, "src/only_tests.rs"]))
         self.assertEqual(left_out, (2, 1))
         self.assertEqual(measured, record)
+
+    def test_a_declaration_row_on_a_mapped_file_is_not_an_unlayered_file(self):
+        # Prime2's #1396 review: a declaration-rule instance has no source layer on any
+        # file. On a mapped file, which `unassigned` does not name, it counts nothing.
+        record, _ = RR.summarize(payload(*TREE))
+        mapped = "src/architecture_core/dependencies.rs"
+        declaration = {**row("conforms", 0, destination=None, source=mapped, layer=None),
+                       "rule": "no-sql-in-query"}
+        measured, _ = RR.summarize(payload(*TREE, row("conforms", 9, source=mapped),
+                                           declaration))
+        self.assertEqual((measured["unlayeredFiles"], measured["unlayeredPaths"]), (0, []))
+        verdict, lines = RR.compare(record, measured)
+        self.assertEqual(verdict, "lower")
+        self.assertFalse(any("FAILED" in line for line in lines))
 
     def test_the_synthetic_cohort_templates_are_in_no_figure(self):
         # #1236: an instance from one of the twelve named templates, whatever its status,
