@@ -20,9 +20,9 @@ SPEC.loader.exec_module(RR)
 # A record of three deviating pairs from two source files and two excepted pairs, one
 # from a source file with deviating pairs and one from a file with none (#1211). Its
 # unknown references are 20 from src/store.rs, 5 from src/http.rs, 8 from src/testing.rs
-# and 17 from files with no deviating or excepted pair.
+# and 17 from files with no deviating or excepted pair. Every source file has a layer.
 RECORD = {"deviatingPairs": 3, "deviatingReferences": 10, "unknownReferences": 50,
-          "partialFiles": 1, "comparablePairs": 40, "conformingPairs": 30, "unknownPairs": 7,
+          "partialFiles": 1, "unlayeredFiles": 0, "comparablePairs": 40, "conformingPairs": 30, "unknownPairs": 7,
           "deviatingReferencesByPair": {"src/http.rs": {"src/storage.rs": 1},
                                         "src/store.rs": {"src/capture.rs": 6, "src/indexer.rs": 3}},
           "exceptedReferencesByPair": {"src/store.rs": {"src/classes.rs": 4},
@@ -72,9 +72,12 @@ def stdlib(package, language="python"):
             "language": language, "package": package, "standardLibrary": True}
 
 
-def row(status, references, excepted=False, destination=NATIVE, source="src/http.rs"):
+def row(status, references, excepted=False, destination=NATIVE, source="src/http.rs",
+        layer="query"):
+    """An instance from `source`, whose layer is `layer`; None when no layer covers it."""
     return {"status": status, "referenceCount": references, "excepted": excepted,
-            "target": {**NATIVE, "path": source}, "destination": destination}
+            "target": {**NATIVE, "path": source}, "destination": destination,
+            "sourceLayer": layer}
 
 
 def payload(*instances):
@@ -133,6 +136,26 @@ class Ratchet(unittest.TestCase):
         self.assertEqual(verdict, "fail")
         self.assertEqual(lines[:2], ["rules ratchet FAILED: more files are partial",
                                      "  partialFiles: recorded 1, measured 2"])
+
+    def test_a_source_file_with_no_layer_fails_and_is_named(self):
+        # #1393: whatever else moved, one more file without a layer fails, and each
+        # measured file without one is named.
+        verdict, lines = self.verdict(unlayeredFiles=2,
+                                      unlayeredPaths=["src/core/deps.rs", "src/old.rs"])
+        self.assertEqual(verdict, "fail")
+        self.assertEqual(lines[:4], ["rules ratchet FAILED: source files have no layer",
+                                     "  unlayeredFiles: recorded 0, measured 2",
+                                     "  no layer of .trellis/rules.toml covers src/core/deps.rs",
+                                     "  no layer of .trellis/rules.toml covers src/old.rs"])
+        self.assertIn("map the file to a layer", lines[-1])
+
+    def test_unlayered_files_at_or_below_the_record_pass(self):
+        record = {**RECORD, "unlayeredFiles": 1}
+        same = figures(unlayeredFiles=1, unlayeredPaths=["src/old.rs"])
+        self.assertEqual(RR.compare(record, same)[0], "equal")
+        verdict, lines = RR.compare(record, figures(unlayeredPaths=[]))
+        self.assertEqual(verdict, "lower")
+        self.assertIn("  unlayeredFiles: recorded 1, measured 0", lines)
 
     def test_a_fall_in_a_pair_with_a_rise_only_in_unrelated_files_is_a_notice(self):
         # #1140: the fall and the rise are not related. src/http.rs has a deviating pair
@@ -308,11 +331,48 @@ class Ratchet(unittest.TestCase):
         measured["partialFiles"] = [{"path": "a.rs"}]
         self.assertEqual(RR.summarize(measured), ({
             "deviatingPairs": 2, "deviatingReferences": 10, "unknownReferences": 2,
-            "partialFiles": 1, "comparablePairs": 6, "conformingPairs": 2,
+            "partialFiles": 1, "unlayeredFiles": 0, "comparablePairs": 6, "conformingPairs": 2,
             "unknownPairs": 1,
             "deviatingReferencesByPair": {"src/http.rs": {"src/storage.rs": 10}},
             "exceptedReferencesByPair": {"src/http.rs": {"src/storage.rs": 5}},
-            "unknownReferencesBySource": {"src/http.rs": 2}}, (2, 0)))
+            "unknownReferencesBySource": {"src/http.rs": 2}, "unlayeredPaths": []}, (2, 0)))
+
+    def test_a_file_no_layer_covers_fails_from_payloads_and_passes_once_mapped(self):
+        # #1393, as src/architecture_core/dependencies.rs was: every instance from a file no
+        # layer covers is unknown, with no source layer, whatever its destination.
+        record, _ = RR.summarize(payload(*TREE))
+        self.assertEqual(record["unlayeredFiles"], 0)
+        new = "src/architecture_core/dependencies.rs"
+
+        def added(layer):
+            status = "unknown" if layer is None else "conforms"
+            return payload(*TREE, row("unknown", 3, destination=None, source=new, layer=layer),
+                           row(status, 9, source=new, layer=layer))
+
+        measured, _ = RR.summarize(added(None))
+        self.assertEqual((measured["unlayeredFiles"], measured["unlayeredPaths"]), (1, [new]))
+        verdict, lines = RR.compare(record, measured)
+        self.assertEqual(verdict, "fail")
+        self.assertEqual(lines[:3], ["rules ratchet FAILED: source files have no layer",
+                                     "  unlayeredFiles: recorded 0, measured 1",
+                                     f"  no layer of .trellis/rules.toml covers {new}"])
+        # Mapped to a layer, the same file is an ordinary rise in unknown references.
+        measured, _ = RR.summarize(added("query"))
+        self.assertEqual(measured["unlayeredFiles"], 0)
+        verdict, lines = RR.compare(record, measured)
+        self.assertEqual(verdict, "lower")
+        self.assertFalse(any("FAILED" in line for line in lines))
+
+    def test_unlayered_files_have_the_populations_exclusions(self):
+        # A file whose only instances have an external destination, and a synthetic cohort
+        # template, are not in the population, so they are not unlayered files either.
+        record, _ = RR.summarize(payload(*TREE))
+        measured, left_out = RR.summarize(payload(
+            *TREE, row("unknown", 1, destination=stdlib("os"), source="tools/x.py", layer=None),
+            row("unknown", 2, destination=None, layer=None,
+                source="tools/synthetic-cohorts/templates/small/rust.rs")))
+        self.assertEqual(left_out, (2, 1))
+        self.assertEqual(measured, record)
 
     def test_the_synthetic_cohort_templates_are_in_no_figure(self):
         # #1236: an instance from one of the twelve named templates, whatever its status,
@@ -443,8 +503,12 @@ class Ratchet(unittest.TestCase):
             measured = figures()
             measured["deviatingReferencesByPair"] = dict(reversed(
                 measured["deviatingReferencesByPair"].items()))
+            measured["unlayeredPaths"] = []
             RR.write_record(path, measured)
             first = path.read_bytes()
+            # The record keeps the number of unlayered files, not their paths (#1393).
+            self.assertEqual(json.loads(first)["unlayeredFiles"], 0)
+            self.assertNotIn("unlayeredPaths", json.loads(first))
             written = RR.read_record(path)
             self.assertEqual({key: written[key] for key in RECORD}, RECORD)
             self.assertEqual(list(written["deviatingReferencesByPair"]), ["src/http.rs", "src/store.rs"])
@@ -469,14 +533,20 @@ class Ratchet(unittest.TestCase):
             self.assertIn("--accept-unknown-rise", written["rule"])
             self.assertIn("renames are not detected", written["rule"])
             self.assertIn("deviatingReferencesByPair or exceptedReferencesByPair", written["rule"])
+            self.assertIn("unlayeredFiles is the number", written["rule"])
             # A record of an earlier version or shape is refused: version 3 had the
-            # totals only (#1140), version 4 no excepted pairs (#1211).
+            # totals only (#1140), version 4 no excepted pairs (#1211), version 5 no
+            # unlayered files (#1393).
             totals = {key: RECORD[key] for key in RR.KEYS}
             version_4 = {key: value for key, value in written.items()
                          if key != "exceptedReferencesByPair"}
             for old in ({**written, "schemaVersion": 3}, {"schemaVersion": 3, **totals},
                         {**version_4, "schemaVersion": 4,
                          "unknownReferencesBySource": {"src/http.rs": 5, "src/store.rs": 20}},
+                        {**{key: value for key, value in written.items()
+                            if key != "unlayeredFiles"}, "schemaVersion": 5},
+                        {key: value for key, value in written.items()
+                         if key != "unlayeredFiles"},
                         {key: value for key, value in written.items()
                          if key != "unknownReferencesBySource"},
                         {**written, "unknownReferencesBySource": {"src/store.rs": 20,
@@ -589,6 +659,9 @@ class NightlyClassifier(unittest.TestCase):
         self.assertEqual(set(self.patterns()), {"record-exceeded", "lost-coverage"})
         self.assertEqual(self.outcomes(self.compared(deviatingPairs=4)), {"record-exceeded"})
         self.assertEqual(self.outcomes(self.compared(partialFiles=2)), {"record-exceeded"})
+        self.assertEqual(self.outcomes(self.compared(unlayeredFiles=1,
+                                                     unlayeredPaths=["src/new.rs"])),
+                         {"record-exceeded"})
         self.assertEqual(self.outcomes(self.compared(pairs={("src/web.rs", "src/storage.rs"): 1})),
                          {"record-exceeded"})
         lost = {"pairs": {STORAGE: 0}, "unknown": {"src/http.rs": 6}}

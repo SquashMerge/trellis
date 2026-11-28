@@ -51,6 +51,9 @@ paths = [
   # per-revision core, the Architecture operations and the metrics projection, with the tests
   # that moved with them. Storage keeps the read they start from.
   "src/architecture_core.rs", "src/architecture_read.rs", "src/architecture_read_apps_tests.rs",
+  # The core's submodules, such as its dependency projection (#1308), are query code with it
+  # (#1393).
+  "src/architecture_core/**",
   "src/metrics_read.rs", "src/metrics_read_parallel_tests.rs",
   # The Sequence, graph and navigation reads, moved up from storage (S6, #1048): the snapshot
   # graph source and Sequence enrichment, the Sequence boundary hops, and the read bodies and
