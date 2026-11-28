@@ -29,6 +29,10 @@ arrival order (see ``Queue``): a delayed enqueuer can land ahead of an earlier
 waiter, and a waiter that loses the head gives back any reserved slot, so the
 lease can be reordered but never wedged.
 
+A nonempty ``MIMIR_HEAVY_LOCK_HELD`` means an ancestor already holds the lease,
+so ``run()`` runs the command directly, as heavy_run.sh does, and takes no ticket
+or slot. This check is a Trellis change; mimir's copy doesn't have it.
+
 Keep this helper compatible with Python 3.9. heavy_run.sh launches it with
 whatever ``python3`` is on PATH, and a non-interactive shell (ssh, cron) on
 macOS gets the system ``/usr/bin/python3``, which is 3.9. A 3.10+ call that
@@ -453,6 +457,11 @@ def _probe_stale(lease: Lease) -> None:
 
 
 def run(command: list[str]) -> int:
+    if os.environ.get("MIMIR_HEAVY_LOCK_HELD"):
+        # Nonempty, as heavy_run.sh tests it: an ancestor holds the lease. Taking
+        # it again would wait on the ancestor's slot or take a second one.
+        status = subprocess.call(command)
+        return status if status >= 0 else 128 - status
     base = os.environ["MIMIR_HEAVY_LOCK_FILE"]
     tier = os.environ.get("MIMIR_HEAVY_TIER", "large") or "large"
     if tier not in TIERS:

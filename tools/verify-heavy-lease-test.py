@@ -61,6 +61,17 @@ def observed(path):
 heavy_run._publish_generation = observed
 sys.exit(heavy_run.run(sys.argv[2:]))
 """
+# A command run by heavy_run.py: it records the lock directory, the queue's tickets
+# and the held marker it was given, then exits 5.
+SNAPSHOT = r"""import json, os, sys
+locks, out = sys.argv[1:3]
+queue = os.path.join(locks, "heavy.lock.queue")
+tickets = sorted(n for n in os.listdir(queue) if n.isdigit()) if os.path.isdir(queue) else []
+with open(out, "w") as snapshot:
+    json.dump({"locks": sorted(os.listdir(locks)), "tickets": tickets,
+               "held": os.environ.get("MIMIR_HEAVY_LOCK_HELD")}, snapshot)
+sys.exit(5)
+"""
 # Used only where the machine has neither gtimeout nor timeout.
 TIMEOUT_STUB = '#!/bin/sh\nshift 3\nexec "$@"\n'
 
@@ -225,6 +236,29 @@ class VerifyHeavyLease(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(self.lane_call(), LANE + "|held=1|lease=absent|mark=")
         self.assertFalse([c for c in self.calls() if c.startswith("python3")])
+
+    def test_heavy_run_py_under_a_held_lease_runs_its_command_directly(self):
+        # A caller already inside the lease runs heavy_run.py itself. At the medium
+        # tier it must not take slot 2 beside its own parent; at the large tier it
+        # must not wait for the slot its parent holds.
+        outer = self.held_run("outer")
+        self.wait_for(lambda: self.events() == ["start outer"], outer)
+        snapshot = self.dir / "snapshot.json"
+        for tier in ("medium", "large"):
+            with self.subTest(tier):
+                done = subprocess.run(
+                    [sys.executable, str(ROOT / "tools" / "heavy_run.py"),
+                     sys.executable, "-c", SNAPSHOT, str(self.dir / "locks"), str(snapshot)],
+                    cwd=ROOT, env=self.leased(MIMIR_HEAVY_LOCK_HELD="1",
+                                              MIMIR_HEAVY_TIER=tier),
+                    capture_output=True, text=True, timeout=BACKSTOP)
+                self.assertEqual(done.returncode, 5, done.stdout + done.stderr)
+                seen = json.loads(snapshot.read_text())
+                self.assertEqual(seen["held"], "1")
+                self.assertEqual(seen["locks"], ["heavy.lock.lease", "heavy.lock.queue"])
+                self.assertEqual(seen["tickets"], [])
+                self.assertEqual(self.holders(), {"lease": "medium"})
+        self.finish_all(outer)
 
     def test_an_unusable_lock_path_fails_without_running_verify(self):
         env = self.leased(MIMIR_HEAVY_LOCK_FILE=str(self.dir / "missing" / "heavy.lock"))
