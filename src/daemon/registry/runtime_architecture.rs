@@ -346,7 +346,15 @@ impl CheckoutRuntime {
         };
         let scheduler = resources.scheduler.clone();
         if pin == response.selected_pin(None)? {
-            let core = scheduler.architecture_core(pin, rules, Duration::ZERO, check)?;
+            // A kept outcome, a failure included, built through other mappings never answers
+            // this read: it asks for the current file's core instead.
+            let first = match &current {
+                Some((_, mappings)) if scheduler.architecture_mappings_differ(pin, mappings) => {
+                    exact
+                }
+                _ => rules,
+            };
+            let core = scheduler.architecture_core(pin, first, Duration::ZERO, check)?;
             if fits(&core) {
                 return Ok(core);
             }

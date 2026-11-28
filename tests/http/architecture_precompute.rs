@@ -2933,3 +2933,82 @@ async fn an_over_budget_revision_still_answers_a_narrow_read() {
     // The failure is kept: the narrow reads asked for no further build.
     assert_eq!(scheduler.architecture_builds_for_tests() - before, 1);
 }
+
+/// #1131 review: a kept build failure resolved through the rules file's specifier mappings
+/// never answers a plain references read once the file maps nothing. After an invalid edit
+/// at the same pin, the read gets the outcome of no mappings.
+#[tokio::test]
+async fn a_kept_failure_built_through_mappings_does_not_answer_after_an_invalid_rules_edit() {
+    let (base, runtime, _, _) = super::architecture_http::fixture_exact_sources(&[
+        ("a/main.js", "import lib from \"web:lib\";\nlib();\n"),
+        ("b/lib.js", "window.Lib = function () {};\n"),
+    ])
+    .await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    super::architecture_http::write_rules(
+        &base,
+        "version = 1\n[[specifiers]]\nprefix = \"web:\"\ndir = \"b\"\nsuffix = \".js\"\n",
+    );
+    // The head's core under this file is built first: the owner takes a captured limit at the
+    // next build it starts, which must be the edit's.
+    let head = current_pin(&scheduler);
+    {
+        let (response, _) = runtime.evidence_response().unwrap();
+        let _ = runtime.architecture_tool(
+            &response,
+            "check",
+            &json!({"expectedBasis": head}),
+            &mut || Ok(()),
+        );
+    }
+    runtime.settled_for_tests(Some(head)).await.unwrap();
+    assert!(
+        scheduler
+            .architecture_core_for_tests(head)
+            .is_some_and(|core| core.canonical().unwrap()["specifiers"] != json!([])),
+        "the head's core is built through the mapping"
+    );
+    // The owner's next build, of the edit below, runs through the mapping and over its work.
+    let limit = trellis::references::set_reference_work_limit_for_tests(1);
+    scheduler.capture_architecture_work_limit_for_tests();
+    let pin = index_edit(
+        &base,
+        &runtime,
+        &[(
+            "b/lib.js",
+            Some("window.Lib = function () { return 1; };\n"),
+        )],
+    )
+    .await;
+    drop(limit);
+    let read = || {
+        let (response, _) = runtime.evidence_response().unwrap();
+        runtime.architecture_tool(
+            &response,
+            "references",
+            &json!({"expectedBasis": pin}),
+            &mut || Ok(()),
+        )
+    };
+    let kept = read().unwrap_err();
+    assert!(kept.to_string().starts_with("bounded_work:"), "{kept:#}");
+    // The file no longer loads, so it maps nothing: the kept failure is not this read's.
+    super::architecture_http::write_rules(&base, "version = 1\n[[specifiers]]\n");
+    let _ = read();
+    runtime.settled_for_tests(Some(pin)).await.unwrap();
+    let references = read().unwrap();
+    let targets: Vec<&str> = references["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|edge| edge["target"]["path"].as_str())
+        .collect();
+    assert!(!targets.contains(&"b/lib.js"), "{references}");
+    let reasons: Vec<&str> = references["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["absolute_or_bare_import"], "{references}");
+}
