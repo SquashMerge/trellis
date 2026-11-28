@@ -311,11 +311,10 @@ fn rust_lookup_keys_reuse_the_checked_source_for_sid_answers() {
     );
 }
 
-#[test]
-fn architecture_read_a_keeps_a_document_over_its_source_bound_as_its_file_module() {
-    // Owner ruling 2026-11-26 (#1321): a source over the snapshot's 2 MiB document bound is
-    // kept as its file module, as capture keeps one over `--max-file-bytes`, instead of
-    // refusing the revision. It is never parsed, and `partialFiles` names it `oversized`.
+/// A published checkout of three small JS files, a class, and `z.js` past the snapshot's
+/// 2 MiB document bound with declarations and calls of its own, indexed under a raised
+/// `--max-file-bytes` (#1321).
+fn published_oversized_store() -> (tempfile::TempDir, tempfile::TempDir, Store) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     for n in 0..3 {
@@ -325,6 +324,8 @@ fn architecture_read_a_keeps_a_document_over_its_source_bound_as_its_file_module
         )
         .unwrap();
     }
+    // A class whose bases a Rules inheritance role reads.
+    fs::write(root.path().join("c.js"), "class Child extends Base {}\n").unwrap();
     // Past the per-document bound, with declarations and calls of its own. Indexing admits
     // it under a raised `--max-file-bytes`.
     let mut large = String::from("function big() { return g(1); }\n// ");
@@ -355,6 +356,15 @@ fn architecture_read_a_keeps_a_document_over_its_source_bound_as_its_file_module
             &cancel,
         )
         .unwrap();
+    (state, root, store)
+}
+
+#[test]
+fn architecture_read_a_keeps_a_document_over_its_source_bound_as_its_file_module() {
+    // Owner ruling 2026-11-26 (#1321): a source over the snapshot's 2 MiB document bound is
+    // kept as its file module, as capture keeps one over `--max-file-bytes`, instead of
+    // refusing the revision. It is never parsed, and `partialFiles` names it `oversized`.
+    let (_state, _root, store) = published_oversized_store();
     let response = store.evidence_response().unwrap();
     let (snapshot, regions) = response
         .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
@@ -503,4 +513,37 @@ fn architecture_byte_limits_name_whole_gib_and_mib() {
     assert_eq!(limit_text(ArchitectureByteLimits::READ_A.stored), "2 GiB");
     assert_eq!(limit_text(ArchitectureByteLimits::READ_A.document), "2 MiB");
     assert_eq!(limit_text(100), "100-byte");
+}
+
+#[test]
+fn rules_inheritance_skips_a_document_kept_as_its_file_module() {
+    // #1321 (Prime2 review of #1384): an inheritance role reads every document's bases. The
+    // document over the snapshot's bound has only its file module, so it is not parsed and its
+    // size is no parse bound; the check answers and names it as partly read.
+    let (_state, _root, store) = published_oversized_store();
+    let response = store.evidence_response().unwrap();
+    let (snapshot, _) = response
+        .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
+        .unwrap();
+    let projection =
+        crate::references::project_where(&snapshot, &[], None, None, &[], 5, &mut || Ok(()))
+            .unwrap();
+    let config = crate::rules::parse(
+        "version=1\n[roles.child]\nselect={name='Child',extends='Base'}\n[[rules]]\nid='inheritance'\nfor_each='child'\nrequire=[{calls='child'}]\n",
+    )
+    .unwrap();
+    let checked =
+        crate::rules::evaluate(&config, &snapshot, &projection, &[], &mut || Ok(())).unwrap();
+    let partial: Vec<_> = checked["partialFiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap(),
+                file["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(partial, [("z.js", "oversized")]);
 }
