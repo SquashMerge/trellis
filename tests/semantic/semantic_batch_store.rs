@@ -6526,15 +6526,12 @@ fn gc_keeps_proofs_referenced_by_retained_provenance() {
     );
 }
 
+/// A failed publication published nothing: the head is unchanged and no revision names a row
+/// it wrote. Rows it pre-wrote stay unnamed until maintenance collects them (#995), and then
+/// none are left.
 fn assert_nothing_published(world: &World, head: IndexPin) {
     assert_eq!(world.store.index_baseline().unwrap(), head);
     for table in [
-        "semantic_raw_batches",
-        "semantic_raw_captures",
-        "semantic_raw_documents",
-        "semantic_raw_proof_documents",
-        "semantic_raw_proofs",
-        "semantic_raw_exclusions",
         "semantic_revision_raw_selections",
         "semantic_coverage",
         "semantic_import_reports",
@@ -6545,6 +6542,26 @@ fn assert_nothing_published(world: &World, head: IndexPin) {
             "{table}"
         );
     }
+    let leader = world.store.publication_for_tests().unwrap();
+    world.store.maintain_revisions(&leader).unwrap();
+    for table in [
+        "semantic_raw_batches",
+        "semantic_raw_captures",
+        "semantic_raw_documents",
+        "semantic_raw_proof_documents",
+        "semantic_raw_proofs",
+        "semantic_raw_exclusions",
+        "semantic_payloads",
+        "semantic_references",
+        "semantic_provenance",
+    ] {
+        assert_eq!(
+            world.count(&format!("SELECT COUNT(*) FROM {table}")),
+            0,
+            "{table} after maintenance"
+        );
+    }
+    assert_eq!(world.store.index_baseline().unwrap(), head);
 }
 
 #[test]
@@ -6597,6 +6614,340 @@ fn failed_publication_leaves_no_partial_rows_and_the_batch_publishes_on_retry() 
         .unwrap();
     assert_eq!(pin.index_revision, head.index_revision + 1);
     assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+}
+
+/// The tables a batch import pre-writes (#995): its raw batch and its documents' payloads.
+const PREWRITTEN_TABLES: [&str; 10] = [
+    "semantic_raw_batches",
+    "semantic_raw_captures",
+    "semantic_raw_documents",
+    "semantic_raw_proofs",
+    "semantic_payloads",
+    "semantic_basis",
+    "semantic_provenance",
+    "semantic_symbols",
+    "semantic_references",
+    "semantic_call_bindings",
+];
+
+fn table_counts(db: &rusqlite::Connection, tables: &[&str]) -> Vec<i64> {
+    tables
+        .iter()
+        .map(|table| {
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        })
+        .collect()
+}
+
+/// #995: a batch import writes its rows in several short pre-write transactions. A read from
+/// another thread between them, and after the last, answers at once from the prior head.
+#[test]
+fn a_read_during_the_prewrite_answers_the_prior_head() {
+    use std::sync::Mutex;
+    use trellis::store::BatchPrewriteStage;
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let head = joined.destination_pin();
+    // One changed row per pre-write transaction, so the import writes in many of them.
+    world.store.set_prewrite_chunk_rows_for_tests(1);
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let (store, seen) = (world.store.clone(), reads.clone());
+    world.store.set_batch_prewrite_hook_for_tests(move |stage| {
+        let store = store.clone();
+        let read = std::thread::spawn(move || {
+            store
+                .status()
+                .map(|status| status.revision)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .join()
+        .unwrap();
+        seen.lock().unwrap().push((stage, read));
+        Ok(())
+    });
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap();
+    let reads = reads.lock().unwrap();
+    let between = reads
+        .iter()
+        .filter(|(stage, _)| *stage == BatchPrewriteStage::BetweenChunks)
+        .count();
+    assert!(between >= 2, "{reads:?}");
+    assert_eq!(reads.last().unwrap().0, BatchPrewriteStage::Prewritten);
+    for (stage, read) in reads.iter() {
+        assert_eq!(read.as_ref(), Ok(&head), "{stage:?}");
+    }
+    assert_eq!(pin.index_revision, head.index_revision + 1);
+    assert_eq!(world.store.status().unwrap().revision, pin);
+}
+
+/// #995: the publishing transaction names what the pre-write wrote and writes none of it. Every
+/// pre-written table has the same rows inside it, before its COMMIT, as when the pre-write
+/// ended; it adds only the manifest rows, one per coverage tuple.
+#[test]
+fn the_publishing_transaction_writes_no_prewritten_rows() {
+    use std::sync::Mutex;
+    use trellis::store::BatchPrewriteStage;
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let head = joined.destination_pin();
+    let prewritten = Arc::new(Mutex::new(None));
+    let (index_db, seen) = (world.index_db.clone(), prewritten.clone());
+    world.store.set_batch_prewrite_hook_for_tests(move |stage| {
+        if stage == BatchPrewriteStage::Prewritten {
+            let db = rusqlite::Connection::open_with_flags(
+                &index_db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let manifest = table_counts(&db, &["semantic_coverage"])[0];
+            *seen.lock().unwrap() = Some((table_counts(&db, &PREWRITTEN_TABLES), manifest));
+        }
+        Ok(())
+    });
+    let leader = world.store.publication_for_tests().unwrap();
+    let mut publishing = None;
+    let pin = world
+        .store
+        .publish_semantic_batch_observing_for_tests(
+            &joined,
+            admitted.stage_mut(),
+            head,
+            &leader,
+            &world.cancel,
+            |db| {
+                publishing = Some((
+                    table_counts(db, &PREWRITTEN_TABLES),
+                    table_counts(db, &["semantic_coverage"])[0],
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    let (before, manifest_before) = prewritten.lock().unwrap().take().unwrap();
+    let (inside, manifest_inside) = publishing.unwrap();
+    // The raw batch, its capture and the payloads were all pre-written.
+    assert!(before[..5].iter().all(|rows| *rows > 0), "{before:?}");
+    assert_eq!(inside, before, "{PREWRITTEN_TABLES:?}");
+    assert_eq!(manifest_before, 0);
+    let tuples = world.store.semantic_at(pin).unwrap().coverage.len() as i64;
+    assert!(tuples > 0);
+    assert_eq!(manifest_inside, tuples);
+}
+
+/// #995: a failure after the pre-write and before the publishing COMMIT leaves the prior head
+/// readable and publishes nothing; maintenance collects the unnamed rows, and the batch then
+/// publishes on retry.
+#[test]
+fn a_failure_after_the_prewrite_keeps_the_prior_head_and_maintenance_collects_its_rows() {
+    use trellis::store::BatchPrewriteStage;
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let head = joined.destination_pin();
+    world.store.set_batch_prewrite_hook_for_tests(|stage| {
+        anyhow::ensure!(
+            stage != BatchPrewriteStage::Prewritten,
+            "injected failure after the pre-write"
+        );
+        Ok(())
+    });
+    let leader = world.store.publication_for_tests().unwrap();
+    let error = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected failure after the pre-write"),
+        "{error:#}"
+    );
+    // The pre-written rows are there, unnamed; the prior head is the head and reads.
+    let rows = table_counts(&world.db(), &PREWRITTEN_TABLES);
+    assert!(rows[..5].iter().all(|rows| *rows > 0), "{rows:?}");
+    assert_eq!(world.store.status().unwrap().revision, head);
+    assert_nothing_published(&world, head);
+    world.store.set_batch_prewrite_hook_for_tests(|_| Ok(()));
+    let pin = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap();
+    assert_eq!(pin.index_revision, head.index_revision + 1);
+    // Maintenance keeps what the head names.
+    world.store.maintain_revisions(&leader).unwrap();
+    assert_eq!(world.store.status().unwrap().revision, pin);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert!(world.count("SELECT COUNT(*) FROM semantic_payloads") > 0);
+    assert!(!world.store.semantic_at(pin).unwrap().coverage.is_empty());
+}
+
+/// #995: when the head moves between the pre-write and the publishing transaction, the exact-head
+/// check fails the publication as a revision conflict and nothing of it is visible at the new
+/// head; maintenance collects its unnamed rows.
+#[test]
+fn a_lost_compare_and_swap_after_the_prewrite_publishes_nothing() {
+    use trellis::store::BatchPrewriteStage;
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let head = joined.destination_pin();
+    let (store, root) = (world.store.clone(), world.root.clone());
+    let moved = Arc::new(std::sync::Mutex::new(None));
+    let seen = moved.clone();
+    world.store.set_batch_prewrite_hook_for_tests(move |stage| {
+        if stage == BatchPrewriteStage::Prewritten {
+            // Another native publication takes the head first.
+            write_files(&root, &[("src/C.js", "function moved() {}\n")]);
+            let cancel = trellis::model::CancelFlag::default();
+            let (graph, native, capture) = index_workspace_bundle(
+                &IndexOptions::new(root.clone()),
+                store.root_id(),
+                &cancel,
+                |_| {},
+            )?;
+            let leader = store.publication_for_tests()?;
+            let baseline = store.index_baseline()?;
+            *seen.lock().unwrap() =
+                Some(store.publish_native(&graph, &capture, &native, &leader, baseline, &cancel)?);
+        }
+        Ok(())
+    });
+    let leader = world.store.publication_for_tests().unwrap();
+    let error = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("revision conflict"),
+        "{error:#}"
+    );
+    let moved = moved.lock().unwrap().take().unwrap();
+    assert_ne!(moved, head);
+    assert_eq!(world.store.status().unwrap().revision, moved);
+    assert!(world.count("SELECT COUNT(*) FROM semantic_payloads") > 0);
+    assert_nothing_published(&world, moved);
+}
+
+/// Fails every batch publication on `world` after its pre-write, until `clear_prewrite_failure`.
+fn fail_after_prewrite(world: &World) {
+    use trellis::store::BatchPrewriteStage;
+    world.store.set_batch_prewrite_hook_for_tests(|stage| {
+        anyhow::ensure!(
+            stage != BatchPrewriteStage::Prewritten,
+            "injected failure after the pre-write"
+        );
+        Ok(())
+    });
+}
+
+fn clear_prewrite_failure(world: &World) {
+    world.store.set_batch_prewrite_hook_for_tests(|_| Ok(()));
+}
+
+/// #995 review: a pre-write that never published must not keep its artifact from a different,
+/// valid descriptor, which its rolled-back transaction would have admitted. The next import
+/// collects it within its own permit, before any maintenance runs.
+#[test]
+fn an_abandoned_prewrite_does_not_reject_another_descriptor_for_its_artifact() {
+    let world = definitions_world();
+    let head = world.store.index_baseline().unwrap();
+    let first = split_definitions(&world, false);
+    fail_after_prewrite(&world);
+    let error = world.publish(&first).err().expect("injected failure");
+    assert!(
+        format!("{error:#}").contains("injected failure after the pre-write"),
+        "{error:#}"
+    );
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    clear_prewrite_failure(&world);
+    // A different descriptor over the same revision that shares the first artifact.
+    let (a, _) = definitions_docs();
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a]);
+    fixture.exclude("javascript", "src/B.js", "notRequested");
+    let second = world.write(&fixture);
+    let (pin, _, _) = world.publish(&second).unwrap();
+    assert_eq!(pin.index_revision, head.index_revision + 1);
+    // Only the published batch is left; the abandoned one was collected.
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections"),
+        1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_payloads p WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)"),
+        0
+    );
+}
+
+/// #995 review: a failed replay of the selected batch leaves payloads no manifest row names on
+/// a batch that is still selected. Maintenance collects them and keeps the head, its selection
+/// and every payload a revision names.
+#[test]
+fn maintenance_collects_unnamed_payloads_of_a_still_selected_batch() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (pin, _, _) = world.publish(&descriptor).unwrap();
+    let unnamed = "SELECT COUNT(*) FROM semantic_payloads p WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)";
+    let named = world.count("SELECT COUNT(*) FROM semantic_payloads") - world.count(unnamed);
+    let semantic = world.store.semantic_at(pin).unwrap();
+    // Unkeyed payloads, as omitted associations write them: a replay reuses none of them.
+    world.store.set_payload_reuse_for_tests(false);
+    fail_after_prewrite(&world);
+    let error = world.publish(&descriptor).err().expect("injected failure");
+    assert!(
+        format!("{error:#}").contains("injected failure after the pre-write"),
+        "{error:#}"
+    );
+    clear_prewrite_failure(&world);
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    assert!(world.count(unnamed) > 0);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections"),
+        1
+    );
+    let leader = world.store.publication_for_tests().unwrap();
+    world.store.maintain_revisions(&leader).unwrap();
+    assert_eq!(world.count(unnamed), 0);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_payloads"), named);
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    assert_eq!(world.store.semantic_at(pin).unwrap(), semantic);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections"),
+        1
+    );
 }
 
 #[test]

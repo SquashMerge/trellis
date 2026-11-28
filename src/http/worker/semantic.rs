@@ -105,6 +105,14 @@ impl SemanticMaintenance {
                 started.elapsed().as_micros()
             ),
         );
+        // The Architecture owner may have skipped the head's build for this catch-up
+        // (#1313 T10b): any unit that is not mid-progress settles that.
+        if !matches!(result, Ok(Ok(SemanticUnitOutcome::Progress))) {
+            state.architecture_catchup_unit_ended(matches!(
+                result,
+                Ok(Ok(SemanticUnitOutcome::Published))
+            ));
+        }
         match result {
             Ok(Ok(SemanticUnitOutcome::Idle)) => {
                 self.retry_after = None;
@@ -257,9 +265,22 @@ mod tests {
         assert_eq!(store.index_baseline().unwrap(), head);
     }
 
+    /// A checkout with one published semantic batch for `a.js` (scip-typescript), so that a
+    /// native edit leaves a semantic catch-up of the new head queued.
     #[cfg(feature = "test-support")]
-    #[test]
-    fn native_request_finishes_before_semantic_units_and_supersedes_private_stage() {
+    struct SemanticBasis {
+        _tmp: tempfile::TempDir,
+        store: crate::store::Store,
+        state: Arc<DaemonState>,
+        options: crate::model::IndexOptions,
+        cancel: Arc<AtomicBool>,
+        session: Arc<crate::store::topology::WriterSession>,
+        source: std::path::PathBuf,
+        basis: crate::model::IndexPin,
+    }
+
+    #[cfg(feature = "test-support")]
+    fn semantic_basis() -> SemanticBasis {
         use crate::capture::Capture;
         use crate::index_coordinator::IndexJobCoordinator;
         use crate::semantic_batch::{
@@ -333,6 +354,38 @@ mod tests {
             )
             .unwrap();
         drop(admitted);
+        SemanticBasis {
+            _tmp,
+            store,
+            state,
+            options,
+            cancel,
+            session,
+            source,
+            basis,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn native_request_finishes_before_semantic_units_and_supersedes_private_stage() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::semantic_batch::{
+            BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner, stage_batch,
+        };
+        use crate::semantic_import::{DestinationMutations, join_staged};
+        let SemanticBasis {
+            _tmp,
+            store,
+            state,
+            options,
+            cancel,
+            session,
+            source,
+            basis,
+        } = semantic_basis();
+        let limits = BatchLimits::PRODUCTION;
+        let descriptor = std::fs::read(options.workspace_root.join("descriptor.json")).unwrap();
 
         std::fs::write(&source, "function f(){g();} // first edit\n").unwrap();
         let request = state.enqueue_index(&options, None).unwrap();
@@ -1220,5 +1273,312 @@ mod tests {
         inbox.shut_down();
         assert!(cancel.load(Ordering::Acquire));
         assert!(inbox.wake_pending());
+    }
+
+    /// The Architecture owner's hook points, in order.
+    #[cfg(feature = "test-support")]
+    fn owner_points(state: &Arc<DaemonState>) -> std::sync::mpsc::Receiver<&'static str> {
+        let (send, points) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        state.set_architecture_hook_for_tests(Arc::new(move |point| {
+            let _ = send.lock().unwrap().send(point);
+        }));
+        points
+    }
+
+    #[cfg(feature = "test-support")]
+    fn reach(points: &std::sync::mpsc::Receiver<&'static str>, want: &str) {
+        loop {
+            let point = points
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap_or_else(|_| panic!("the owner never reached {want}"));
+            if point == want {
+                return;
+            }
+        }
+    }
+
+    /// #1313 T10b: a native edit publishes head N with a catch-up of N queued; the owner
+    /// skips N's build. A native edit's own head is now N. Returns the basis and N.
+    #[cfg(feature = "test-support")]
+    fn deferred_head() -> (
+        SemanticBasis,
+        std::sync::mpsc::Receiver<&'static str>,
+        crate::model::IndexPin,
+    ) {
+        let basis = semantic_basis();
+        let points = owner_points(&basis.state);
+        std::fs::write(&basis.source, "function f(){g();} // edit\n").unwrap();
+        let request = basis.state.enqueue_index(&basis.options, None).unwrap();
+        basis.state.worker_step().unwrap();
+        let head = basis
+            .store
+            .request_by_id(&request.id)
+            .unwrap()
+            .unwrap()
+            .revision
+            .unwrap();
+        assert_ne!(head, basis.basis);
+        assert_eq!(
+            basis.store.pending_semantic_target().unwrap().unwrap().pin,
+            head
+        );
+        reach(&points, "architecture_deferred_to_catchup");
+        // No turn is running or due: the owner waits on a signal, with no retry timer set.
+        basis.state.await_architecture_idle_for_tests();
+        assert_eq!(basis.state.architecture_builds_for_tests(), 0);
+        (basis, points, head)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn the_head_build_waits_for_its_queued_catch_up_whose_publication_starts_the_next() {
+        let (basis, points, native) = deferred_head();
+        let SemanticBasis {
+            store,
+            state,
+            options,
+            cancel,
+            session,
+            ..
+        } = &basis;
+        state.worker_step().unwrap(); // the next foreground selection prunes completed FIFO
+        state.next_wake();
+        state.inbox.wait(Some(Instant::now()));
+        assert_eq!(state.maintenance_priority_reason(session, options), None);
+        let mut semantic = SemanticMaintenance::default();
+        // The catch-up's units run until it publishes the next head.
+        for _ in 0..10_000 {
+            if store.index_baseline().unwrap() != native {
+                break;
+            }
+            semantic.run_unit(state, cancel);
+        }
+        let caught_up = store.index_baseline().unwrap();
+        assert_ne!(caught_up, native);
+        assert!(store.pending_semantic_target().unwrap().is_none());
+        // The publication itself woke the owner, with no worker step since and no timer.
+        reach(&points, "architecture_build_started");
+        state.await_architecture_idle_for_tests();
+        let attempts = state.architecture_attempts_for_tests();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.pin)
+                .collect::<Vec<_>>(),
+            [caught_up],
+            "only the caught-up head is built"
+        );
+        assert!(attempts[0].published);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_catch_up_unit_that_ends_without_publishing_lets_the_deferred_head_build() {
+        let (basis, points, native) = deferred_head();
+        // The catch-up's owner reports a unit that ended without publishing (deferred,
+        // failed or idle): the head is built now and not skipped again.
+        basis.state.architecture_catchup_unit_ended(false);
+        reach(&points, "architecture_build_started");
+        basis.state.await_architecture_idle_for_tests();
+        let attempts = basis.state.architecture_attempts_for_tests();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.pin)
+                .collect::<Vec<_>>(),
+            [native]
+        );
+        assert!(attempts[0].published);
+        assert!(basis.store.pending_semantic_target().unwrap().is_some());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_read_of_the_deferred_head_builds_it_at_once() {
+        let (basis, _points, native) = deferred_head();
+        // #934: a read answers at the catch-up head, labelled as catching up, so it asks for
+        // that head's own core and the owner builds it rather than wait for the catch-up.
+        let core = basis
+            .state
+            .architecture_core(
+                native,
+                crate::http::architecture::CoreRules::Any,
+                crate::testing::HANG_BACKSTOP,
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(core.pin, native);
+        basis.state.await_architecture_idle_for_tests();
+        let attempts = basis.state.architecture_attempts_for_tests();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.pin)
+                .collect::<Vec<_>>(),
+            [native]
+        );
+        assert!(basis.store.pending_semantic_target().unwrap().is_some());
+    }
+
+    /// A recorder of the owner's hook points that holds the owner at `hold`'s first
+    /// occurrence until the returned sender is dropped or sent to.
+    #[cfg(feature = "test-support")]
+    fn owner_points_held(
+        state: &Arc<DaemonState>,
+        hold: &'static str,
+    ) -> (
+        std::sync::mpsc::Receiver<&'static str>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (send, points) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let send = std::sync::Mutex::new(send);
+        let gate = std::sync::Mutex::new(Some(gate));
+        state.set_architecture_hook_for_tests(Arc::new(move |point| {
+            let _ = send.lock().unwrap().send(point);
+            if point == hold
+                && let Some(gate) = gate.lock().unwrap().take()
+            {
+                let _ = gate.recv_timeout(crate::testing::HANG_BACKSTOP);
+            }
+        }));
+        (points, release)
+    }
+
+    /// A native edit, published by one worker step on this thread.
+    #[cfg(feature = "test-support")]
+    fn native_edit(basis: &SemanticBasis, text: &str) -> crate::model::IndexPin {
+        std::fs::write(&basis.source, text).unwrap();
+        let request = basis.state.enqueue_index(&basis.options, None).unwrap();
+        basis.state.worker_step().unwrap();
+        basis
+            .store
+            .request_by_id(&request.id)
+            .unwrap()
+            .unwrap()
+            .revision
+            .unwrap()
+    }
+
+    /// #1313 T10b review: a read of an older retained pin after a read of the head must not
+    /// let the head's eager build be skipped. Each pin keeps its own request.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn an_older_pin_read_after_a_head_read_does_not_let_the_head_be_skipped() {
+        let basis = semantic_basis();
+        let (points, release) = owner_points_held(&basis.state, "architecture_step_started");
+        let head = native_edit(&basis, "function f(){g();} // edit\n");
+        assert_eq!(
+            basis.store.pending_semantic_target().unwrap().unwrap().pin,
+            head
+        );
+        // The owner's turn for the head is held before it reads anything.
+        reach(&points, "architecture_step_started");
+        let read = |pin: crate::model::IndexPin| {
+            let state = basis.state.clone();
+            std::thread::spawn(move || {
+                state
+                    .architecture_core(
+                        pin,
+                        crate::http::architecture::CoreRules::Any,
+                        crate::testing::HANG_BACKSTOP,
+                        &mut || Ok(()),
+                    )
+                    .map(|core| core.pin)
+            })
+        };
+        let head_read = read(head);
+        reach(&points, "architecture_read_waiting");
+        basis
+            .state
+            .architecture_request_older(basis.basis, crate::http::architecture::CoreRules::Any);
+        let older_read = read(basis.basis);
+        reach(&points, "architecture_read_waiting");
+        drop(release);
+        assert_eq!(head_read.join().unwrap().unwrap(), head);
+        assert_eq!(older_read.join().unwrap().unwrap(), basis.basis);
+        basis.state.await_architecture_idle_for_tests();
+        let built: Vec<_> = basis
+            .state
+            .architecture_attempts_for_tests()
+            .iter()
+            .filter(|attempt| attempt.published)
+            .map(|attempt| attempt.pin)
+            .collect();
+        assert!(
+            built.contains(&head) && built.contains(&basis.basis),
+            "{built:?}"
+        );
+    }
+
+    /// #1313 T10b review: while the head's eager build is skipped, a queued request for an
+    /// older retained pin is still built in that turn.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_queued_older_pin_is_built_while_the_head_is_skipped() {
+        let (basis, points, head) = deferred_head();
+        basis
+            .state
+            .architecture_request_older(basis.basis, crate::http::architecture::CoreRules::Any);
+        let core = basis
+            .state
+            .architecture_core(
+                basis.basis,
+                crate::http::architecture::CoreRules::Any,
+                crate::testing::HANG_BACKSTOP,
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(core.pin, basis.basis);
+        reach(&points, "architecture_deferred_to_catchup");
+        basis.state.await_architecture_idle_for_tests();
+        let attempts = basis.state.architecture_attempts_for_tests();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.pin)
+                .collect::<Vec<_>>(),
+            [basis.basis],
+            "the older pin is built and the head is still skipped"
+        );
+        assert!(basis.store.pending_semantic_target().unwrap().is_some());
+        assert_ne!(head, basis.basis);
+    }
+
+    /// #1313 T10b review: the owner decides the skip from its own admitted snapshot. A
+    /// publication that reaches COMMIT while that snapshot is held waits for it; the turn
+    /// still reaches its typed decision without opening a second snapshot behind the writer,
+    /// and the publication then commits.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_publication_committing_during_the_turn_does_not_block_its_queue_read() {
+        let basis = semantic_basis();
+        let (points, release) = owner_points_held(&basis.state, "architecture_step_admitted");
+        let head = native_edit(&basis, "function f(){g();} // edit\n");
+        reach(&points, "architecture_step_admitted");
+        // A second native edit runs to COMMIT on another thread, against the held snapshot.
+        let (at_commit, committing) = std::sync::mpsc::channel();
+        basis
+            .store
+            .set_publication_before_commit_hook_for_tests(move || {
+                let _ = at_commit.send(());
+            });
+        std::fs::write(&basis.source, "function f(){g();} // second edit\n").unwrap();
+        let request = basis.state.enqueue_index(&basis.options, None).unwrap();
+        let writer = {
+            let state = basis.state.clone();
+            std::thread::spawn(move || state.worker_step())
+        };
+        committing
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the second publication reached COMMIT");
+        drop(release);
+        // The decision came from the turn's own snapshot, where the head's catch-up is queued.
+        reach(&points, "architecture_deferred_to_catchup");
+        writer.join().unwrap().unwrap();
+        let second = basis.store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(second.state, "done");
+        assert_ne!(second.revision.unwrap(), head);
     }
 }

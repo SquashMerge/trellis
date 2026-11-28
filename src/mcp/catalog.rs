@@ -600,8 +600,8 @@ mod tests {
                         &id,
                         "bounded_work",
                         &anyhow::anyhow!(
-                            "bounded_work: architecture stored total: 672452376 bytes, \
-                             over the 512 MiB limit"
+                            "bounded_work: architecture stored total: 2400000000 bytes, \
+                             over the 2 GiB limit"
                         ),
                     )),
                     root,

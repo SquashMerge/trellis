@@ -760,19 +760,18 @@ impl KeptNativeDocument {
     }
 
     /// The kept document as a read at native revision `native_revision` decodes it: every
-    /// row gets the document's key, that native revision ID and the document's native proof
-    /// ID under `producer_id`, as the decoder writes them.
+    /// row gets the document's key, that native revision ID and `proof`, the document's
+    /// native proof ID at that revision, as the decoder writes them. Storage mints `proof`.
     pub(crate) fn restore(
         self,
         native_revision: &str,
-        producer_id: &str,
+        proof: &str,
     ) -> (DocumentInput, Vec<crate::native_records::ControlRegion>) {
         let Self {
             table: _,
             mut input,
             mut regions,
         } = self;
-        let proof = crate::store::native_proof_id(producer_id, &input.key, native_revision);
         let DocumentInput {
             key,
             file: _,
@@ -783,17 +782,17 @@ impl KeptNativeDocument {
         for declaration in declarations {
             declaration.document.clone_from(key);
             declaration.revision_id = native_revision.to_owned();
-            declaration.provenance_id.clone_from(&proof);
+            declaration.provenance_id = proof.to_owned();
         }
         for call in calls {
             call.document.clone_from(key);
             call.revision_id = native_revision.to_owned();
-            call.provenance_id.clone_from(&proof);
+            call.provenance_id = proof.to_owned();
         }
         for region in &mut regions {
             region.document.clone_from(key);
             region.revision_id = native_revision.to_owned();
-            region.provenance_id.clone_from(&proof);
+            region.provenance_id = proof.to_owned();
         }
         (input, regions)
     }

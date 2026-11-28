@@ -36,8 +36,11 @@ MODEL = "voyage-4-nano"
 SOURCE_HASHES = {
     "results/cards.jsonl": "4ca5a9d3588944094ad2e7ee12a454b60498a3ffff7783d78ee99cb4eb28abe0",
     "eval/queries.json": "b4cf25fbfd7ba8b91c7c49f11a558de6defe4d78f22642a1ef9249eaa13e5e55",
-    "results/eval.json": "843a191d9a4fef6dd1bf975be5d04182e6fe71fe341bcb0e2a1d3fab756ea9e0",
+    "results/eval.json": "78af93939d742974af8b2a4c5bf9b61aac2b24d0236f8f42908f6fe1adcf318f",  # #1323: voyage-4-nano only
+    "scripts/cards.py": "71384b41e2a689a93698939b7a89acaf1c9ccbcf87ac12941f911609da043fda",
+    "scripts/embed.py": "c3f185bb263eab10fac8cc9d33f80c2224cc25dc0257e7228cd93e6003cd1886",
     "scripts/evaluate.py": "1a76389a368fc823c6ba68f1ac206ca345cc11cedb15179cc041798322e41b1d",
+    "scripts/download.py": "2d44038187ccdedd0700614f91ebc51e628de2159cfe54f187509706f20045e2",
     "results/emb/voyage-4-nano.a.docs.npy": "4c80fc0658344ae5427427fc21186087edc0b235896502090ee3b874d4bc0c3d",
     "results/emb/voyage-4-nano.b.docs.npy": "1e6757ed955de1d7b2816b98e2031b14f65dd8f1363a49bfe3938ad03a102529",
     "results/emb/voyage-4-nano.c.docs.npy": "55de9fe1ca2aa0b42a5ddb23d67df2b6ca4a0cffbcedcf8a454e79e1865bb72f",
@@ -47,6 +50,10 @@ ORDER_HASHES = {
     "documents": "87d8f149103449876e5bf781c20ed96f6d7ee2736c1b5eb538f7d20ede1db1dd",
     "queries": "7cbc016b8ab034ddca29ded94454cff6c2db555046b7ed98bd092a62cf97107f",
 }
+# The #1323 verified-download manifest; see docs/semantic-search-eval/reference-corpus.json.
+MODEL_PIN_MANIFEST_SHA256 = "84605f14234fa5e0388a96127eea9bd4de91c6c9298a4d80872212ae1b3371be"
+# The #214 harness, committed verbatim; the evidence root's scripts/ must be byte-identical copies.
+REFERENCE_SCRIPTS_DIR = Path(__file__).resolve().parent / "reference"
 
 
 class InvalidInput(ValueError):
@@ -283,14 +290,16 @@ def analyze(args, result):
     paths = {p: root / p for p in selected_sources}
     candidate_paths = {v: candidate_dir / f"{v}.jsonl" for v in variants}
     candidate_paths["queries"] = candidate_dir / "queries.jsonl"
-    protected = [*paths.values(), *candidate_paths.values(), args.model_pin_manifest, Path(__file__)]
-    require(args.output.resolve() not in [p.resolve() for p in protected], "output must not overwrite an input")
+    conflict = output_conflict(args.output, root, candidate_dir, args.model_pin_manifest)
+    require(conflict is None, conflict)
     result["sourceArtifacts"] = {}
     for name, path in paths.items():
         actual = sha256(path)
         result["sourceArtifacts"][name] = {"path": str(path), "sha256": actual,
                                             "expectedSha256": SOURCE_HASHES[name]}
         require(actual == SOURCE_HASHES[name], f"saved reference artifact changed: {name}")
+    for path, expected in committed_script_pins().items():
+        require(path.is_file() and sha256(path) == expected, f"committed harness script changed: {path.name}")
     result["candidateArtifacts"] = {name: {"path": str(path), "sha256": sha256(path)}
                                      for name, path in candidate_paths.items()}
     manifest_bytes = args.model_pin_manifest.read_bytes()
@@ -377,9 +386,43 @@ def analyze(args, result):
                             if result["passed"] else "Owner-ratified form-c card cosine or all-query no-regression criterion failed.")
 
 
+def output_guard_test():
+    """--output must never replace an input, a pinned harness script or a reference script copy.
+
+    The child checker and its harness are copies in a temporary tree, so a guard regression can
+    only damage the copies, never this checkout.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tool = Path(tmp) / "tools" / "semantic-search"
+        shutil.copytree(REFERENCE_SCRIPTS_DIR, tool / "reference")
+        checker = tool / Path(__file__).name
+        shutil.copy2(Path(__file__).resolve(), checker)
+        root = Path(tmp) / "root"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "extra.py").write_text("keep\n")
+        manifest = Path(tmp) / "manifest.json"
+        manifest.write_text("{}\n")
+        targets = [tool / "reference" / "evaluate.py", tool / "reference" / "new-report.json",
+                   root / "scripts" / "extra.py", root / "scripts" / "new-report.json", root / "scripts/../scripts/evaluate.py"]
+        for target in targets:
+            before = target.read_bytes() if target.exists() else None
+            run = subprocess.run([sys.executable, "-I", str(checker), "--evidence-root", str(root),
+                                  "--candidate-dir", str(Path(tmp) / "candidate"), "--model-pin-manifest", str(manifest),
+                                  "--output", str(target)], capture_output=True, text=True)
+            after = target.read_bytes() if target.exists() else None
+            assert run.returncode == 1 and "must not" in run.stderr, f"--output {target} was not refused"
+            assert before == after, f"--output {target} changed the file"
+        assert output_conflict(Path(tmp) / "report.json", root, Path(tmp) / "candidate", manifest) is None
+
+
 def self_test():
     import tempfile
 
+    output_guard_test()
     with tempfile.TemporaryDirectory() as tmp:
         candidate = Path(tmp) / "candidate.jsonl"
         for record in ({"id": "wrong", "vector": [1, 0]}, {"id": "right", "vector": [1]}):
@@ -452,6 +495,46 @@ def self_test():
     return 0
 
 
+def output_conflict(output, evidence_root, candidate_dir, model_pin_manifest):
+    """Why --output must not be written, or None. Checked before any report is written."""
+    target = output.resolve()
+    inputs = [model_pin_manifest, Path(__file__), *(evidence_root / name for name in SOURCE_HASHES),
+              *committed_script_pins(), *(candidate_dir / f"{name}.jsonl" for name in ("a", "b", "c", "queries"))]
+    if target in {p.resolve() for p in inputs}:
+        return "--output must not overwrite an input"
+    for directory in (REFERENCE_SCRIPTS_DIR, evidence_root / "scripts"):
+        if target.is_relative_to(directory.resolve()):
+            return f"--output must not be inside the harness scripts directory {directory}"
+    return None
+
+
+def committed_script_pins():
+    return {REFERENCE_SCRIPTS_DIR / name.removeprefix("scripts/"): digest
+            for name, digest in SOURCE_HASHES.items() if name.startswith("scripts/")}
+
+
+def verify_reference(root, model_pin_manifest):
+    """Release-checklist presence check: every pinned reference input exists with its pinned hash."""
+    problems = []
+    pinned = {**{root / name: digest for name, digest in SOURCE_HASHES.items()},
+              **committed_script_pins(), model_pin_manifest: MODEL_PIN_MANIFEST_SHA256}
+    for path, expected in pinned.items():
+        if not path.is_file():
+            problems.append(f"missing: {path}")
+        elif sha256(path) != expected:
+            problems.append(f"changed: {path}")
+    if not problems:
+        cards = read_jsonl(root / "results/cards.jsonl")
+        queries = json.loads((root / "eval/queries.json").read_text())["queries"]
+        if {"documents": id_order_hash([c["id"] for c in cards]),
+                "queries": id_order_hash([q["id"] for q in queries])} != ORDER_HASHES:
+            problems.append("saved ID order does not match current benchmark")
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    print("FAIL: reference corpus missing or changed" if problems else f"PASS: reference corpus present: {root}")
+    return 1 if problems else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-root", type=Path)
@@ -461,18 +544,22 @@ def main():
                         help="include c for acceptance; a/b are optional diagnostics (default: c)")
     parser.add_argument("--model-pin-manifest", type=Path)
     parser.add_argument("--self-test", action="store_true", help="run small offline synthetic checks; no model or saved corpus")
+    parser.add_argument("--verify-reference", action="store_true",
+                        help="only check that the saved reference corpus under --evidence-root is present and unchanged")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    if args.verify_reference:
+        if args.evidence_root is None or args.model_pin_manifest is None:
+            parser.error("--verify-reference requires --evidence-root and --model-pin-manifest")
+        return verify_reference(args.evidence_root, args.model_pin_manifest)
     for name in ("evidence_root", "candidate_dir", "output", "model_pin_manifest"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required unless --self-test is used")
-    # This check precedes failure-report writing: never overwrite ANY input.
-    protected = [args.model_pin_manifest, Path(__file__),
-                 *(args.evidence_root / name for name in SOURCE_HASHES),
-                 *(args.candidate_dir / f"{name}.jsonl" for name in ("a", "b", "c", "queries"))]
-    if args.output.resolve() in {p.resolve() for p in protected}:
-        print("error: --output must not overwrite an input", file=sys.stderr)
+    # This check precedes failure-report writing: never overwrite an input or a harness script.
+    conflict = output_conflict(args.output, args.evidence_root, args.candidate_dir, args.model_pin_manifest)
+    if conflict is not None:
+        print(f"error: {conflict}", file=sys.stderr)
         return 1
     result = {
         "format": "trellis-semantic-search-parity-analysis/v1", "passed": False, "integrityPassed": False,

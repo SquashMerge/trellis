@@ -311,20 +311,24 @@ fn rust_lookup_keys_reuse_the_checked_source_for_sid_answers() {
     );
 }
 
-#[test]
-fn architecture_read_a_names_the_document_over_its_source_bound() {
-    // #1321: a document over the per-document bound is named, with its size.
+/// A published checkout of three small JS files, a class, and `z.js` past the snapshot's
+/// 2 MiB document bound with declarations and calls of its own, indexed under a raised
+/// `--max-file-bytes` (#1321).
+fn published_oversized_store() -> (tempfile::TempDir, tempfile::TempDir, Store) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     for n in 0..3 {
         fs::write(
             root.path().join(format!("f{n}.js")),
-            format!("function f{n}(x) {{ return x; }}\n"),
+            format!("function f{n}(x) {{ return g(x); }}\n"),
         )
         .unwrap();
     }
-    // Sorted last, and past Read A's per-document bound. Indexing admits it.
-    let mut large = String::from("// ");
+    // A class whose bases a Rules inheritance role reads.
+    fs::write(root.path().join("c.js"), "class Child extends Base {}\n").unwrap();
+    // Past the per-document bound, with declarations and calls of its own. Indexing admits
+    // it under a raised `--max-file-bytes`.
+    let mut large = String::from("function big() { return g(1); }\n// ");
     large.push_str(&"x".repeat(2 * 1024 * 1024));
     fs::write(root.path().join("z.js"), large).unwrap();
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -333,6 +337,15 @@ fn architecture_read_a_names_the_document_over_its_source_bound() {
     options.max_file_bytes = 4 * 1024 * 1024;
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let indexed = native
+        .declarations
+        .iter()
+        .filter(|row| row.document.path == "z.js")
+        .count();
+    assert!(
+        indexed > 1,
+        "indexing kept the large document's declarations"
+    );
     store
         .publish_native(
             &graph,
@@ -343,30 +356,52 @@ fn architecture_read_a_names_the_document_over_its_source_bound() {
             &cancel,
         )
         .unwrap();
-    let progress = std::sync::Mutex::new(Vec::new());
+    (state, root, store)
+}
+
+#[test]
+fn architecture_read_a_keeps_a_document_over_its_source_bound_as_its_file_module() {
+    // Owner ruling 2026-11-26 (#1321): a source over the snapshot's 2 MiB document bound is
+    // kept as its file module, as capture keeps one over `--max-file-bytes`, instead of
+    // refusing the revision. It is never parsed, and `partialFiles` names it `oversized`.
+    let (_state, _root, store) = published_oversized_store();
     let response = store.evidence_response().unwrap();
-    let (read, counts) = whole_request(|| {
-        response
-            .architecture_native_regions(None, &mut || Ok(()), &|done, total| {
-                progress.lock().unwrap().push((done, total))
-            })
-            .map(|_| ())
-    });
-    let error = read.unwrap_err();
-    // #1321: the refusal names the limit, the document and its size.
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "bounded_work: architecture document source: z.js is {} bytes, over the 2 MiB limit",
-            2 * 1024 * 1024 + 3
-        )
-    );
-    assert_eq!(counts.document_reads, 4);
-    assert_eq!(
-        progress.lock().unwrap().len(),
-        3,
-        "the documents before it were read"
-    );
+    let (snapshot, regions) = response
+        .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
+        .unwrap();
+    let position = |path: &str| {
+        snapshot
+            .documents
+            .iter()
+            .position(|document| document.key.path == path)
+            .unwrap()
+    };
+    let large = &snapshot.documents[position("z.js")];
+    assert_eq!(snapshot.evidence_gaps.get(&large.key), Some(&"oversized"));
+    assert!(snapshot.unparsed.contains(&large.key));
+    assert_eq!(large.declarations.len(), 1);
+    assert!(large.declarations[0].kind == "module" && large.declarations[0].ancestors.is_empty());
+    assert!(large.calls.is_empty());
+    assert!(regions[position("z.js")].is_empty());
+    let small = &snapshot.documents[position("f0.js")];
+    assert!(!snapshot.evidence_gaps.contains_key(&small.key));
+    assert!(small.declarations.len() > 1 && !small.calls.is_empty());
+    // The projection reads the revision and names the document, without parsing it.
+    let projection =
+        crate::references::project_where(&snapshot, &[], None, None, &[], 5, &mut || Ok(()))
+            .unwrap();
+    let partial: Vec<_> = projection.data["partialFiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap(),
+                file["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(partial, [("z.js", "oversized")]);
 }
 
 /// Read A of `store`'s head under `limits`, with the counts of the whole request.
@@ -378,37 +413,6 @@ fn read_a_under(store: &Store, limits: ArchitectureByteLimits) -> (Result<()>, S
             .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
             .map(|_| ())
     })
-}
-
-#[test]
-fn architecture_read_a_names_the_source_total_it_exceeds() {
-    // #1321: the total is the whole revision's, not the sum where the limit was crossed.
-    let (_state, root, store) = published_store(3);
-    let total: u64 = (0..3)
-        .map(|n| {
-            fs::metadata(root.path().join(format!("f{n}.js")))
-                .unwrap()
-                .len()
-        })
-        .sum();
-    let limits = ArchitectureByteLimits {
-        source: total - 1,
-        ..ArchitectureByteLimits::READ_A
-    };
-    let (read, counts) = read_a_under(&store, limits);
-    assert_eq!(
-        read.unwrap_err().to_string(),
-        format!(
-            "bounded_work: architecture source total: {total} bytes, over the {}-byte limit",
-            total - 1
-        )
-    );
-    assert_eq!(counts.document_reads, 3, "every header is read");
-    let limits = ArchitectureByteLimits {
-        source: total,
-        ..ArchitectureByteLimits::READ_A
-    };
-    read_a_under(&store, limits).0.unwrap();
 }
 
 #[test]
@@ -524,15 +528,19 @@ fn read_a_documents(store: &Store) -> Vec<String> {
 
 #[test]
 fn architecture_read_a_decodes_in_chunks_as_in_one() {
-    // #1321: decoding a chunk at a time gives every document as one decode after the loop.
+    // #1321: decoding a chunk at a time gives every document as one decode after the loop,
+    // a document over the per-document bound kept as its file module in its own chunk too.
     let (_state, _root, store) = published_store(4);
-    let whole = read_a_documents(&store);
-    assert_eq!(whole.len(), 4);
-    for bytes in [1, 2_000] {
-        let _chunk = set_read_a_decode_chunk_bytes_for_tests(bytes);
-        let (chunked, counts) = whole_request(|| read_a_documents(&store));
-        assert_eq!(chunked, whole, "chunks of {bytes} read bytes");
-        assert_eq!(counts.source_reads, 4);
+    let (_oversized_state, _oversized_root, oversized) = published_oversized_store();
+    for (store, documents) in [(&store, 4), (&oversized, 5)] {
+        let whole = read_a_documents(store);
+        assert_eq!(whole.len(), documents);
+        for bytes in [1, 2_000] {
+            let _chunk = set_read_a_decode_chunk_bytes_for_tests(bytes);
+            let (chunked, counts) = whole_request(|| read_a_documents(store));
+            assert_eq!(chunked, whole, "chunks of {bytes} read bytes");
+            assert_eq!(counts.source_reads, documents);
+        }
     }
 }
 
@@ -587,4 +595,45 @@ fn architecture_read_a_reports_a_decode_failure_after_every_bound() {
         )
     );
     assert_eq!(counts.source_reads, 1);
+}
+
+#[test]
+fn architecture_byte_limits_name_whole_gib_and_mib() {
+    // #1321: the stored total is 2 GiB (owner ruling 2026-11-26), and its refusal says so.
+    assert_eq!(limit_text(ArchitectureByteLimits::READ_A.stored), "2 GiB");
+    assert_eq!(limit_text(ArchitectureByteLimits::READ_A.document), "2 MiB");
+    assert_eq!(limit_text(100), "100-byte");
+}
+
+#[test]
+fn rules_inheritance_skips_a_document_kept_as_its_file_module() {
+    // #1321 (Prime2 review of #1384): an inheritance role reads every document's bases. The
+    // document over the snapshot's bound has only its file module, so it is not parsed and its
+    // size is no parse bound; the check answers and names it as partly read.
+    let (_state, _root, store) = published_oversized_store();
+    let response = store.evidence_response().unwrap();
+    let (snapshot, _) = response
+        .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
+        .unwrap();
+    let projection =
+        crate::references::project_where(&snapshot, &[], None, None, &[], 5, &mut || Ok(()))
+            .unwrap();
+    let config = crate::rules::parse(
+        "version=1\n[roles.child]\nselect={name='Child',extends='Base'}\n[[rules]]\nid='inheritance'\nfor_each='child'\nrequire=[{calls='child'}]\n",
+    )
+    .unwrap();
+    let checked =
+        crate::rules::evaluate(&config, &snapshot, &projection, &[], &mut || Ok(())).unwrap();
+    let partial: Vec<_> = checked["partialFiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap(),
+                file["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(partial, [("z.js", "oversized")]);
 }
