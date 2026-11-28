@@ -7952,7 +7952,24 @@ fn prewrite_raw_rows(
     ensure!(!artifacts.is_empty(), "staged batch has no artifacts");
     let mut capture_ids = Vec::with_capacity(artifacts.len());
     for (ordinal, languages, sha256, length) in &artifacts {
-        let other: Option<i64> = db.query_row("SELECT batch_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![producer_id,sha256,source_set_id,captured_revision], |r| r.get(0)).optional()?;
+        let captured_by = || -> Result<Option<i64>> {
+            Ok(db.query_row("SELECT batch_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![producer_id,sha256,source_set_id,captured_revision], |r| r.get(0)).optional()?)
+        };
+        let mut other = captured_by()?;
+        if let Some(abandoned) = other.filter(|other| *other != batch_id)
+            && batch_unselected(db, abandoned)?
+        {
+            // Another batch's pre-write that never published (#995) holds the artifact. Nothing
+            // selects it, and this publication's permit keeps every other publication and
+            // maintenance out, so collect it now: an abandoned pre-write never rejects an import
+            // its rollback would have admitted. Rows a revision still names stay, and so does
+            // the rejection they cause.
+            while collect_unselected_batch_chunk(db, abandoned)? {
+                gate()?;
+                prewrite.next_if_full()?;
+            }
+            other = captured_by()?;
+        }
         ensure!(
             other.is_none_or(|other| other == batch_id),
             "invalid_request: artifact already captured by another batch"
@@ -8827,21 +8844,58 @@ const UNSELECTED_BATCH_SQL: &str = "SELECT b.batch_id FROM semantic_raw_batches 
     WHERE NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.batch_id=b.batch_id)
     AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections p WHERE p.batch_id=b.batch_id)";
 
-/// One bounded chunk of collecting what a batch publication pre-wrote and never named
-/// (#995): first a payload of an unselected batch that no manifest row names and no release
-/// journals, then the raw rows of unselected batches. True if it deleted anything. Only a
-/// maintenance unit runs it, and a maintenance unit never runs inside a publication's permit,
-/// so no live publication owns what it collects.
+/// A payload no manifest row names and no release journals. Whether its raw batch is selected
+/// does not matter: a failed replay of a selected batch can leave one (#995).
+const UNNAMED_PAYLOAD_SQL: &str = "SELECT p.payload_id FROM semantic_payloads p
+    WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)
+    AND NOT EXISTS(SELECT 1 FROM semantic_release_candidate_payloads r WHERE r.payload_id=p.payload_id)";
+
+/// One bounded chunk of collecting what a batch publication wrote and never named (#995):
+/// first a payload no manifest row names and no release journals, whatever its batch, then the
+/// raw rows of an unselected batch. True if it deleted anything. Only a maintenance unit runs
+/// it, and a maintenance unit never runs inside a publication's permit, so no live publication
+/// owns what it collects.
 fn collect_unpublished_chunk(db: &Connection) -> Result<bool> {
     let payload: Option<i64> = db
+        .query_row(&format!("{UNNAMED_PAYLOAD_SQL} LIMIT 1"), [], |r| r.get(0))
+        .optional()?;
+    if let Some(payload) = payload {
+        semantic_payload::collect_payload_chunk(db, payload)?;
+        return Ok(true);
+    }
+    let batches: Vec<i64> = db
+        .prepare(&format!("{UNSELECTED_BATCH_SQL} LIMIT 8"))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for batch in batches {
+        if collect_unselected_batch_chunk(db, batch)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether no revision selects `batch` and no pending target names it.
+fn batch_unselected(db: &Connection, batch: i64) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE batch_id=?1)
+             AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections WHERE batch_id=?1)",
+        [batch],
+        |r| r.get(0),
+    )?)
+}
+
+/// One bounded chunk of collecting unselected raw batch `batch` (#995): one of its payloads no
+/// manifest row names and no release journals, else up to 4096 of its witness documents,
+/// proofs no provenance derives from and exclusions, its captures left without proofs (with
+/// their documents), its witness and its batch row once nothing names them. True if it
+/// deleted anything. The caller has checked that the batch is unselected and holds what keeps
+/// any live publication out: a maintenance permit, or the publication's own permit.
+fn collect_unselected_batch_chunk(db: &Connection, batch: i64) -> Result<bool> {
+    let payload: Option<i64> = db
         .query_row(
-            &format!(
-                "SELECT p.payload_id FROM semantic_payloads p WHERE p.batch_id IN ({UNSELECTED_BATCH_SQL})
-                 AND NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)
-                 AND NOT EXISTS(SELECT 1 FROM semantic_release_candidate_payloads r WHERE r.payload_id=p.payload_id)
-                 LIMIT 1"
-            ),
-            [],
+            &format!("{UNNAMED_PAYLOAD_SQL} AND p.batch_id=?1 LIMIT 1"),
+            [batch],
             |r| r.get(0),
         )
         .optional()?;
@@ -8849,7 +8903,25 @@ fn collect_unpublished_chunk(db: &Connection) -> Result<bool> {
         semantic_payload::collect_payload_chunk(db, payload)?;
         return Ok(true);
     }
-    release_unselected_raw_chunk(db)
+    let mut deleted = 0;
+    for statement in [
+        "DELETE FROM semantic_batch_witness_documents WHERE rowid IN (SELECT rowid FROM semantic_batch_witness_documents WHERE batch_id=?1 LIMIT 4096)",
+        "DELETE FROM semantic_batch_witnesses WHERE batch_id=?1 AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents WHERE batch_id=?1)",
+        "DELETE FROM semantic_raw_proofs WHERE rowid IN (SELECT p.rowid FROM semantic_raw_captures c CROSS JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.batch_id=?1 AND NOT EXISTS(SELECT 1 FROM semantic_provenance v WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id) LIMIT 4096)",
+        "DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE c.batch_id=?1 AND NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) LIMIT 64)",
+        "DELETE FROM semantic_raw_exclusions WHERE rowid IN (SELECT rowid FROM semantic_raw_exclusions WHERE batch_id=?1 LIMIT 4096)",
+        "DELETE FROM semantic_raw_batches WHERE batch_id=?1
+         AND NOT EXISTS(SELECT 1 FROM semantic_raw_captures WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_raw_exclusions WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_pending_selections WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_batch_witnesses WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_batch_witness_documents WHERE batch_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM semantic_payloads WHERE batch_id=?1)",
+    ] {
+        deleted += db.execute(statement, [batch])?;
+    }
+    Ok(deleted > 0)
 }
 
 /// Up to 64 rows of each raw table that only unselected batches own. True if it deleted any.
@@ -19151,12 +19223,18 @@ impl Store {
             // Revisions first: a release itself collects the batches it unselects. With none
             // due, rows a publication pre-wrote and never named are collected (#995).
             let unpublished = selected.is_none()
-                && db
+                && (db
                     .query_row(&format!("{UNSELECTED_BATCH_SQL} LIMIT 1"), [], |r| {
                         r.get::<_, i64>(0)
                     })
                     .optional()?
-                    .is_some();
+                    .is_some()
+                    || db
+                        .query_row(&format!("{UNNAMED_PAYLOAD_SQL} LIMIT 1"), [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .optional()?
+                        .is_some());
             Ok((head, now, selected, unpublished))
         })();
         drop(db);

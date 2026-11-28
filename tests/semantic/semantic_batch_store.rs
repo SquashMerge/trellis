@@ -6859,6 +6859,97 @@ fn a_lost_compare_and_swap_after_the_prewrite_publishes_nothing() {
     assert_nothing_published(&world, moved);
 }
 
+/// Fails every batch publication on `world` after its pre-write, until `clear_prewrite_failure`.
+fn fail_after_prewrite(world: &World) {
+    use trellis::store::BatchPrewriteStage;
+    world.store.set_batch_prewrite_hook_for_tests(|stage| {
+        anyhow::ensure!(
+            stage != BatchPrewriteStage::Prewritten,
+            "injected failure after the pre-write"
+        );
+        Ok(())
+    });
+}
+
+fn clear_prewrite_failure(world: &World) {
+    world.store.set_batch_prewrite_hook_for_tests(|_| Ok(()));
+}
+
+/// #995 review: a pre-write that never published must not keep its artifact from a different,
+/// valid descriptor, which its rolled-back transaction would have admitted. The next import
+/// collects it within its own permit, before any maintenance runs.
+#[test]
+fn an_abandoned_prewrite_does_not_reject_another_descriptor_for_its_artifact() {
+    let world = definitions_world();
+    let head = world.store.index_baseline().unwrap();
+    let first = split_definitions(&world, false);
+    fail_after_prewrite(&world);
+    let error = world.publish(&first).err().expect("injected failure");
+    assert!(
+        format!("{error:#}").contains("injected failure after the pre-write"),
+        "{error:#}"
+    );
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    clear_prewrite_failure(&world);
+    // A different descriptor over the same revision that shares the first artifact.
+    let (a, _) = definitions_docs();
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a]);
+    fixture.exclude("javascript", "src/B.js", "notRequested");
+    let second = world.write(&fixture);
+    let (pin, _, _) = world.publish(&second).unwrap();
+    assert_eq!(pin.index_revision, head.index_revision + 1);
+    // Only the published batch is left; the abandoned one was collected.
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections"),
+        1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_payloads p WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)"),
+        0
+    );
+}
+
+/// #995 review: a failed replay of the selected batch leaves payloads no manifest row names on
+/// a batch that is still selected. Maintenance collects them and keeps the head, its selection
+/// and every payload a revision names.
+#[test]
+fn maintenance_collects_unnamed_payloads_of_a_still_selected_batch() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (pin, _, _) = world.publish(&descriptor).unwrap();
+    let unnamed = "SELECT COUNT(*) FROM semantic_payloads p WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage c WHERE c.payload_id=p.payload_id)";
+    let named = world.count("SELECT COUNT(*) FROM semantic_payloads") - world.count(unnamed);
+    let semantic = world.store.semantic_at(pin).unwrap();
+    // Unkeyed payloads, as omitted associations write them: a replay reuses none of them.
+    world.store.set_payload_reuse_for_tests(false);
+    fail_after_prewrite(&world);
+    let error = world.publish(&descriptor).err().expect("injected failure");
+    assert!(
+        format!("{error:#}").contains("injected failure after the pre-write"),
+        "{error:#}"
+    );
+    clear_prewrite_failure(&world);
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    assert!(world.count(unnamed) > 0);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections"),
+        1
+    );
+    let leader = world.store.publication_for_tests().unwrap();
+    world.store.maintain_revisions(&leader).unwrap();
+    assert_eq!(world.count(unnamed), 0);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_payloads"), named);
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    assert_eq!(world.store.semantic_at(pin).unwrap(), semantic);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections"),
+        1
+    );
+}
+
 #[test]
 fn cancelled_publication_changes_nothing() {
     let world = definitions_world();
