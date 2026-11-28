@@ -471,7 +471,7 @@ fn app_files(
             } else {
                 evidence_failure_code(&error)
             };
-            let mut envelope = tools::failure(id, code);
+            let mut envelope = tools::failure_for(id, code, &error);
             if code == "not_found" {
                 envelope["error"]["message"] = serde_json::json!(crate::rules::UNKNOWN_APP);
             }

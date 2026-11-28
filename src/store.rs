@@ -972,6 +972,100 @@ impl std::io::Write for EncodedSourceBudget {
         Ok(())
     }
 }
+/// Architecture Read A's byte limits ([rules](../docs/rules.md#work-bounds-and-located-failures)).
+/// Each refusal is `bounded_work` and names its limit and the observed value (#1321).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArchitectureByteLimits {
+    /// One document's captured source.
+    pub(crate) document: u64,
+    /// All admitted captured source, plus present retained-manifest and root-config bytes.
+    pub(crate) source: u64,
+    /// All stored bytes the read charges: each document's header charge, plus the retained
+    /// dependency and config inputs.
+    pub(crate) stored: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ARCHITECTURE_BYTE_LIMITS: std::cell::Cell<Option<ArchitectureByteLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
+impl ArchitectureByteLimits {
+    pub(crate) const READ_A: Self = Self {
+        document: 2 * 1024 * 1024,
+        source: 256 * 1024 * 1024,
+        stored: 512 * 1024 * 1024,
+    };
+
+    /// The limits a read on this thread applies: [`Self::READ_A`], or a test's own.
+    fn current() -> Self {
+        #[cfg(test)]
+        if let Some(limits) = TEST_ARCHITECTURE_BYTE_LIMITS.get() {
+            return limits;
+        }
+        Self::READ_A
+    }
+
+    /// Lowers this thread's limits until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn set_for_tests(limits: Self) -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_ARCHITECTURE_BYTE_LIMITS.set(None);
+            }
+        }
+        TEST_ARCHITECTURE_BYTE_LIMITS.set(Some(limits));
+        Reset
+    }
+
+    fn document_refusal(self, path: &str, bytes: u64) -> anyhow::Error {
+        anyhow::anyhow!(
+            "bounded_work: architecture document source: {path} is {bytes} bytes, over the {} limit",
+            limit_text(self.document)
+        )
+    }
+
+    fn check_source(self, total: u64) -> Result<()> {
+        ensure!(
+            total <= self.source,
+            "bounded_work: architecture source total: {total} bytes, over the {} limit",
+            limit_text(self.source)
+        );
+        Ok(())
+    }
+
+    fn check_stored(self, total: u64) -> Result<()> {
+        ensure!(
+            total <= self.stored,
+            "bounded_work: architecture stored total: {total} bytes, over the {} limit",
+            limit_text(self.stored)
+        );
+        Ok(())
+    }
+
+    /// A present retained manifest or config input stays within capture's own input bound.
+    fn check_retained(path: &str, bytes: u64) -> Result<()> {
+        ensure!(
+            bytes <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES,
+            "bounded_work: architecture retained input: {path} is {bytes} bytes, over the {} limit",
+            limit_text(crate::skipped_config::CONFIG_INPUT_MAX_BYTES)
+        );
+        Ok(())
+    }
+}
+
+/// `512 MiB` for a whole number of MiB, else `100-byte`.
+fn limit_text(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes}-byte")
+    }
+}
+
 const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(CASE WHEN NOT class THEN row_bytes END),0),COALESCE(sum(CASE WHEN class THEN row_bytes END),0) FROM (
 SELECT ?3+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes,0 AS class FROM native_version_coverage_roles x WHERE x.vid=?1
 UNION ALL
@@ -1946,10 +2040,17 @@ impl EvidenceResponse {
         let mut pending = Vec::new();
         let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
+        // A refusal names the limit it hit and the whole revision's total (#1321). Once a total
+        // is over its limit the read can only fail: it frees the rows it fetched, fetches no
+        // more, and charges the remaining documents' sizes for the total it reports.
+        let limits = ArchitectureByteLimits::current();
+        let mut over = false;
+        let mut documents_seen = 0usize;
         while let Some(row) = cursor.next()? {
             check()?;
+            documents_seen += 1;
             ensure!(
-                pending.len() < 100_000,
+                documents_seen <= 100_000,
                 "bounded_work: architecture documents"
             );
             let key = DocumentKey {
@@ -1989,24 +2090,57 @@ impl EvidenceResponse {
                 .and_then(|kept| kept.documents.get(&key))
                 .filter(|document| Some(&document.table.identity) == identity.as_ref())
                 .map(|document| (document.table.bytes, document.table.stored_bytes));
-            if let Some((bytes, stored)) = reused {
+            let header = match reused {
                 // The same budgets as a read, from the sizes this identity was read with.
-                source_bytes = source_bytes.saturating_add(bytes.max(0) as u64);
-                stored_bytes = stored_bytes.saturating_add(stored);
-                ensure!(
-                    bytes <= 2 * 1024 * 1024
-                        && source_bytes <= 256 * 1024 * 1024
-                        && stored_bytes <= 512 * 1024 * 1024,
-                    "bounded_work: architecture source"
-                );
-                if let Some(reason) =
-                    crate::syntax_bounds::module_only_reason(diagnostic.as_deref())
-                {
-                    evidence_gaps.insert(key.clone(), reason);
+                Some(_) => None,
+                None => {
+                    let progress_failure = Mutex::new(None);
+                    let check = Mutex::new(&mut *check);
+                    let expired = || match (*check.lock().unwrap())() {
+                        Ok(()) => false,
+                        Err(error) => {
+                            *progress_failure.lock().unwrap() = Some(error);
+                            true
+                        }
+                    };
+                    let header = self.store.fetch_selected_header(
+                        &self.db,
+                        &key.path,
+                        &selected,
+                        Some(&expired),
+                    );
+                    if let Some(error) = progress_failure.lock().unwrap().take() {
+                        return Err(error);
+                    }
+                    Some(header?)
                 }
-                if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
-                    unparsed.insert(key.clone());
-                }
+            };
+            let (bytes, stored) = match (reused, &header) {
+                (Some(sizes), _) => sizes,
+                (None, Some(header)) => (header.bytes, header.stored_bytes),
+                (None, None) => unreachable!("a document is kept or has a header"),
+            };
+            let document_bytes = bytes.max(0) as u64;
+            if document_bytes > limits.document {
+                return Err(limits.document_refusal(&key.path, document_bytes));
+            }
+            source_bytes = source_bytes.saturating_add(document_bytes);
+            stored_bytes = stored_bytes.saturating_add(stored);
+            if !over && (source_bytes > limits.source || stored_bytes > limits.stored) {
+                over = true;
+                pending = Vec::new();
+                tables = Vec::new();
+            }
+            if over {
+                continue;
+            }
+            if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
+                evidence_gaps.insert(key.clone(), reason);
+            }
+            if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
+                unparsed.insert(key.clone());
+            }
+            let Some(header) = header else {
                 tables.push(NativeTable {
                     identity: identity.expect("a kept document matched its identity"),
                     fingerprint,
@@ -2017,8 +2151,7 @@ impl EvidenceResponse {
                 pending.push((key, None));
                 progress(pending.len(), total);
                 continue;
-            }
-            let header_sizes;
+            };
             let fetched = {
                 let progress_failure = Mutex::new(None);
                 let check = Mutex::new(&mut *check);
@@ -2029,25 +2162,6 @@ impl EvidenceResponse {
                         true
                     }
                 };
-                let header = self.store.fetch_selected_header(
-                    &self.db,
-                    &key.path,
-                    &selected,
-                    Some(&expired),
-                );
-                if let Some(error) = progress_failure.lock().unwrap().take() {
-                    return Err(error);
-                }
-                let header = header?;
-                header_sizes = (header.bytes, header.stored_bytes);
-                source_bytes = source_bytes.saturating_add(header.bytes.max(0) as u64);
-                stored_bytes = stored_bytes.saturating_add(header.stored_bytes);
-                ensure!(
-                    header.bytes <= 2 * 1024 * 1024
-                        && source_bytes <= 256 * 1024 * 1024
-                        && stored_bytes <= 512 * 1024 * 1024,
-                    "bounded_work: architecture source"
-                );
                 let fetched =
                     self.store
                         .fetch_selected_raw(&self.db, header, &selected, Some(&expired));
@@ -2056,25 +2170,42 @@ impl EvidenceResponse {
                 }
                 fetched?
             };
-            if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
-                evidence_gaps.insert(key.clone(), reason);
-            }
-            if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
-                unparsed.insert(key.clone());
-            }
             // A row whose identity is incomplete failed its header above.
             tables.push(NativeTable {
                 identity: identity.context(SelectedIntegrity(
                     "incompatible_index: selected native identity missing".into(),
                 ))?,
                 fingerprint,
-                bytes: header_sizes.0,
-                stored_bytes: header_sizes.1,
+                bytes,
+                stored_bytes: stored,
                 read: true,
             });
             pending.push((key, Some(std::sync::Mutex::new(Some(fetched)))));
             progress(pending.len(), total);
         }
+        drop(cursor);
+        // The retained dependency and config inputs are charged by their stored length with
+        // the documents, so a refusal reports the whole stored total.
+        for (column, corrupt) in [
+            (
+                "retained_dependencies",
+                "incompatible_index: invalid retained dependencies length",
+            ),
+            (
+                "retained_config",
+                "incompatible_index: invalid retained config length",
+            ),
+        ] {
+            let length: i64 = self.db.query_row(
+                &format!("SELECT length(CAST({column} AS BLOB)) FROM native_revisions WHERE id=?1"),
+                [&selected.key],
+                |row| row.get(0),
+            )?;
+            let length = u64::try_from(length).context(SelectedIntegrity(corrupt.into()))?;
+            stored_bytes = stored_bytes.saturating_add(length);
+        }
+        limits.check_source(source_bytes)?;
+        limits.check_stored(stored_bytes)?;
         // SQLite reads stay on this connection; decoding needs no connection, so
         // it runs in parallel. The first decode failure in document order is reported.
         let mut fetched_documents = Vec::new();
@@ -2144,20 +2275,8 @@ impl EvidenceResponse {
             }
         }
         // Retained manifests belong to this selected row and this admitted transaction.
-        // Charge stored bytes before fetching JSON, and source bytes before hex decoding.
-        let dependency_bytes: i64 = self.db.query_row(
-            "SELECT length(CAST(retained_dependencies AS BLOB)) FROM native_revisions WHERE id=?1",
-            [&selected.key],
-            |row| row.get(0),
-        )?;
-        let dependency_bytes = u64::try_from(dependency_bytes).context(SelectedIntegrity(
-            "incompatible_index: invalid retained dependencies length".into(),
-        ))?;
-        stored_bytes = stored_bytes.saturating_add(dependency_bytes);
-        ensure!(
-            stored_bytes <= 512 * 1024 * 1024,
-            "bounded_work: architecture source"
-        );
+        // Their stored bytes were charged with the documents; source bytes are charged
+        // before hex decoding.
         check()?;
         let (source_set_id, native_revision_id, dependency_hash, retained): (String, String, String, String) = self.db.query_row(
             "SELECT source_set_id,native_revision_id,dependency_hash,retained_dependencies FROM native_revisions WHERE id=?1",
@@ -2215,11 +2334,8 @@ impl EvidenceResponse {
                     bytes, byte_length, ..
                 } => {
                     source_bytes = source_bytes.saturating_add(byte_length);
-                    ensure!(
-                        byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
-                            && source_bytes <= 256 * 1024 * 1024,
-                        "bounded_work: architecture source"
-                    );
+                    ArchitectureByteLimits::check_retained(path, byte_length)?;
+                    limits.check_source(source_bytes)?;
                     selected_ensure!(
                         byte_length.checked_mul(2) == Some(bytes.len() as u64),
                         "incompatible_index: corrupt retained {} length",
@@ -2260,19 +2376,6 @@ impl EvidenceResponse {
         }
         // The root TypeScript config rides the retained native config: a present
         // `tsconfig.json`, else a present `jsconfig.json`.
-        let config_bytes: i64 = self.db.query_row(
-            "SELECT length(CAST(retained_config AS BLOB)) FROM native_revisions WHERE id=?1",
-            [&selected.key],
-            |row| row.get(0),
-        )?;
-        let config_bytes = u64::try_from(config_bytes).context(SelectedIntegrity(
-            "incompatible_index: invalid retained config length".into(),
-        ))?;
-        stored_bytes = stored_bytes.saturating_add(config_bytes);
-        ensure!(
-            stored_bytes <= 512 * 1024 * 1024,
-            "bounded_work: architecture source"
-        );
         check()?;
         let retained_config: String = self.db.query_row(
             "SELECT retained_config FROM native_revisions WHERE id=?1",
@@ -2339,11 +2442,8 @@ impl EvidenceResponse {
                 continue;
             }
             source_bytes = source_bytes.saturating_add(byte_length);
-            ensure!(
-                byte_length <= crate::skipped_config::CONFIG_INPUT_MAX_BYTES
-                    && source_bytes <= 256 * 1024 * 1024,
-                "bounded_work: architecture source"
-            );
+            ArchitectureByteLimits::check_retained(path, byte_length)?;
+            limits.check_source(source_bytes)?;
             selected_ensure!(
                 byte_length.checked_mul(2) == Some(bytes.len() as u64),
                 "incompatible_index: corrupt retained {} length",
