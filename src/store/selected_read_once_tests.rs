@@ -507,6 +507,96 @@ fn architecture_read_a_charges_only_the_rows_it_decodes() {
     read_a_under(&store, stored_limit(charged)).0.unwrap();
 }
 
+/// Each document of `store`'s head as Read A gives it: key, source, rows and regions.
+fn read_a_documents(store: &Store) -> Vec<String> {
+    let response = store.evidence_response().unwrap();
+    let (snapshot, regions) = response
+        .architecture_native_regions(None, &mut || Ok(()), &|_, _| {})
+        .unwrap();
+    snapshot
+        .documents
+        .iter()
+        .zip(regions)
+        .map(|(doc, regions)| {
+            format!(
+                "{:?} {:?} {:?} {:?} {regions:?}",
+                doc.key, doc.file, doc.declarations, doc.calls
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn architecture_read_a_decodes_in_chunks_as_in_one() {
+    // #1321: decoding a chunk at a time gives every document as one decode after the loop,
+    // a document over the per-document bound kept as its file module in its own chunk too.
+    let (_state, _root, store) = published_store(4);
+    let (_oversized_state, _oversized_root, oversized) = published_oversized_store();
+    for (store, documents) in [(&store, 4), (&oversized, 5)] {
+        let whole = read_a_documents(store);
+        assert_eq!(whole.len(), documents);
+        for bytes in [1, 2_000] {
+            let _chunk = set_read_a_decode_chunk_bytes_for_tests(bytes);
+            let (chunked, counts) = whole_request(|| read_a_documents(store));
+            assert_eq!(chunked, whole, "chunks of {bytes} read bytes");
+            assert_eq!(counts.source_reads, documents);
+        }
+    }
+}
+
+#[test]
+fn architecture_read_a_reports_a_decode_failure_after_every_bound() {
+    // #1321: a chunk's decode failure stops further fetches, and still yields to a byte
+    // bound of a later document, as when every row was decoded after the loop.
+    let (_state, _root, store) = published_store(3);
+    let db = store.cache_write().unwrap();
+    db.pragma_update(None, "ignore_check_constraints", "ON")
+        .unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE native_version_declarations SET role='invalid' WHERE name='f0'",
+            []
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let _chunk = set_read_a_decode_chunk_bytes_for_tests(1);
+    let (read, counts) = read_a_under(&store, ArchitectureByteLimits::READ_A);
+    let failure = read.unwrap_err().to_string();
+    assert!(!failure.starts_with("bounded_work"), "{failure}");
+    assert_eq!(counts.document_reads, 3, "every header is read");
+    assert_eq!(
+        counts.source_reads, 1,
+        "nothing is fetched after the failed chunk"
+    );
+    // The whole revision's stored total, from a refusal at the first document.
+    let stored_limit = |stored| ArchitectureByteLimits {
+        stored,
+        ..ArchitectureByteLimits::READ_A
+    };
+    let message = read_a_under(&store, stored_limit(1))
+        .0
+        .unwrap_err()
+        .to_string();
+    let total: u64 = message
+        .strip_prefix("bounded_work: architecture stored total: ")
+        .and_then(|rest| rest.strip_suffix(" bytes, over the 1-byte limit"))
+        .unwrap_or_else(|| panic!("{message}"))
+        .parse()
+        .unwrap();
+    // Over only at the last document: the first is fetched and fails its decode first.
+    let (read, counts) = read_a_under(&store, stored_limit(total - 1));
+    assert_eq!(
+        read.unwrap_err().to_string(),
+        format!(
+            "bounded_work: architecture stored total: {total} bytes, over the {}-byte limit",
+            total - 1
+        )
+    );
+    assert_eq!(counts.source_reads, 1);
+}
+
 #[test]
 fn architecture_byte_limits_name_whole_gib_and_mib() {
     // #1321: the stored total is 2 GiB (owner ruling 2026-11-26), and its refusal says so.
