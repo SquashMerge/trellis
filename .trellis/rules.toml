@@ -178,6 +178,11 @@ paths = [
   # model and native records. Storage builds them for one revision; the references read
   # (query) takes them in and re-exports them at their old paths.
   "src/architecture_inputs.rs",
+  # The admitted input identities storage computes and the Architecture core compares
+  # (#1393): the typed fingerprint encoding, the semantic-input, producer-projection and
+  # syntax-ID digests, and the semantic read charges. Pure over shared records, no I/O;
+  # moved out of src/architecture_core/dependencies.rs (query).
+  "src/architecture_identity.rs",
   # The producer selection and call-binding core (S12, #997): the per-language default
   # producers and their notes (#483), the snapshot facts and the `GraphSource` trait the
   # call graph reads through, and `call_disposition`, the binding selection (#466). Pure

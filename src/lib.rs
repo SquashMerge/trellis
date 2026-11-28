@@ -1,6 +1,7 @@
 pub(crate) mod apps;
 mod architecture_core;
 pub mod architecture_details;
+mod architecture_identity;
 mod architecture_inputs;
 mod architecture_read;
 pub mod auth;

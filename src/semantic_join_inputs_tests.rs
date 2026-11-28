@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, path::Path};
 /// cannot change a settled payload row for unchanged inputs.
 const NON_OUTPUT_ITEMS: &[(&str, &str)] = &[
     (
-        "architecture_core::dependencies::Fingerprint",
+        "architecture_identity::Fingerprint",
         "hashes read-time Architecture inventories only; it cannot change settled semantic payload rows",
     ),
     (

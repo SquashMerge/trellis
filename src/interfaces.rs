@@ -201,9 +201,8 @@ fn inputs(
     reads: impl Fn(&DocumentInput) -> bool,
     extra: &str,
 ) -> [u8; 32] {
-    use crate::architecture_core::dependencies::{
-        Fingerprint, manifest_digest, root_config_digest,
-    };
+    use crate::architecture_core::dependencies::{manifest_digest, root_config_digest};
+    use crate::architecture_identity::Fingerprint;
     let mut hash = Fingerprint::new(domain);
     hash.bytes(&manifest_digest(&snapshot.manifests));
     hash.bytes(&root_config_digest(snapshot.root_tsconfig.as_ref()));

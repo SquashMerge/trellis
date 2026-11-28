@@ -463,7 +463,7 @@ pub(crate) fn architecture_inventory_fingerprints(
     db: &Connection,
     revision: &str,
 ) -> Result<([u8; 32], [u8; 32])> {
-    use crate::architecture_core::dependencies::Fingerprint;
+    use crate::architecture_identity::Fingerprint;
     fn rows(
         db: &Connection,
         revision: &str,

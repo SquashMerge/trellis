@@ -20,7 +20,7 @@ mod semantic_retention;
 pub(crate) mod spool_reader;
 pub mod staging;
 #[cfg(feature = "test-support")]
-pub use crate::architecture_core::dependencies::SemanticReadCounts;
+pub use crate::architecture_identity::SemanticReadCounts;
 pub use crate::architecture_inputs::{
     ArchitectureFingerprints, DocumentFingerprint, NativeFingerprint, SemanticFreshnessState,
     SemanticInputState, SemanticTupleState,
@@ -1954,7 +1954,7 @@ impl EvidenceResponse {
                         .map(|producer| {
                             Ok((
                                 producer.clone(),
-                                crate::architecture_core::dependencies::producer_projection_digest(
+                                crate::architecture_identity::producer_projection_digest(
                                     native_first::semantic_projection_for(
                                         &self.db,
                                         snapshot.pin,
@@ -1967,7 +1967,7 @@ impl EvidenceResponse {
                             ))
                         })
                         .collect::<Result<_>>()?,
-                    sids: crate::architecture_core::dependencies::sid_digest(
+                    sids: crate::architecture_identity::sid_digest(
                         document
                             .declarations
                             .iter()
