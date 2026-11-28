@@ -216,36 +216,49 @@ entries, which the checker never reads.
 
 ### Rebuilding it
 
-Run every embedding step under the shared heavy-run lease. Never run the built `trellis` under
-your real `HOME`.
+Run every step from the evidence root `<root>`, and every build and embedding step under the
+shared heavy-run lease. Never run the 693c32c `trellis` under your real `HOME`, and never use an
+installed `trellis` for the index: its extractor and IDs differ.
 
-0. **Scripts.** Copy the four files in `tools/semantic-search/reference/` to `<root>/scripts/`
+1. **Scripts.** Copy the four files in `tools/semantic-search/reference/` to `<root>/scripts/`
    without modification. Their hashes are the `scripts` pins in the manifest and in the
    checker's `SOURCE_HASHES`; do not reformat them.
-1. **Indexer.** `git archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93` into a scratch directory
-   and build it with `cargo build --locked --release --bin trellis`.
-2. **Index.** The snapshot has no `.git`, so the source-set ID, and with it every `sid:v1` ID,
+2. **Venv.** `uv venv --python 3.12 <root>/venv`, then
+   `uv pip install --python <root>/venv/bin/python --exclude-newer 2026-10-19T19:33:00Z` with
+   the package list in `environment.resolution`. Check the resolved versions against
+   `environment.packages`. Every later `python` is `<root>/venv/bin/python -I`.
+3. **Indexer binary.** Build the release `trellis` from the source commit, outside any checkout,
+   and keep it in the evidence root:
+
+   ```sh
+   mkdir <scratch>/src-693c32c
+   git -C <trellis checkout> archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93 | tar -x -C <scratch>/src-693c32c
+   (cd <scratch>/src-693c32c && CARGO_TARGET_DIR=<scratch>/target cargo build --locked --release --bin trellis)
+   cp <scratch>/target/release/trellis <root>/trellis-693c32c
+   ```
+
+   The pinned `rust-toolchain.toml` in the snapshot selects Rust 1.99.1.
+4. **Index.** The snapshot has no `.git`, so the source-set ID, and with it every `sid:v1` ID,
    hashes the canonical workspace path. Re-index at the original canonical workspace path
    recorded in the local reference manifest (`local-manifest.json` in the evidence root): extract
-   the same snapshot there, run
-   `HOME=<root>/home XDG_CACHE_HOME= trellis index --workspace <that path>`, stop the daemon it
-   started, and remove the path. The index key must equal `79e73f12…` (`inputs.indexKey`), and the
-   index's source set must equal `inputs.sourceSetId`.
-3. **Cards.** `venv/bin/python -I scripts/cards.py <index.db> results/cards.jsonl`. The output
+   the same `git archive` there, run
+   `HOME=<root>/home XDG_CACHE_HOME= <root>/trellis-693c32c index --workspace <that path>`, stop
+   the daemon that binary started (by its exact PID), and remove the path. The index key must
+   equal `79e73f12…` (`inputs.indexKey`), and the index's source set must equal
+   `inputs.sourceSetId`.
+5. **Cards.** `python scripts/cards.py <index.db> results/cards.jsonl`, where `<index.db>` is
+   `<root>/home/Library/Caches/dev.squashmerge.trellis/indexes/<index key>/index.db`. The output
    must match `cards.sha256` byte for byte; if it doesn't, stop: the inputs differ.
-4. **Venv.** `uv venv --python 3.12 venv`, then `uv pip install --exclude-newer
-   2026-10-19T19:33:00Z` with the package list in `environment.resolution`. Check the resolved
-   versions against `environment.packages`.
-5. **Model.** `scripts/download.py <root>/models voyage-4-nano` fetches the evaluation pin
-   `433ece5e…`. The weight SHA-256 must equal the pin, and every file in the Candle runtime's
-   model directory must be byte-identical to the snapshot. Record both in
+6. **Model.** `HF_HOME=<root>/hf-home python scripts/download.py <root>/models voyage-4-nano`
+   fetches the evaluation pin `433ece5e…`. The weight SHA-256 must equal the pin, and every file
+   in the Candle runtime's model directory must be byte-identical to the snapshot. Record both in
    `verified-download-manifest.json`.
-6. **Vectors and evaluation.** Copy `docs/semantic-search-eval/queries.json` to
+7. **Vectors and evaluation.** Copy `docs/semantic-search-eval/queries.json` to
    `eval/queries.json`, then run
-   `scripts/embed.py voyage-4-nano <root>/models results/cards.jsonl eval/queries.json results/emb a,b,c 512`
-   and `scripts/evaluate.py results/cards.jsonl eval/queries.json results/emb results/eval.json voyage-4-nano`
+   `python scripts/embed.py voyage-4-nano <root>/models results/cards.jsonl eval/queries.json results/emb a,b,c 512`
+   and `python scripts/evaluate.py results/cards.jsonl eval/queries.json results/emb results/eval.json voyage-4-nano`
    (MPS).
-7. **Pin it.** Update `reference-corpus.json` and the checker's `SOURCE_HASHES` together, and
+8. **Pin it.** Update `reference-corpus.json` and the checker's `SOURCE_HASHES` together, and
    re-run the CPU and Metal parity check against the new reference.
 
 A rebuild that doesn't reproduce the pinned vector hashes is a new reference, not a restore. It

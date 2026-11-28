@@ -290,8 +290,8 @@ def analyze(args, result):
     paths = {p: root / p for p in selected_sources}
     candidate_paths = {v: candidate_dir / f"{v}.jsonl" for v in variants}
     candidate_paths["queries"] = candidate_dir / "queries.jsonl"
-    protected = [*paths.values(), *candidate_paths.values(), args.model_pin_manifest, Path(__file__)]
-    require(args.output.resolve() not in [p.resolve() for p in protected], "output must not overwrite an input")
+    conflict = output_conflict(args.output, root, candidate_dir, args.model_pin_manifest)
+    require(conflict is None, conflict)
     result["sourceArtifacts"] = {}
     for name, path in paths.items():
         actual = sha256(path)
@@ -386,9 +386,34 @@ def analyze(args, result):
                             if result["passed"] else "Owner-ratified form-c card cosine or all-query no-regression criterion failed.")
 
 
+def output_guard_test():
+    """--output must never replace an input, a pinned harness script or a reference script copy."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "root"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "extra.py").write_text("keep\n")
+        manifest = Path(tmp) / "manifest.json"
+        manifest.write_text("{}\n")
+        targets = [REFERENCE_SCRIPTS_DIR / "evaluate.py", REFERENCE_SCRIPTS_DIR / "new-report.json",
+                   root / "scripts" / "extra.py", root / "scripts" / "new-report.json", root / "scripts/../scripts/evaluate.py"]
+        for target in targets:
+            before = target.read_bytes() if target.exists() else None
+            run = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--evidence-root", str(root),
+                                  "--candidate-dir", str(Path(tmp) / "candidate"), "--model-pin-manifest", str(manifest),
+                                  "--output", str(target)], capture_output=True, text=True)
+            after = target.read_bytes() if target.exists() else None
+            assert run.returncode == 1 and "must not" in run.stderr, f"--output {target} was not refused"
+            assert before == after, f"--output {target} changed the file"
+        assert output_conflict(Path(tmp) / "report.json", root, Path(tmp) / "candidate", manifest) is None
+
+
 def self_test():
     import tempfile
 
+    output_guard_test()
     with tempfile.TemporaryDirectory() as tmp:
         candidate = Path(tmp) / "candidate.jsonl"
         for record in ({"id": "wrong", "vector": [1, 0]}, {"id": "right", "vector": [1]}):
@@ -461,6 +486,19 @@ def self_test():
     return 0
 
 
+def output_conflict(output, evidence_root, candidate_dir, model_pin_manifest):
+    """Why --output must not be written, or None. Checked before any report is written."""
+    target = output.resolve()
+    inputs = [model_pin_manifest, Path(__file__), *(evidence_root / name for name in SOURCE_HASHES),
+              *committed_script_pins(), *(candidate_dir / f"{name}.jsonl" for name in ("a", "b", "c", "queries"))]
+    if target in {p.resolve() for p in inputs}:
+        return "--output must not overwrite an input"
+    for directory in (REFERENCE_SCRIPTS_DIR, evidence_root / "scripts"):
+        if target.is_relative_to(directory.resolve()):
+            return f"--output must not be inside the harness scripts directory {directory}"
+    return None
+
+
 def committed_script_pins():
     return {REFERENCE_SCRIPTS_DIR / name.removeprefix("scripts/"): digest
             for name, digest in SOURCE_HASHES.items() if name.startswith("scripts/")}
@@ -509,12 +547,10 @@ def main():
     for name in ("evidence_root", "candidate_dir", "output", "model_pin_manifest"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required unless --self-test is used")
-    # This check precedes failure-report writing: never overwrite ANY input.
-    protected = [args.model_pin_manifest, Path(__file__),
-                 *(args.evidence_root / name for name in SOURCE_HASHES),
-                 *(args.candidate_dir / f"{name}.jsonl" for name in ("a", "b", "c", "queries"))]
-    if args.output.resolve() in {p.resolve() for p in protected}:
-        print("error: --output must not overwrite an input", file=sys.stderr)
+    # This check precedes failure-report writing: never overwrite an input or a harness script.
+    conflict = output_conflict(args.output, args.evidence_root, args.candidate_dir, args.model_pin_manifest)
+    if conflict is not None:
+        print(f"error: {conflict}", file=sys.stderr)
         return 1
     result = {
         "format": "trellis-semantic-search-parity-analysis/v1", "passed": False, "integrityPassed": False,
