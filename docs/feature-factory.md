@@ -76,12 +76,18 @@ The repository configuration has four operational boundaries:
 
 - `resolve` reads a recognized GitHub Issue and emits the canonical factory payload.
 - `bootstrap` installs the pinned MCP conformance-test packages from `tests/mcp` in a fresh sandbox without lifecycle scripts.
-- `verify` runs the same Rust, MCP conformance, JavaScript syntax, and browser test commands as CI.
-  If `FACTORY_VERIFY_WRAPPER` is set in the factory's environment, verify runs as
-  `$FACTORY_VERIFY_WRAPPER ./tools/verify`. Use it to run verify under a machine-wide lease or queue
-  shared with other heavy jobs. Unset, verify runs `./tools/verify` directly. The value is word-split,
-  so it must not contain spaces inside a path. `verify_timeout_ms` (4 hours) covers waiting for such a
-  lease as well as the run itself.
+- `verify` runs on CI, not on the factory's machine. [`tools/ci-verify.sh`](../tools/ci-verify.sh)
+  pushes the commit under test to `qualify/factory-<sha>`, where `rust.yml` runs the full verify
+  matrix, waits for that commit's six matrix checks, and deletes the branch when it exits. It exits 0
+  when all six pass and 1 when one fails or times out. It exits 75 (`verify_unavailable_exit`) when it
+  could not get an answer: origin's push URL is not a GitHub repository, the push failed, GitHub was
+  unreachable for 15 minutes, a check had not started after 20 minutes, a check was cancelled or
+  otherwise did not run, or its own 85-minute deadline passed. The factory then parks the slice
+  instead of reviewing or retrying it; resume the run once CI can answer. There is no fallback to a
+  local run. `verify_scope` is `integration`, so verify runs once, on the integrated top after every
+  slice has merged, not on each slice. The script's deadline stays below `verify_timeout_ms` (90
+  minutes), so the factory never has to kill it. The factory's `GH_TOKEN` must be able to push
+  branches and read check runs.
 - `mcp_servers` names the Trellis MCP server, so specialists use it on their own worktree.
 - `publish` declares the future branch-push command. The current factory release still performs its
   guarded Git and GitHub publication flow directly.

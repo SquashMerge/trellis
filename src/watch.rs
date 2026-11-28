@@ -162,6 +162,28 @@ fn relevant(event: &notify::Result<Event>, root: &Path, executable: Option<&Path
         .is_ok_and(|event| read_only(event.kind) || certainly_excluded(event, root, executable))
 }
 
+/// The optional `watch_event` marker detail for one native callback (#1355):
+/// the event kind, any notify flag (such as a rescan), whether it was
+/// accepted, how long classification took, and the first path of how many.
+fn event_detail(event: &notify::Result<Event>, relevant: bool, classify: Duration) -> String {
+    let classify_us = classify.as_micros();
+    match event {
+        Ok(event) => format!(
+            "kind={:?} flag={:?} relevant={relevant} classify_us={classify_us} paths={} path={}",
+            event.kind,
+            event.flag(),
+            event.paths.len(),
+            event
+                .paths
+                .first()
+                .map_or_else(String::new, |path| path.display().to_string()),
+        ),
+        Err(error) => {
+            format!("kind=error relevant={relevant} classify_us={classify_us} error={error}")
+        }
+    }
+}
+
 /// Accept an event: bump the generation, queue it, wake the worker. Only short,
 /// non-blocking steps, so a callback may do this under its liveness lock.
 fn accept(
@@ -491,7 +513,15 @@ impl WatchSignals {
                     pause();
                 }
             }
+            let classified = Instant::now();
             let relevant = relevant(&event, &callback_root, callback_executable.as_deref());
+            if crate::diagnostic_markers::diagnostics_enabled() {
+                crate::diagnostic_markers::diagnostic_marker(
+                    "-",
+                    "watch_event",
+                    &event_detail(&event, relevant, classified.elapsed()),
+                );
+            }
             // A released watcher has no authority over the checkout. The
             // lock is held only through the short effects below, so a
             // release waits for a callback already past this check.
@@ -884,6 +914,28 @@ mod source_relevance_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::*;
+
+    /// #1355: the `watch_event` marker names the event kind, any notify
+    /// flag, whether it was accepted and its first path of how many.
+    #[test]
+    fn the_watch_event_marker_names_kind_flag_relevance_and_path() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(PathBuf::from("/w/src/a.rs"))
+        .add_path(PathBuf::from("/w/src/b.rs"));
+        assert_eq!(
+            event_detail(&Ok(event), true, Duration::from_micros(7)),
+            "kind=Modify(Data(Content)) flag=None relevant=true classify_us=7 paths=2 path=/w/src/a.rs"
+        );
+        let rescan = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert_eq!(
+            event_detail(&Ok(rescan), true, Duration::ZERO),
+            "kind=Other flag=Some(Rescan) relevant=true classify_us=0 paths=0 path="
+        );
+        let error = event_detail(&Err(notify::Error::generic("lost")), true, Duration::ZERO);
+        assert!(error.starts_with("kind=error relevant=true classify_us=0 error="));
+    }
     #[test]
     fn running_executable_inside_excluded_target_forces_reconciliation() {
         let root = tempfile::tempdir().unwrap();
