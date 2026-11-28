@@ -1,4 +1,4 @@
-# TypeScript conformance corpus — native-v20 DRAFT
+# TypeScript conformance corpus — native-v21 DRAFT
 
 Seven TypeScript sources for #683 cover interfaces, type aliases, enums, generics,
 abstract classes, parameter properties, decorators, overloads, namespaces and
@@ -28,7 +28,7 @@ used to meet a floor.
   candidates and no calls or controls, and its coverage intent requests only
   `definition`, like the call-free JavaScript `public.js` barrel.
 
-The raw capture comes from Trellis's `trellis.native.syntax@native-v20` extractor
+The raw capture comes from Trellis's `trellis.native.syntax@native-v21` extractor
 through the #95 `native-capture` command, with UTF-8 byte coordinates. Native
 identifier-site candidates carry no inferred semantic role or target. `.tsx`
 uses the tree-sitter-typescript `tsx` grammar; other paths use `typescript`.
@@ -36,15 +36,20 @@ Native measurement does no type checking, so `tsconfig.json` (`allowJs:false`,
 `include` of `src/**/*.ts` and `src/**/*.tsx`) and the dependency-free
 `package.json` describe the future semantic project, not native inputs.
 `captures/native.json` has SHA-256
-`7ccc656e850d98be94a14a608ddf8bf8fb46fa36ad4427ee9591eeb5ed027cfb`. The compiled
+`43a1c1b1085d24640d6985c779bd351e00de32149ae36cde4e8cae9bc9bf76ae`. The compiled
 native extractor hash is
-`1d787cb9fdf4f32564e8fd8a76367b20543f600182a3ac117b5a4b1fcb6b4a1e`, pinned as
-`trellis-native-v20-typescript-test-support` in
-`docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. native-v20 (#1234) measures Rust
-enum variants as `variant` declarations and trait associated types as `alias` declarations; no
-TypeScript construct changed. Two recaptures are byte-identical and differ from the native-v19
-capture only in occurrence IDs, which include the producer version. The native anchors below are
-the native-v20 IDs.
+`8d6239f521b196dfea5f4ef51cf07faca8dc6c0d3fe62b13ed8fff45876c0655`, pinned as
+`trellis-native-v21-typescript-test-support` in
+`docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json`. native-v21 (#953) pins
+tree-sitter-typescript to a grammar revision that parses a call-site `typeof import(...)` type
+argument (`f<typeof import("m")>()`), which the 0.23.2 grammar misparsed; this corpus has no such
+call. Two recaptures are byte-identical and differ from the native-v20 capture only in occurrence
+IDs, which include the producer version. The `sid:v1` anchors below are unchanged; the
+`occ:v2` anchors are older IDs, already stale before native-v21, and do not resolve in this capture.
+
+native-v20 (#1234), pinned as `trellis-native-v20-typescript-test-support`, measures Rust enum
+variants as `variant` declarations and trait associated types as `alias` declarations; no
+TypeScript construct changed, so that recapture also changed only occurrence IDs.
 
 native-v19 (#1120), pinned as `trellis-native-v19-typescript-test-support`, stores Rust
 `while`, Java's enhanced `for` and `try (resource)`, and Python's `except` as control regions

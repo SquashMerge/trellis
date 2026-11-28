@@ -1,4 +1,4 @@
-# JavaScript conformance corpus — native-v20 DRAFT
+# JavaScript conformance corpus — native-v21 DRAFT
 
 An independently authored event-processing workbench for #28: ten ES modules
 cover parsing, normalization, stages, editing, history and runtime extensions.
@@ -18,7 +18,7 @@ family, dropped record or artificial tagged-template gap is used to meet a floor
 - 10 production capability reports; every family is available with no gaps.
 - Two independent command runs are byte-identical. Semantic counts remain zero.
 
-The raw capture comes from Trellis's actual `trellis.native.syntax@native-v20`
+The raw capture comes from Trellis's actual `trellis.native.syntax@native-v21`
 extractor through the #95 `native-capture` command. It uses UTF-8 byte coordinates,
 not the old helper's UTF-16 offsets. Native identifier-site candidates carry no
 inferred semantic role or target. Narrow explicit renamed imports have measured
@@ -31,7 +31,19 @@ barrel. Zero calls is not unsupported. Annotations contain native coverage only;
 scenario arrays, semantic artifacts, dispositions, callable negatives and rooted
 answers are empty. `generated/manifest.json` selects the content-addressed bundle.
 
-## Current native-v20 recapture
+## Current native-v21 recapture
+
+native-v21 (#953) pins tree-sitter-typescript to a grammar revision that parses a call-site
+`typeof import(...)` type argument (`f<typeof import("m")>()`). This corpus has no such call. The
+production `native-capture` command re-ran twice on these unchanged snapshots using pinned Rust
+1.99.1 and `test-support`. Both outputs were byte-identical (SHA-256
+`4258e6a8ed938f5e0c22744d67fdfed9a95aaa3721c138cf9e00a33315930cef`). Only the producer
+version, extractor hash and occurrence IDs (which include the producer version) differ from the
+native-v20 capture. The compiled native extractor hash is
+`8d6239f521b196dfea5f4ef51cf07faca8dc6c0d3fe62b13ed8fff45876c0655`,
+pinned as `trellis-native-v21-javascript-test-support` in the hardware profile.
+
+## Historical native-v20 recapture
 
 native-v20 (#1234) measures Rust enum variants as `variant` declarations and trait associated
 types as `alias` declarations. No JavaScript or TypeScript construct changed. The production
@@ -190,7 +202,7 @@ No executable, parser archive or fixture-local replacement extractor is vendored
 The obsolete TypeScript capture script and script-plus-parser archive pins are
 removed. F7's Python/tarfile reproducibility dependency no longer exists.
 
-## Reproduce the current native-v20 capture
+## Reproduce the current native-v21 capture
 
 The commands below reproduce the current capture, not the historical native-v10
 or native-v11 hashes above. From the repository root, use an owned target directory and the
