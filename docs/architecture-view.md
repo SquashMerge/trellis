@@ -953,7 +953,12 @@ background, on one per-checkout owner thread. A worker step that leaves a differ
 rules file from the last step hints the owner (#798), which compares the head and the rules
 file's hash with what it last published and starts a build when they differ; a newer head stops a build that is under way. The owner builds every active runtime's
 new head, with or without a rules file, so the first read after an activation or a publication
-usually finds its result published (#798). Reads never compute the head: any number of them wait for
+usually finds its result published (#798). One head's eager build is skipped (owner ruling
+2026-11-27, "build the proper version of T10b", #1313): a native publication whose semantic
+catch-up of that same head is queued, since the catch-up's publication supersedes it. The owner
+builds on the catch-up's publication. It builds the skipped head itself as soon as a read asks for
+it, so reads still answer at the catch-up head (#934), or when a catch-up unit ends without
+publishing it. Each of these wakes the owner by signal, not a timer. Reads never compute the head: any number of them wait for
 the same build, and each rechecks the pin and rules hash, so a new revision or an edited rules
 file is never served from an older result. A daemon restart or an idle checkout's retirement
 drops the result, and the next activation builds it again.

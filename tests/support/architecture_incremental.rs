@@ -479,6 +479,9 @@ impl CapturedArchitecture {
 
     pub fn build(&self, pin: IndexPin) -> (ArchitectureAttempt, ArchitectureCoreHandle) {
         let before = self.owner.architecture_verified_for_tests();
+        // This fixture drives semantic catch-up itself and asks for `pin`'s own core. The
+        // owner otherwise skips a head whose catch-up is queued (#1313 T10b).
+        self.owner.architecture_decline_catchup_for_tests(pin);
         self.owner.architecture_hint();
         let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
