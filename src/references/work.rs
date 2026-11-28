@@ -30,18 +30,22 @@ impl Work {
 fn scaled_limit(
     documents: usize,
     bytes: usize,
-    per_document: usize,
-    per_kib: usize,
+    (base, per_document, per_kib): (usize, usize, usize),
     ceiling: usize,
 ) -> usize {
     let kib = (bytes / 1024).saturating_add(usize::from(!bytes.is_multiple_of(1024)));
-    5_000_000usize
-        .saturating_add(documents.saturating_mul(per_document))
+    base.saturating_add(documents.saturating_mul(per_document))
         .saturating_add(kib.saturating_mul(per_kib))
         .min(ceiling)
 }
 pub(crate) fn reference_limit(documents: usize, bytes: usize) -> usize {
-    let limit = scaled_limit(documents, bytes, 20_000, 512, REFERENCE_CEILING);
+    // Owner ruling 2026-11-27 (#1359, option A): 1.25 times the #373 base and growth terms.
+    let limit = scaled_limit(
+        documents,
+        bytes,
+        (6_250_000, 25_000, 640),
+        REFERENCE_CEILING,
+    );
     #[cfg(feature = "test-support")]
     let limit = limit.min(TEST_REFERENCE_LIMIT.get());
     limit
@@ -104,7 +108,7 @@ pub fn set_reference_work_limit_for_tests(limit: usize) -> ReferenceWorkLimitGua
     ReferenceWorkLimitForTests(limit).apply()
 }
 pub(crate) fn rules_limit(documents: usize, bytes: usize) -> usize {
-    scaled_limit(documents, bytes, 10_000, 256, RULES_CEILING)
+    scaled_limit(documents, bytes, (5_000_000, 10_000, 256), RULES_CEILING)
 }
 
 // Counting only: admission and source validation remain with their existing owners.
@@ -196,13 +200,13 @@ mod tests {
 
     #[test]
     fn limits_grow_from_full_admission_and_round_aggregate_bytes() {
-        assert_eq!(reference_limit(0, 0), 5_000_000);
+        assert_eq!(reference_limit(0, 0), 6_250_000);
         assert_eq!(rules_limit(0, 0), 5_000_000);
-        assert_eq!(reference_limit(2, 0) - reference_limit(1, 0), 20_000);
+        assert_eq!(reference_limit(2, 0) - reference_limit(1, 0), 25_000);
         assert_eq!(rules_limit(2, 0) - rules_limit(1, 0), 10_000);
         let utf8 = "é".len();
         assert_eq!(reference_limit(2, utf8 + 1022), reference_limit(2, 1024));
-        assert_eq!(reference_limit(2, 1025) - reference_limit(2, 1024), 512);
+        assert_eq!(reference_limit(2, 1025) - reference_limit(2, 1024), 640);
         assert_eq!(rules_limit(2, 1025) - rules_limit(2, 1024), 256);
         assert_eq!(reference_limit(usize::MAX, usize::MAX), REFERENCE_CEILING);
         assert_eq!(rules_limit(usize::MAX, usize::MAX), RULES_CEILING);
