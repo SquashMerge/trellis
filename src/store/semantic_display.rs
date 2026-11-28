@@ -1776,15 +1776,15 @@ pub(crate) enum ArchitectureSemanticSources {
     All,
     Sources {
         keys: BTreeSet<DocumentKey>,
-        retained: BTreeMap<DocumentKey, crate::architecture_core::dependencies::SemanticReadCounts>,
+        retained: BTreeMap<DocumentKey, crate::architecture_identity::SemanticReadCounts>,
     },
 }
 
 #[derive(Default, serde::Serialize)]
 pub struct ArchitectureSemanticCounts {
-    pub sources: BTreeMap<DocumentKey, crate::architecture_core::dependencies::SemanticReadCounts>,
+    pub sources: BTreeMap<DocumentKey, crate::architecture_identity::SemanticReadCounts>,
     /// The existing producer selection performs no evidence admission charges.
-    pub global: crate::architecture_core::dependencies::SemanticReadCounts,
+    pub global: crate::architecture_identity::SemanticReadCounts,
 }
 
 pub(crate) fn architecture_semantic_for_sources(
@@ -1795,7 +1795,7 @@ pub(crate) fn architecture_semantic_for_sources(
     check: &mut impl FnMut() -> Result<()>,
     metadata_limit: usize,
 ) -> Result<ArchitectureSemanticCounts> {
-    use crate::architecture_core::dependencies::SemanticReadCounts;
+    use crate::architecture_identity::SemanticReadCounts;
     use crate::architecture_inputs::{
         RowProvenance, SemanticAnchor, SemanticMetadata, SemanticOutcome, SemanticRelationship,
     };
@@ -2622,7 +2622,7 @@ impl super::Store {
     pub fn architecture_semantic_selection_for_tests(
         &self,
         keys: Option<BTreeSet<DocumentKey>>,
-        retained: BTreeMap<DocumentKey, crate::architecture_core::dependencies::SemanticReadCounts>,
+        retained: BTreeMap<DocumentKey, crate::architecture_identity::SemanticReadCounts>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<(
         crate::architecture_inputs::Snapshot,

@@ -1255,7 +1255,7 @@ fn semantic_input(store: &Store, direct: bool) -> ArchitectureInput {
         input.semantic_counts.sources.insert(
             doc.key.clone(),
             if i == source {
-                dependencies::SemanticReadCounts {
+                crate::architecture_identity::SemanticReadCounts {
                     rows: 1,
                     metadata: 2,
                     lookups: 3,
@@ -1374,7 +1374,7 @@ fn architecture_incremental_full_rules_and_direct_does_not_dirty_references() {
     );
     assert_eq!(
         built.dependencies.documents[main].semantic,
-        dependencies::SemanticReadCounts {
+        crate::architecture_identity::SemanticReadCounts {
             rows: 1,
             metadata: 2,
             lookups: 3
