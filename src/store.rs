@@ -2525,8 +2525,8 @@ impl EvidenceResponse {
                 });
                 continue;
             };
-            let (input, kept_regions) =
-                document.restore(&native_revision, &table.identity.producer_id);
+            let proof = native_proof_id(&table.identity.producer_id, &key, &native_revision);
+            let (input, kept_regions) = document.restore(&native_revision, &proof);
             regions.push(kept_regions);
             documents.push(input);
         }
