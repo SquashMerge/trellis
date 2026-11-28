@@ -100,6 +100,7 @@ fn snapshot_at(
         documents,
         manifests: Vec::new(),
         root_tsconfig: None,
+        specifiers: Default::default(),
         evidence_gaps: gaps,
         unparsed: Default::default(),
     }

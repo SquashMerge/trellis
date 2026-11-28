@@ -85,6 +85,7 @@ pub(super) fn snapshot_in(root: &std::path::Path, files: &[(&str, &str)]) -> Sna
         documents,
         manifests: Vec::new(),
         root_tsconfig: None,
+        specifiers: Default::default(),
         evidence_gaps: Default::default(),
         unparsed: Default::default(),
     }

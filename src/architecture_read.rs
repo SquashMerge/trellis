@@ -798,6 +798,7 @@ impl EvidenceResponse {
         crate::architecture_details::edge_pairs(
             &references.data,
             &rules,
+            Some(&scope),
             &mut *check,
             |role, edge, pair| {
                 let summary = summaries

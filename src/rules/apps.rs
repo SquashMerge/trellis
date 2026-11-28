@@ -341,6 +341,37 @@ impl<'a> AppScope<'a> {
         self.apps.len() < 2 || !self.layer(a).is_disjoint(&self.layer(b))
     }
 
+    /// A reference from layer `a` into layer `b` of an app it shares none with (#1131):
+    /// `None` when no app of `a` declares `may_use` of an app of `b`; otherwise whether one of
+    /// those declarations lists `b`.
+    pub(crate) fn declared_use(&self, a: &str, b: &str) -> Option<bool> {
+        let targets = self.layer(b);
+        let mut declared = false;
+        for source in self.layer(a) {
+            let Some(authored) = self
+                .config
+                .apps
+                .iter()
+                .find(|app| app.name == self.apps[source].name)
+            else {
+                continue;
+            };
+            for used in &authored.may_use {
+                if !self
+                    .index(&used.app)
+                    .is_some_and(|app| targets.contains(&app))
+                {
+                    continue;
+                }
+                declared = true;
+                if used.layers.iter().any(|(layer, _)| layer == b) {
+                    return Some(true);
+                }
+            }
+        }
+        declared.then_some(false)
+    }
+
     /// The app of `path`: the one app of its `layer`, otherwise the app whose root contains it.
     pub(crate) fn file(&self, path: &str, layer: Option<&str>) -> Option<usize> {
         if self.apps.is_empty() {
@@ -508,6 +539,7 @@ pub(crate) const UNKNOWN_APP: &str =
 /// order (#855).
 pub(super) fn validate_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
     validate_layer_apps(config, apps)?;
+    validate_app_uses(config, apps)?;
     for wrapper in &config.wrappers {
         let Some((name, span)) = &wrapper.app else {
             continue;
@@ -578,6 +610,56 @@ pub(crate) fn file_apps<'p>(
         }
     }
     Ok(assigned)
+}
+
+/// Each authored app's `may_use` (#1131), in app name order then app order: the app named
+/// must be exactly one app of the effective inventory, and each layer listed must exist and
+/// belong to that app.
+fn validate_app_uses(config: &Config, apps: &[crate::apps::App]) -> Result<()> {
+    let scope = AppScope::new(config, apps);
+    for authored in &config.apps {
+        for used in &authored.may_use {
+            let matching = apps.iter().filter(|app| app.name == used.app).count();
+            if matching != 1 {
+                return Err(error(
+                    &config.text,
+                    used.span.clone(),
+                    if matching == 0 {
+                        "reference"
+                    } else {
+                        "ambiguity"
+                    },
+                    "token",
+                    format!(
+                        "app {} may_use names app {}, which {}",
+                        authored.name,
+                        used.app,
+                        if matching == 0 {
+                            "is not detected or authored".to_owned()
+                        } else {
+                            format!("{matching} apps share")
+                        }
+                    ),
+                ));
+            }
+            let app = scope.index(&used.app).expect("one matching app");
+            for (layer, span) in &used.layers {
+                if !config.layers.contains_key(layer) || !scope.layer(layer).contains(&app) {
+                    return Err(error(
+                        &config.text,
+                        span.clone(),
+                        "reference",
+                        "token",
+                        format!(
+                            "app {} may_use {} lists layer {layer}, which is not a layer of app {}",
+                            authored.name, used.app, used.app
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_layer_apps(config: &Config, apps: &[crate::apps::App]) -> Result<()> {

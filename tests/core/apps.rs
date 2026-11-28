@@ -1103,3 +1103,226 @@ fn summary_detected() -> Value {
     let rules_file = format!("version = 1\n{MIMIR_LAYERS}");
     summary(&with(&rules_file, &MIMIR_FILES))
 }
+
+/// #1131: a mod in app `alpha` imports app `beta`'s scripts through a custom specifier, and
+/// one plain relative import reaches app `gamma`. `alpha` declares that it may use only
+/// `beta`'s `pure` layer.
+const USE_RULES: &str = r#"version = 1
+[[specifiers]]
+prefix = "web:"
+dir = "b"
+suffix = ".js"
+exact = { pele = "b/vendor/pele.js", style = "b/style.css" }
+
+[apps.alpha]
+roots = ["a"]
+may_use = { beta = ["pure"] }
+
+[layers.main]
+app = "alpha"
+order = 1
+paths = ["a/**"]
+
+[layers.ui]
+app = "beta"
+order = 1
+paths = ["b/other.js"]
+
+[layers.pure]
+app = "beta"
+order = 2
+paths = ["b/lib.js", "b/vendor/**"]
+
+[layers.gamma]
+app = "gamma"
+order = 1
+paths = ["c/**"]
+"#;
+const USE_FILES: [(&str, &str); 9] = [
+    A_PACKAGE,
+    B_PACKAGE,
+    ("c/package.json", "{\"name\":\"gamma\"}\n"),
+    (
+        "a/main.js",
+        "import lib from \"web:lib\";\nimport pele from \"web:pele\";\nimport other from \"web:other\";\nimport style from \"web:style\";\nimport missing from \"web:missing\";\nimport { g } from \"../c/lib.js\";\nexport function f() { lib(); pele(); other(); style(); missing(); g(); }\n",
+    ),
+    ("b/lib.js", "window.Lib = function () {};\n"),
+    ("b/other.js", "window.Other = function () {};\n"),
+    ("b/vendor/pele.js", "var pele = 1;\n"),
+    ("b/style.css", ":root { --x: #000000; }\n"),
+    ("c/lib.js", "export function g() {}\n"),
+];
+
+/// The `$layers` row from `a/main.js` to `destination`.
+fn use_row<'a>(data: &'a Value, destination: &str) -> &'a Value {
+    data["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["rule"] == "$layers"
+                && row["target"]["path"] == "a/main.js"
+                && row["destination"]["path"] == destination
+        })
+        .unwrap_or_else(|| panic!("no row to {destination}: {data}"))
+}
+
+#[test]
+fn specifier_mappings_resolve_imports_including_exact_entries() {
+    let data = check(&with(USE_RULES, &USE_FILES)).unwrap();
+    // `dir` + name + `suffix`, and an `exact` entry, each name the file.
+    assert_eq!(use_row(&data, "b/lib.js")["destinationLayer"], "pure");
+    assert_eq!(
+        use_row(&data, "b/vendor/pele.js")["destinationLayer"],
+        "pure"
+    );
+    // A references read, which loads no rules, follows the same mappings. A mapped file that
+    // is no indexed script, and a mapped name with no file, stay unresolved with the mapping's
+    // reason; neither falls back to a package.
+    let (_state, _root, store, pin) = publish(&with(USE_RULES, &USE_FILES));
+    let response = store.evidence_response().unwrap();
+    let value = response
+        .architecture_response(
+            "references",
+            &json!({"expectedBasis": pin, "paths": ["a/main.js"]}),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let references = response.finish(value).unwrap();
+    let targets: Vec<&str> = references["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|edge| edge["target"]["path"].as_str())
+        .collect();
+    for path in ["b/lib.js", "b/vendor/pele.js", "b/other.js", "c/lib.js"] {
+        assert!(targets.contains(&path), "{path}: {targets:?}");
+    }
+    let mut unresolved: Vec<(String, String)> = references["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["site"]["spelling"].as_str().unwrap().to_owned(),
+                item["reason"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    unresolved.sort();
+    assert_eq!(
+        unresolved,
+        [
+            (
+                "\"web:missing\"".to_owned(),
+                "javascript_specifier_not_indexed".to_owned()
+            ),
+            (
+                "\"web:style\"".to_owned(),
+                "javascript_specifier_not_indexed".to_owned()
+            ),
+        ]
+    );
+    assert!(
+        references["externalPackages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn declared_cross_app_use_conforms_into_an_allowed_layer() {
+    let data = check(&with(USE_RULES, &USE_FILES)).unwrap();
+    for path in ["b/lib.js", "b/vendor/pele.js"] {
+        let row = use_row(&data, path);
+        assert_eq!(row["status"], "conforms", "{row}");
+        assert_eq!(row["unresolved"], json!([]));
+    }
+}
+
+#[test]
+fn declared_cross_app_use_deviates_into_an_undeclared_layer() {
+    let data = check(&with(USE_RULES, &USE_FILES)).unwrap();
+    let row = use_row(&data, "b/other.js");
+    assert_eq!(row["sourceLayer"], "main");
+    assert_eq!(row["destinationLayer"], "ui");
+    assert_eq!(row["status"], "deviates", "{row}");
+    assert_eq!(data["counts"]["deviates"], 1);
+    // A judged cross-app pair still belongs to no app: the two layers share none.
+    assert_eq!(data["noApp"]["counts"]["deviates"], 1);
+}
+
+#[test]
+fn an_undeclared_app_pair_stays_cross_app() {
+    let data = check(&with(USE_RULES, &USE_FILES)).unwrap();
+    let row = use_row(&data, "c/lib.js");
+    assert_eq!(row["status"], "unknown");
+    assert_eq!(row["unresolved"], json!(["cross_app"]));
+    // Without `may_use`, the same import of an allowed layer is interface evidence again.
+    let undeclared = USE_RULES.replace("may_use = { beta = [\"pure\"] }\n", "");
+    let data = check(&with(&undeclared, &USE_FILES)).unwrap();
+    let row = use_row(&data, "b/lib.js");
+    assert_eq!(row["status"], "unknown");
+    assert_eq!(row["unresolved"], json!(["cross_app"]));
+    assert_eq!(data["counts"]["deviates"], 0);
+}
+
+#[test]
+fn invalid_specifiers_and_may_use_are_invalid_rules() {
+    let cases: [(&str, &str, &str); 9] = [
+        (
+            "may_use = { beta = [\"pure\"] }",
+            "may_use = { delta = [\"pure\"] }",
+            "reference",
+        ),
+        (
+            "may_use = { beta = [\"pure\"] }",
+            "may_use = { beta = [\"gamma\"] }",
+            "reference",
+        ),
+        (
+            "may_use = { beta = [\"pure\"] }",
+            "may_use = { beta = [\"nowhere\"] }",
+            "reference",
+        ),
+        (
+            "may_use = { beta = [\"pure\"] }",
+            "may_use = { alpha = [\"main\"] }",
+            "schema",
+        ),
+        (
+            "may_use = { beta = [\"pure\"] }",
+            "may_use = { beta = [] }",
+            "schema",
+        ),
+        ("prefix = \"web:\"\n", "", "schema"),
+        (
+            "dir = \"b\"\nsuffix = \".js\"\nexact = { pele = \"b/vendor/pele.js\", style = \"b/style.css\" }\n",
+            "",
+            "schema",
+        ),
+        ("dir = \"b\"\n", "dir = \"../b\"\n", "schema"),
+        (
+            "suffix = \".js\"\n",
+            "suffix = \".js\"\nkind = \"esbuild\"\n",
+            "schema",
+        ),
+    ];
+    for (from, to, kind) in cases {
+        assert!(USE_RULES.contains(from), "{from}");
+        let rules_file = USE_RULES.replacen(from, to, 1);
+        let diagnostic = invalid(&with(&rules_file, &USE_FILES));
+        assert_eq!(diagnostic["kind"], kind, "{from} -> {to}: {diagnostic}");
+    }
+    // Two prefixes where one starts the other would both own `web:x`.
+    let overlapping = USE_RULES.replacen(
+        "[apps.alpha]",
+        "[[specifiers]]\nprefix = \"web:lib\"\nexact = { x = \"b/lib.js\" }\n\n[apps.alpha]",
+        1,
+    );
+    assert_eq!(
+        invalid(&with(&overlapping, &USE_FILES))["kind"],
+        "ambiguity"
+    );
+}

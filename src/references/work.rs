@@ -256,6 +256,7 @@ mod tests {
             }],
             manifests: vec![manifest, present],
             root_tsconfig: None,
+            specifiers: Default::default(),
             evidence_gaps: Default::default(),
             unparsed: Default::default(),
         };

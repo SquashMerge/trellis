@@ -265,6 +265,9 @@ This adds a row to the direction table:
 | --- | --- |
 | Source and destination layers that share no app | unknown, with reason `cross_app` |
 
+(#1131: unless one app declares `may_use` of the other's layers; see
+[Amendment (#1131)](#amendment-1131-import-specifier-mappings-and-declared-cross-app-use).)
+
 `cross_app` joins `layer_unassigned` in the instance's `unresolved` reasons. Such a pair is
 never counted as a deviation and never fails `trellis rules check`. It stays `unknown` until
 [#686](https://github.com/SquashMerge/trellis/issues/686) measures interfaces between apps.
@@ -561,7 +564,8 @@ behaves exactly as under those sections.
 **Authored apps (D1, D5).** `apps` is the eighth closed top-level key: a map of
 `[apps.<name>]` tables, like `[layers.<name>]`. The table key is the app's name: nonblank and
 case-sensitive, the name layers use in `app` and `apps`. The TOML parser rejects a repeated
-table. Each table has exactly one key:
+table. Each table has exactly one key (#1131 adds an optional `may_use`; see
+[Amendment (#1131)](#amendment-1131-import-specifier-mappings-and-declared-cross-app-use)):
 
 | Key | Rule |
 | --- | --- |
@@ -733,6 +737,91 @@ file names no feature for it. Declaration roles, `callerRole`, find, search, met
 treemap do not change, and nothing is re-indexed when the key changes. A rules file without the key behaves exactly
 as before.
 
+### Amendment (#1131): import specifier mappings and declared cross-app use
+
+**Status: owner ruling 2026-11-27 on [#1131](https://github.com/SquashMerge/trellis/issues/1131)
+(options R2 and K1), for ratification.** A build tool can resolve an import specifier that no
+manifest or `tsconfig.json` declares, such as an esbuild plugin's virtual namespace. Such
+imports were unresolved, so the direction between the two apps they join was never checked.
+This amendment lets the rules file map such specifiers to files, and lets an app declare which
+layers of another app it may use.
+
+**`specifiers` (R2)** is an optional top-level key, the eleventh: an array of tables.
+
+```toml
+[[specifiers]]
+prefix = "trellis-web:"
+dir = "web"
+suffix = ".js"
+exact = { pele = "web/vendor/pele-1.10.0-trellis.2.js" }
+```
+
+| Key | Rule |
+| --- | --- |
+| `prefix` | Required. 1 to 256 characters with no whitespace, control character or backslash, not starting with `.` or `/`. No prefix may start another entry's prefix (`ambiguity`), so at most one entry owns a specifier. |
+| `dir` | Optional. `.` (the checkout) or a literal checkout-relative directory, as an `[apps]` root. |
+| `suffix` | Optional, only with `dir`. 1 to 256 characters with no `/`, whitespace, control character or backslash. |
+| `exact` | Optional. A nonempty table of at most 1,024 names (each like `prefix`, without its start rule) to literal checkout-relative file paths. |
+
+An entry has `dir` or `exact`, or both. More than 64 entries is `too_large`; every other
+violation, and any other key, is a located `schema` error.
+
+A JavaScript or TypeScript import, re-export or `import x = require(...)` whose specifier
+starts with a mapping's `prefix` resolves through that mapping, before `paths`, `baseUrl`,
+workspace packages and package labels; the rest of the specifier is the *name*. An `exact`
+name gives its file. Otherwise, with `dir`, the file is `dir/<name><suffix>`; a name that is
+empty, has a backslash or NUL, or leaves `dir` maps nothing. The path is literal: no extension
+or `index` candidates are tried. The import then targets that file's module, as a relative
+import does, and exports are followed as for any module. A mapping owns every specifier under
+its prefix: a name it maps nothing for is unresolved with `javascript_specifier_unmapped`, a
+mapped path that is no indexed script with `javascript_specifier_not_indexed`, and neither
+falls back to a package label. A mapping may name a file that is no script (a stylesheet a
+plugin reads, for example); that import stays unresolved with the second reason, which records
+where it goes.
+
+Mappings change reference resolution, so they reach every read that resolves references:
+`trellis_references` and the rules check, explain, view and details. A build uses the
+mappings of the rules file it is built with; a read that does not load the rules takes them
+from the checkout's current file, and a missing or invalid file maps nothing. They never
+change the semantic producer's project configuration (the generated or checkout
+`tsconfig.json`); they are not captured with the revision, and nothing is re-indexed when they
+change. A rules file without the key behaves exactly as before.
+
+**`may_use` (K1)** is a second, optional key of an authored `[apps.<name>]` table: a table
+from the name of another app to a nonempty list of distinct layer names of that app.
+
+```toml
+[apps.mod]
+roots = ["mod"]
+may_use = { web = ["web-pure", "web-adapters"] }
+```
+
+`roots` stays required, so an app that declares `may_use` is authored; to annotate a detected
+app, author it at its own root under its own name (the "rename" row of
+[Amendment (#794)](#amendment-794-authored-apps)). Each error is a located `invalid_rules`:
+an empty table or list, a blank or repeated layer, or the app's own name is `schema`; more than
+1,024 apps or layers is `too_large`. When the effective apps are known, an app name that is no
+app is `reference` and one that several apps share is `ambiguity`; a listed layer that does not
+exist, or is not a layer of that app (an ordered layer whose `app` it is, or a shared layer
+that serves it), is `reference`.
+
+This changes one row of the [#783 direction table](#amendment-783-apps-and-per-app-layers). For
+a `$layers` pair whose source and destination layers share no app:
+
+| Declaration | Result |
+| --- | --- |
+| An app of the source layer declares `may_use` of an app of the destination layer, and lists the destination layer | conforms |
+| An app of the source layer declares `may_use` of an app of the destination layer, and no such declaration lists the destination layer | deviates |
+| No app of the source layer declares `may_use` of any app of the destination layer | unknown, with reason `cross_app`, as before |
+
+Only the declaring app's direction is judged: `may_use` in one app says nothing about
+references from the other app back into it. A judged pair is counted and excepted like any
+`$layers` pair, and a deviating one fails `trellis rules check`. It still belongs to no app,
+because its two layers share none: the bucket rule of the
+[implementation notes (#784)](#implementation-notes-784) is unchanged, so it is counted under
+`noApp`. The Architecture view still draws no layer edge for a pair between apps, judged or
+not; its verdict is in the check, explain and the counts.
+
 ## External package policy
 
 A layer needs a nonempty `paths` or `external` collection; either selects that
@@ -803,7 +892,9 @@ start empty. (#783: an ordered layer gains `app` and a shared layer gains `apps`
 [Amendment (#783)](#amendment-783-apps-and-per-app-layers). #794: `apps` is an eighth
 top-level key, a map of authored `[apps.<name>]` tables; see
 [Amendment (#794)](#amendment-794-authored-apps). #855: `interfaces` is a ninth. #988:
-`test_features` is a tenth; see [Amendment (#988)](#amendment-988-test-features).) A selector has at least one of `paths`, `name`, `language`, `extends`
+`test_features` is a tenth; see [Amendment (#988)](#amendment-988-test-features). #1131:
+`specifiers` is an eleventh, and an `[apps.<name>]` table may add `may_use`; see
+[Amendment (#1131)](#amendment-1131-import-specifier-mappings-and-declared-cross-app-use).) A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
 combine with OR. Languages are `java`, `rust`, `python`, `javascript`, `typescript`. Name patterns
 match the measured nullable name; null never receives an invented name.
@@ -1121,7 +1212,10 @@ Supported mapping is deliberately narrow:
   to a TypeScript target and the reverse. The root `tsconfig.json` (else
   `jsconfig.json`; JSONC, `extends` is not followed) adds `paths` (exact key,
   else the longest `prefix*suffix` pattern, targets in order, targets leaving
-  the checkout skipped), `baseUrl` and `rootDirs` for relative misses.
+  the checkout skipped), `baseUrl` and `rootDirs` for relative misses. An authored
+  `[[specifiers]]` mapping of the rules file owns the specifiers under its prefix and comes
+  before all of these (#1131; see
+  [Amendment (#1131)](#amendment-1131-import-specifier-mappings-and-declared-cross-app-use)).
   Workspace packages (#773, owner-ratified 2026-11-10) come next for a bare
   specifier that `paths` and `baseUrl` leave unmatched. The member directories are
   the literal paths and simple globs (`*` within a segment, `**` across segments;
@@ -1335,10 +1429,11 @@ fallback. Projection is not persisted, writes no `index.db`, and changes neither
 native producer output nor Stage 3 extraction.
 
 The one current-file exception is root `.trellis/rules.toml`, read once per
-check/explain/prompt as bounded configuration. A references read takes one thing from
-it (#988): the `test_features` list, through the same bounded read, once per request. That
-read is lenient: a missing or invalid file names no test feature and the references read
-still answers, with no rules descriptor in its response. Check, explain and prompt still
+check/explain/prompt as bounded configuration. A references read takes two things from
+it: the `test_features` list (#988) and the `[[specifiers]]` mappings (#1131), through the
+same bounded read. That read is lenient: a missing or invalid file names no test feature and
+maps no specifier, and the references read still answers, with no rules descriptor in its
+response. Check, explain and prompt still
 fail with a typed `invalid_rules` error on an invalid file.
 Its descriptor is `{path:".trellis/rules.toml",source:"checkout-config",contentHash}`.
 **The code pin does not identify these rules bytes.** Editing only rules can change

@@ -32,7 +32,13 @@ fn layer_status(
         return ("conforms", vec![]);
     }
     if !scope.share(s, t) {
-        return ("unknown", vec!["cross_app".into()]);
+        // #1131: a use one app declares of another's layers is judged; any other stays
+        // interface evidence.
+        return match scope.declared_use(s, t) {
+            Some(true) => ("conforms", vec![]),
+            Some(false) => ("deviates", vec![]),
+            None => ("unknown", vec!["cross_app".into()]),
+        };
     }
     if to.order.is_none() {
         return ("conforms", vec![]);

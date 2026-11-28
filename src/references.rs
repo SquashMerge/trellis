@@ -1010,6 +1010,7 @@ fn build_catalog(
                     &packages,
                     &workspaces,
                     snapshot.root_tsconfig.as_ref(),
+                    &snapshot.specifiers,
                     &mut work,
                     request,
                     workers,

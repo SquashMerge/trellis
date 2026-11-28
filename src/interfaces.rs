@@ -206,7 +206,7 @@ fn inputs(
     };
     let mut hash = Fingerprint::new(domain);
     hash.bytes(&manifest_digest(&snapshot.manifests));
-    hash.bytes(&root_config_digest(snapshot.root_tsconfig.as_ref()));
+    hash.bytes(&root_config_digest(snapshot));
     hash.text(extra);
     for (doc, version) in snapshot.documents.iter().zip(versions) {
         if !reads(doc) {

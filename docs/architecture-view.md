@@ -76,7 +76,10 @@ switcher and the drawing are [#789](https://github.com/SquashMerge/trellis/issue
   not drawn as a layer arrow or counted as a deviation. It is an `unknown` `$layers`
   instance with reason `cross_app`, counted with the other unknowns and listed in the review
   list. Interface edges between apps wait for
-  [#686](https://github.com/SquashMerge/trellis/issues/686).
+  [#686](https://github.com/SquashMerge/trellis/issues/686). (#1131: an app that declares
+  `may_use` of another app's layers has those pairs judged, `conforms` or `deviates`, and
+  counted under `noApp`; they still draw no layer arrow. See
+  [rules.md Amendment (#1131)](rules.md#amendment-1131-import-specifier-mappings-and-declared-cross-app-use).)
 - **Counts equal the CLI per app.** A band's counts are sums over that app's `$layers`
   instances on the same pin and rules hash. A cross-app pair is never a deviation, so the
   apps' deviation totals cover every deviation in `rules.counts.deviates`. A deviation
@@ -145,7 +148,7 @@ runnable `pom.xml` and Gradle build modules ([#854](https://github.com/SquashMer
   rules are ready. With no detected app it holds every count. The two numbers count different
   things:
   - `counts` counts production **rule instances** that belong to no app. They are `cross_app`
-    pairs, pairs between layers that share more than one app, rows attributed by a file that
+    pairs and pairs a declared `may_use` judges (#1131), pairs between layers that share more than one app, rows attributed by a file that
     is in no single-app layer and outside every app root, and every instance when no app is
     detected.
   - `unassignedFileCount` counts **files** with no layer that lie outside every app root.
@@ -171,7 +174,9 @@ runnable `pom.xml` and Gradle build modules ([#854](https://github.com/SquashMer
   `callSites` counts call sites. `counts.confidence` counts call sites, matched and
   client-only. `serverOnly` is the number of the server's routes that no call matched, and
   `clientOnly` the number of the client's unmatched calls.
-- Summary `edges` omit `cross_app` instances. They stay in `rules.counts.unknown`.
+- Summary `edges` omit `cross_app` instances. They stay in `rules.counts.unknown`. Edges also
+  omit the pairs between apps that a declared `may_use` judges (#1131); they count in
+  `rules.counts` and `noApp.counts` by their verdict.
 - A single-app checkout whose app root is a subdirectory, and which has unassigned files
   outside that root, reports part of its per-app output under `noApp`: `apps[0].counts`
   equals `rules.counts` only when no row's own file is unassigned and outside the app's root.

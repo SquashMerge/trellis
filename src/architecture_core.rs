@@ -596,7 +596,12 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<ArchitectureCore> {
-        let input = self.architecture_input(pin, check, progress)?;
+        let mut input = self.architecture_input(pin, check, progress)?;
+        // A read without the rules still resolves through the file's specifiers (#1131).
+        if config.is_none() {
+            input.snapshot.specifiers =
+                crate::rules::load_specifiers(std::path::Path::new(self.store.workspace_root()));
+        }
         ArchitectureCore::compute(&self.store, input, config, measure, check, progress)
     }
 
@@ -612,12 +617,15 @@ impl ArchitectureCore {
     /// failures propagate.
     pub(crate) fn compute(
         store: &Store,
-        input: ArchitectureInput,
+        mut input: ArchitectureInput,
         config: Option<&Config>,
         measure: bool,
         check: &mut (impl FnMut() -> Result<()> + Send),
         progress: &(dyn Fn(ArchitectureProgress) + Sync),
     ) -> Result<Self> {
+        if let Some(config) = config {
+            input.snapshot.specifiers = config.specifiers().to_vec();
+        }
         progress(ArchitectureProgress {
             phase: "resolving",
             completed: 0,
@@ -836,6 +844,7 @@ pub enum FullReason {
     NoBase,
     DocumentSetChanged,
     ManifestsChanged,
+    /// The root tsconfig, or the rules file's import specifier mappings (#1131), changed.
     RootTsconfigChanged,
     ProducerSetChanged,
     RawSelectionsChanged,
@@ -937,6 +946,10 @@ mod engine {
         #[cfg(feature = "test-support")]
         let _work_limit = read_a.work_limit.apply();
         check()?;
+        // References resolve through the build's rules file specifiers (#1131).
+        if let Some(config) = read_a.config {
+            read_a.input.snapshot.specifiers = config.specifiers().to_vec();
+        }
         (read_a.progress)(ArchitectureProgress {
             phase: "resolving",
             completed: 0,

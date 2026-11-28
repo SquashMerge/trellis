@@ -934,8 +934,9 @@ impl DaemonState {
                 return;
             }
         };
-        // A rules file that does not load answers its own reads, and references and metrics
-        // do not depend on it: a core of this revision is enough.
+        // A rules file that does not load answers its own reads, and metrics do not depend on
+        // it; references depend on it only through its import specifier mappings (#1131), and
+        // an unloadable file keeps those of a published core: a core of this revision is enough.
         let loaded = crate::rules::load(std::path::Path::new(self.store.workspace_root()));
         let unreadable = loaded.is_err();
         let config = loaded.ok().flatten();

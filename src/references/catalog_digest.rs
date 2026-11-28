@@ -230,6 +230,7 @@ pub(super) fn snapshot_in(
             bytes: text.as_bytes().to_vec(),
         }),
         documents,
+        specifiers: Default::default(),
         evidence_gaps: BTreeMap::new(),
         unparsed: BTreeSet::new(),
     }
