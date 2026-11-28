@@ -240,12 +240,24 @@ installed `trellis` for the index: its extractor and IDs differ.
    The pinned `rust-toolchain.toml` in the snapshot selects Rust 1.99.1.
 4. **Index.** The snapshot has no `.git`, so the source-set ID, and with it every `sid:v1` ID,
    hashes the canonical workspace path. Re-index at the original canonical workspace path
-   recorded in the local reference manifest (`local-manifest.json` in the evidence root): extract
-   the same `git archive` there, run
-   `HOME=<root>/home XDG_CACHE_HOME= <root>/trellis-693c32c index --workspace <that path>`, stop
-   the daemon that binary started (by its exact PID), and remove the path. The index key must
-   equal `79e73f12…` (`inputs.indexKey`), and the index's source set must equal
-   `inputs.sourceSetId`.
+   recorded in the local reference manifest (`local-manifest.json` in the evidence root). That
+   path may belong to someone's real directory, so use it only if it is absent, and remove only
+   what this run created:
+
+   ```sh
+   W='<workspaceRoot from local-manifest.json>'
+   top=$W   # the highest ancestor of W that does not exist yet
+   while [ ! -e "$(dirname "$top")" ]; do top=$(dirname "$top"); done
+   [ ! -e "$top" ] || { echo "refusing: $W already exists" >&2; exit 1; }
+   mkdir -p "$W"
+   git -C <trellis checkout> archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93 | tar -x -C "$W"
+   HOME=<root>/home XDG_CACHE_HOME= <root>/trellis-693c32c index --workspace "$W"
+   ```
+
+   Stop the daemon that binary started (find its PID with `ps -axo pid,command`, confirm it is
+   `<root>/trellis-693c32c daemon`, then signal that PID only), and then `rm -rf "$top"`, which
+   removes only the directories this run created. The index key must equal `79e73f12…`
+   (`inputs.indexKey`), and the index's source set must equal `inputs.sourceSetId`.
 5. **Cards.** `python scripts/cards.py <index.db> results/cards.jsonl`, where `<index.db>` is
    `<root>/home/Library/Caches/dev.squashmerge.trellis/indexes/<index key>/index.db`. The output
    must match `cards.sha256` byte for byte; if it doesn't, stop: the inputs differ.

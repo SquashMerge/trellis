@@ -387,21 +387,30 @@ def analyze(args, result):
 
 
 def output_guard_test():
-    """--output must never replace an input, a pinned harness script or a reference script copy."""
+    """--output must never replace an input, a pinned harness script or a reference script copy.
+
+    The child checker and its harness are copies in a temporary tree, so a guard regression can
+    only damage the copies, never this checkout.
+    """
+    import shutil
     import subprocess
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
+        tool = Path(tmp) / "tools" / "semantic-search"
+        shutil.copytree(REFERENCE_SCRIPTS_DIR, tool / "reference")
+        checker = tool / Path(__file__).name
+        shutil.copy2(Path(__file__).resolve(), checker)
         root = Path(tmp) / "root"
         (root / "scripts").mkdir(parents=True)
         (root / "scripts" / "extra.py").write_text("keep\n")
         manifest = Path(tmp) / "manifest.json"
         manifest.write_text("{}\n")
-        targets = [REFERENCE_SCRIPTS_DIR / "evaluate.py", REFERENCE_SCRIPTS_DIR / "new-report.json",
+        targets = [tool / "reference" / "evaluate.py", tool / "reference" / "new-report.json",
                    root / "scripts" / "extra.py", root / "scripts" / "new-report.json", root / "scripts/../scripts/evaluate.py"]
         for target in targets:
             before = target.read_bytes() if target.exists() else None
-            run = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--evidence-root", str(root),
+            run = subprocess.run([sys.executable, "-I", str(checker), "--evidence-root", str(root),
                                   "--candidate-dir", str(Path(tmp) / "candidate"), "--model-pin-manifest", str(manifest),
                                   "--output", str(target)], capture_output=True, text=True)
             after = target.read_bytes() if target.exists() else None
