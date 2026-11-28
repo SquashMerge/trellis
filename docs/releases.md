@@ -99,6 +99,15 @@ or embedding code changes, re-run the full form-c CPU/Metal parity check in
 not a substitute for all 6,722 cards and 50 queries, and a missing model or
 reference corpus is not a successful parity run.
 
+**Reference corpus present (every release).** Before publication, check that the
+parity reference corpus described in
+[semantic-search-eval/README.md](semantic-search-eval/README.md#parity-reference-corpus)
+is on the release machine and matches
+[`reference-corpus.json`](semantic-search-eval/reference-corpus.json):
+`tools/semantic-search/check-parity.py --verify-reference` must pass. A missing or
+changed corpus blocks the release until it is restored or rebuilt, so that the next
+model, Candle or embedding change can still be checked.
+
 ### Installed-binary MCP dogfood
 
 The packaged-byte smoke above is not a real-repository MCP dogfood run. Before
