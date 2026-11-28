@@ -560,8 +560,8 @@ async fn main() -> Result<()> {
             let socket = socket_path()?;
             let stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
                 .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
-            client::relay_stdio(stream, &identity, || {
-                client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
+            client::relay_stdio(stream, &identity, |deadline| {
+                client::connect_or_start_until(&socket, start_daemon, deadline)
             })?;
         }
         Command::Model(args) => model_command(args).await?,
@@ -994,6 +994,7 @@ struct DaemonControl {
 async fn run_daemon() -> Result<()> {
     let paths = daemon::SocketPaths::new(&TopologyRoots::production()?.data);
     let Some(owner) = daemon::SocketOwner::acquire(&paths)? else {
+        report_lost_election(&paths.socket);
         return Ok(());
     };
     // Test-only ownership marker: only the elected daemon records its PID.
@@ -1173,6 +1174,9 @@ async fn run_daemon() -> Result<()> {
         }
     };
     drop(idle);
+    // The listener now only answers `daemon_stopping`, until the owner
+    // releases the socket and election lock below (#1293).
+    let stopping = tokio::spawn(answer_stopping(listener));
     if let Some(stop) = &stop {
         sockets.remove(&stop.session);
     }
@@ -1210,7 +1214,8 @@ async fn run_daemon() -> Result<()> {
     }
     drop(browser);
     drop(registry);
-    drop(listener);
+    stopping.abort();
+    let _ = stopping.await;
     drop(owner);
     if let Some(mut stop) = stop {
         // Acknowledgment proves this elected owner released its socket/lock.
@@ -1223,6 +1228,113 @@ async fn run_daemon() -> Result<()> {
                 payload: serde_json::json!({"result": {"stopped": true}}),
             },
         )?;
+    }
+    Ok(())
+}
+
+/// A candidate that lost the election exits 0; say why on stderr (#1293).
+/// An auto-started candidate's stderr is null, so only a bare `trellis
+/// daemon` shows it. A no-op request tells a stopping owner from a running one.
+fn report_lost_election(socket: &std::path::Path) {
+    use std::io::Write;
+    let answer = (|| -> std::io::Result<protocol::Reply> {
+        let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        protocol::write_frame(
+            &mut stream,
+            &daemon_request("daemon_probe", serde_json::json!({})),
+        )?;
+        protocol::read_frame(&mut stream)
+    })();
+    let message = match answer {
+        Ok(reply) if protocol::is_stopping(&reply.payload) => {
+            "trellis daemon: another Trellis daemon holds the election lock and is stopping; \
+             start this one again once it has exited (or let a client start one)"
+        }
+        Ok(_) => "trellis daemon: another Trellis daemon is already running; this one exits",
+        Err(_) => "trellis daemon: another Trellis daemon holds the election lock; this one exits",
+    };
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
+}
+
+/// While a daemon stops, every new connection is answered `daemon_stopping`
+/// before admission (#1293): clients wait for the stop, then re-run the
+/// election, instead of hanging in a listen backlog nobody serves.
+async fn answer_stopping(listener: tokio::net::UnixListener) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(stream) = stream.into_std() else {
+            continue;
+        };
+        // Bounded by its own read and write deadlines.
+        tokio::task::spawn_blocking(move || {
+            let _ = reply_stopping(stream);
+        });
+    }
+}
+
+fn reply_stopping(mut stream: std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    // One request frame within one second, however the peer sends it.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let mut first = [0u8; 1];
+    read_exact_by(&mut stream, &mut first, deadline)?;
+    // A metrics request arrives behind its one-byte admission preface.
+    let request: protocol::Request = if first[0] == 0xff {
+        protocol::read_frame_until(&mut stream, deadline)?
+    } else {
+        let mut length = [first[0], 0, 0, 0];
+        read_exact_by(&mut stream, &mut length[1..], deadline)?;
+        let size = u32::from_be_bytes(length) as usize;
+        if size > protocol::MAX_FRAME {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let mut bytes = vec![0; size];
+        read_exact_by(&mut stream, &mut bytes, deadline)?;
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)?
+    };
+    protocol::write_frame(
+        &mut stream,
+        &protocol::Reply {
+            id: request.id,
+            payload: serde_json::json!({ "error": protocol::DAEMON_STOPPING_MESSAGE }),
+        },
+    )?;
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STOPPING_SOCKET") {
+        use std::io::Write;
+        if let Ok(mut hook) = std::os::unix::net::UnixStream::connect(path) {
+            let _ = hook.write_all(b"A");
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_by(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    while !buf.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(left))?;
+        let read = stream.read(buf)?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[read..];
     }
     Ok(())
 }

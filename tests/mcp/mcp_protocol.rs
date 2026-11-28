@@ -6404,7 +6404,7 @@ async fn an_oversized_answer_is_typed_and_keeps_the_connection() {
     }] {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert_eq!(
-            reply["result"]["structuredContent"]["data"]["toolVersion"], 36,
+            reply["result"]["structuredContent"]["data"]["toolVersion"], 37,
             "{reply}"
         );
     }

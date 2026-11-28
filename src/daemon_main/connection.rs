@@ -1074,7 +1074,7 @@ fn await_first_head(
         // An explicit daemon stop cancelled the first index: it restarts on
         // the next activation, so this wait ends now (#1293).
         if checkout.stopping() {
-            anyhow::bail!("daemon_unavailable: the daemon is stopping");
+            anyhow::bail!("{}", trellis::daemon::protocol::DAEMON_STOPPING_MESSAGE);
         }
         #[cfg(all(feature = "test-support", unix))]
         if reported.is_none()

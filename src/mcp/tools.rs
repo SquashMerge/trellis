@@ -923,6 +923,7 @@ fn details(code: &str) -> (&'static str, bool) {
         "store_unavailable" => ("Store is unavailable", false),
         "checkout_capacity" => ("Checkout capacity reached", true),
         "daemon_unavailable" => ("Daemon is unavailable", true),
+        "daemon_stopping" => ("Daemon is stopping; retry once it has exited", true),
         "outcome_unknown" => ("Outcome unknown; inspect request status", false),
         // Owner ruling 2026-11-18 (#1119 follow-up): the same document is refused on every
         // run, so a retry cannot help. `failure_for` names the bound.

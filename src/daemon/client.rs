@@ -22,6 +22,100 @@ impl CallError {
     }
 }
 
+/// How long a CLI, `serve` or `trellis mcp` attach waits out an explicit
+/// daemon stop before it fails (#1293, owner ruling 2026-11-26).
+pub const STOP_WAIT: Duration = Duration::from_secs(60);
+/// The connect and the attach exchange of one MCP attach, each at most this long.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the `trellis mcp` launch attach waits out a stop; a fixture may shorten it.
+fn mcp_stop_wait() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(millis) = std::env::var("TRELLIS_TEST_MCP_STOP_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    STOP_WAIT
+}
+/// How often a waiting CLI reports on stderr, as the first-index wait does (#842).
+const STOP_WAIT_PROGRESS: Duration = Duration::from_secs(10);
+
+/// A client's wait for a stopping daemon to exit. Each `daemon_stopping`
+/// answer pauses briefly, then the client connects again; once the old owner
+/// has released, that connect re-runs the election and reaches the successor.
+///
+/// One deadline covers the whole wait: each attempt inside it gets only the
+/// [`remaining`](Self::remaining) budget for its connect and its reply, so no
+/// attempt outlives the bound.
+pub struct StopWait {
+    started: Instant,
+    deadline: Instant,
+    reported: Option<Instant>,
+}
+
+impl StopWait {
+    pub fn new(bound: Duration) -> Self {
+        Self::until(Instant::now() + bound)
+    }
+
+    /// A wait that ends at `deadline`, such as a command's own whole-call bound.
+    pub fn until(deadline: Instant) -> Self {
+        Self {
+            started: Instant::now(),
+            deadline,
+            reported: None,
+        }
+    }
+
+    /// What is left of the wait, at least 1 ms so it can bound a socket timeout.
+    pub fn remaining(&self) -> Duration {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1))
+    }
+
+    /// The wait's one absolute deadline.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Whether the wait's deadline has passed.
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    /// False once the bound has passed. Otherwise report progress (at most
+    /// every 10 s) and pause before the next attempt.
+    pub fn pause(&mut self, progress: &mut dyn FnMut(String)) -> bool {
+        let now = Instant::now();
+        let deadline = self.deadline;
+        if now >= deadline {
+            return false;
+        }
+        if self
+            .reported
+            .is_none_or(|at| now.duration_since(at) >= STOP_WAIT_PROGRESS)
+        {
+            progress(format!(
+                "trellis: the daemon is stopping; waiting to reach its successor ({}s elapsed, waiting up to {}s)",
+                now.duration_since(self.started).as_secs(),
+                deadline.duration_since(self.started).as_secs()
+            ));
+            self.reported = Some(now);
+        }
+        thread::sleep(Duration::from_millis(50).min(deadline - now));
+        true
+    }
+}
+
+/// Progress of a CLI's stop wait goes to stderr; a closed stderr cannot fail it.
+pub fn stderr_progress(message: String) {
+    use std::io::Write;
+    let _ = writeln!(io::stderr(), "{message}");
+}
+
 /// The starter reports election loss separately from unexpected startup failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartOutcome {
@@ -52,6 +146,115 @@ pub fn connect_or_start(
             ));
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// [`connect_or_start`] under an owning absolute `deadline`, as a stop wait's
+/// reconnect needs (#1293): the deadline is checked before the first connect,
+/// after it, after the start and after every later connect, and each pause is
+/// capped at what is left. A single blocking connect or start may finish past
+/// the deadline, but nothing it yields after the deadline is accepted.
+pub fn connect_or_start_until(
+    socket: &Path,
+    mut start: impl FnMut() -> io::Result<StartOutcome>,
+    deadline: Instant,
+) -> io::Result<UnixStream> {
+    let expired = || io::Error::new(io::ErrorKind::TimedOut, "daemon unavailable");
+    let live = || Instant::now() < deadline;
+    if !live() {
+        return Err(expired());
+    }
+    if let Ok(stream) = UnixStream::connect(socket) {
+        return if live() { Ok(stream) } else { Err(expired()) };
+    }
+    if !live() {
+        return Err(expired());
+    }
+    let _ = start()?; // An election loser waits for the winner within the same deadline.
+    loop {
+        if !live() {
+            return Err(expired());
+        }
+        if let Ok(stream) = UnixStream::connect(socket) {
+            return if live() { Ok(stream) } else { Err(expired()) };
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(expired());
+        }
+        thread::sleep(left.min(Duration::from_millis(20)));
+    }
+}
+
+/// What one probe of a stopping owner observed.
+enum OwnerProbe {
+    /// The owner still answers `daemon_stopping`.
+    Stopping,
+    /// The owner has released: nothing listens, or a successor answered.
+    Released,
+}
+
+/// One no-op request to the daemon at `socket`, within `deadline`.
+fn probe_owner(socket: &Path, deadline: Instant) -> io::Result<OwnerProbe> {
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(OwnerProbe::Released);
+        }
+        Err(error) => return Err(error),
+    };
+    let request = Request {
+        id: 1,
+        operation: "daemon_probe".into(),
+        payload: serde_json::json!({}),
+    };
+    protocol::write_frame_until(&mut stream, &request, deadline)?;
+    let reply: Reply = protocol::read_frame_until(&mut stream, deadline)?;
+    Ok(if protocol::is_stopping(&reply.payload) {
+        OwnerProbe::Stopping
+    } else {
+        OwnerProbe::Released
+    })
+}
+
+/// A second `trellis daemon stop` waits for the stop already under way (#1293).
+/// `Ok` only once a release was observed. Every probe runs on the wait's owning
+/// deadline, checked before and after it; expiry is the typed `daemon_stopping`,
+/// and a probe that fails is a typed `daemon_unavailable`, never a release.
+pub fn wait_for_stopping_owner(
+    socket: &Path,
+    wait: &mut StopWait,
+    progress: &mut dyn FnMut(String),
+) -> io::Result<()> {
+    let stopping = || io::Error::other(protocol::DaemonStopping);
+    loop {
+        if wait.expired() {
+            return Err(stopping());
+        }
+        let probe = probe_owner(
+            socket,
+            wait.deadline().min(Instant::now() + Duration::from_secs(2)),
+        );
+        if wait.expired() {
+            return Err(stopping());
+        }
+        match probe {
+            Ok(OwnerProbe::Released) => return Ok(()),
+            Ok(OwnerProbe::Stopping) => {}
+            Err(_) => {
+                return Err(io::Error::other(
+                    "daemon_unavailable: the stopping daemon did not answer its probe",
+                ));
+            }
+        }
+        if !wait.pause(progress) {
+            return Err(stopping());
+        }
     }
 }
 
@@ -96,18 +299,43 @@ pub fn connect_or_start_metrics(
 pub fn call(
     request: &Request,
     read_only: bool,
+    connect: impl FnMut() -> io::Result<UnixStream>,
+) -> Result<Reply, CallError> {
+    call_until(request, read_only, connect, None)
+}
+
+/// [`call`], bounded by `deadline` when one is given: every frame of the reply,
+/// progress included, is read by it, and a reply that completes after it is
+/// refused, so a stop wait's deadline holds across the attempt (#1293).
+pub fn call_until(
+    request: &Request,
+    read_only: bool,
     mut connect: impl FnMut() -> io::Result<UnixStream>,
+    deadline: Option<Instant>,
 ) -> Result<Reply, CallError> {
     let attempts = if read_only { 2 } else { 1 };
+    // Past the deadline nothing is connected or written: the request was not
+    // sent, so even a mutation reports `daemon_unavailable`, never a replay.
+    let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
     for attempt in 0..attempts {
+        if expired() {
+            return Err(CallError::DaemonUnavailable);
+        }
         let mut stream = match connect() {
             Ok(stream) => stream,
             Err(_) if attempt + 1 < attempts => continue,
             Err(_) => return Err(CallError::DaemonUnavailable),
         };
+        if expired() {
+            return Err(CallError::DaemonUnavailable);
+        }
         // A partially written request can still have reached the server. Never replay
         // a mutation after attempting its write, including when the reply is lost.
-        if protocol::write_frame(&mut stream, request).is_err() {
+        let written = match deadline {
+            Some(deadline) => protocol::write_frame_until(&mut stream, request, deadline),
+            None => protocol::write_frame(&mut stream, request),
+        };
+        if written.is_err() {
             if read_only && attempt + 1 < attempts {
                 continue;
             }
@@ -117,7 +345,7 @@ pub fn call(
                 CallError::OutcomeUnknown
             });
         }
-        match read_reply(&mut stream, request.id) {
+        match read_reply_bounded(&mut stream, request.id, deadline) {
             Ok(reply) => return Ok(reply),
             Err(error)
                 if read_only
@@ -158,6 +386,10 @@ pub fn call_metrics(
             protocol::write_preface_until(&mut stream, ingress_deadline)?;
             protocol::write_frame_until(&mut stream, request, ingress_deadline)?;
             let admission: Reply = protocol::read_frame_until(&mut stream, ingress_deadline)?;
+            // A stopping daemon answers before admission (#1293): pass it up.
+            if admission.id == request.id && protocol::is_stopping(&admission.payload) {
+                return Ok(admission);
+            }
             if admission.id != request.id
                 || admission.payload != serde_json::json!({"admitted": true})
             {
@@ -179,14 +411,29 @@ pub fn call_metrics(
 
 /// One large daemon reply is a sequence of individually bounded frames. The
 /// final JSON is parsed only after every frame with the same request ID arrives.
-fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
-    read_reply_until(stream, id, None)
+/// A CLI reply, under `deadline` when one is given. Unlike a metrics reply it has
+/// no 64 MiB cap of its own.
+fn read_reply_bounded(
+    stream: &mut UnixStream,
+    id: u64,
+    deadline: Option<Instant>,
+) -> io::Result<Reply> {
+    read_reply_capped(stream, id, deadline, false)
 }
 
 fn read_reply_until(
     stream: &mut UnixStream,
     id: u64,
     deadline: Option<Instant>,
+) -> io::Result<Reply> {
+    read_reply_capped(stream, id, deadline, deadline.is_some())
+}
+
+fn read_reply_capped(
+    stream: &mut UnixStream,
+    id: u64,
+    deadline: Option<Instant>,
+    capped: bool,
 ) -> io::Result<Reply> {
     let read = |stream: &mut UnixStream| -> io::Result<Reply> {
         match deadline {
@@ -240,7 +487,7 @@ fn read_reply_until(
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon chunk"))?;
         let part = hex::decode(chunk).map_err(io::Error::other)?;
         bytes.extend_from_slice(&part);
-        if deadline.is_some() && bytes.len() > 64 * 1024 * 1024 + 4096 {
+        if capped && bytes.len() > 64 * 1024 * 1024 + 4096 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "metrics reply too large",
@@ -275,6 +522,7 @@ fn attach_mcp(
     mut stream: UnixStream,
     workspace: &crate::store::topology::WorkspaceIdentity,
     attachments: &[protocol::McpAttachment],
+    deadline: Instant,
 ) -> io::Result<UnixStream> {
     let request = Request {
         id: 1,
@@ -289,10 +537,9 @@ fn attach_mcp(
             "attachments": attachments,
         }),
     };
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    protocol::write_frame(&mut stream, &request)?;
-    let reply: Reply = protocol::read_frame(&mut stream)?;
+    // One absolute deadline for the request and its reply (#1293).
+    protocol::write_frame_until(&mut stream, &request, deadline)?;
+    let reply: Reply = protocol::read_frame_until(&mut stream, deadline)?;
     if reply.id != request.id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -302,6 +549,9 @@ fn attach_mcp(
     if let Some(error) = reply.payload.get("error").and_then(|v| v.as_str()) {
         if error.starts_with(protocol::MCP_RESTART_REQUIRED) {
             return Err(io::Error::other(protocol::McpRestartRequired));
+        }
+        if error.starts_with(protocol::DAEMON_STOPPING) {
+            return Err(io::Error::other(protocol::DaemonStopping));
         }
         return Err(io::Error::other(error.to_owned()));
     }
@@ -329,6 +579,27 @@ fn mcp_failure(
             "code":-32603, "message":protocol::MCP_RESTART_MESSAGE,
             "data":{"code":protocol::MCP_RESTART_REQUIRED, "retryable":false}
         }});
+    }
+    if code == protocol::DAEMON_STOPPING
+        && value.get("method").and_then(|v| v.as_str()) == Some("tools/call")
+        && let Some(name) = value
+            .pointer("/params/name")
+            .and_then(|v| v.as_str())
+            .filter(|name| crate::mcp::catalog::known(name))
+    {
+        // Application validation still takes precedence; nothing was answered.
+        let envelope = match crate::mcp::tools::validate(name, value.pointer("/params/arguments")) {
+            Err(error) => crate::mcp::tools::failure(&id, error),
+            Ok(_) => crate::mcp::tools::failure(&id, protocol::DAEMON_STOPPING),
+        };
+        let modern = value.pointer("/params/_meta").is_some();
+        return json!({"jsonrpc":"2.0","id":id,
+            "result":crate::mcp::tools::result(name, envelope, modern)});
+    }
+    if code == protocol::DAEMON_STOPPING {
+        return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,
+            "message":protocol::DAEMON_STOPPING_MESSAGE,
+            "data":{"code":protocol::DAEMON_STOPPING,"retryable":true}}});
     }
     if matches!(code, "daemon_unavailable" | "selection_unavailable")
         && value.get("method").and_then(|v| v.as_str()) == Some("tools/call")
@@ -951,6 +1222,8 @@ struct Relay<'a, W: std::io::Write> {
     daemon: Option<DaemonConnection>,
     generation: u64,
     restart_required: bool,
+    /// The last reconnect reached a stopping daemon (#1293).
+    stopping: bool,
     connect: Reconnect<'a>,
     attachments:
         std::collections::BTreeMap<std::path::PathBuf, crate::store::topology::WorkspaceIdentity>,
@@ -966,6 +1239,10 @@ impl<W: std::io::Write> Relay<'_, W> {
     fn connection_failure(&self, value: &serde_json::Value) -> serde_json::Value {
         let code = if self.restart_required {
             protocol::MCP_RESTART_REQUIRED
+        } else if self.stopping {
+            // The reconnect reached a stopping daemon: the call keeps its own
+            // deadline and answers the retryable code instead of waiting (#1293).
+            protocol::DAEMON_STOPPING
         } else {
             "daemon_unavailable"
         };
@@ -1042,9 +1319,11 @@ impl<W: std::io::Write> Relay<'_, W> {
                     self.restart_required = error
                         .get_ref()
                         .is_some_and(|cause| cause.is::<protocol::McpRestartRequired>());
+                    self.stopping = protocol::stopping_error(&error);
                     return false;
                 }
             };
+            self.stopping = false;
             if let (Some(init), true) = (&self.legacy_init, legacy && self.legacy_ready) {
                 let mut setup = format!("{SETUP_RELAY_ID} ").into_bytes();
                 setup.extend_from_slice(init);
@@ -1522,7 +1801,7 @@ impl<W: std::io::Write> Relay<'_, W> {
 pub fn relay_stdio(
     stream: UnixStream,
     workspace: &crate::store::topology::WorkspaceIdentity,
-    mut reconnect: impl FnMut() -> io::Result<UnixStream>,
+    mut reconnect: impl FnMut(Instant) -> io::Result<UnixStream>,
 ) -> io::Result<()> {
     let doorbell = std::sync::Arc::new(Doorbell::default());
     let (receiver, stdin) = spawn_ringing_frame_reader(0, Some(doorbell.clone()))?;
@@ -1531,15 +1810,46 @@ pub fn relay_stdio(
         let doorbell = doorbell.clone();
         move |stream: io::Result<UnixStream>,
               generation: u64,
-              attachments: &[protocol::McpAttachment]|
+              attachments: &[protocol::McpAttachment],
+              deadline: Instant|
               -> io::Result<DaemonConnection> {
-            let stream = attach_mcp(stream?, workspace, attachments)?;
+            let stream = attach_mcp(stream?, workspace, attachments, deadline)?;
             stream.set_read_timeout(None)?;
             spawn_reply_reader(&stream, generation, reply_sender.clone(), doorbell.clone())?;
             Ok(DaemonConnection { stream, generation })
         }
     };
-    let (first, restart_required) = match open(Ok(stream), 0, &[]) {
+    // The launch attach waits out an explicit daemon stop (#1293), bounded,
+    // then reaches the successor; any other failure is typed, never a raw
+    // I/O error such as a read timeout's EAGAIN.
+    let mut attached = open(Ok(stream), 0, &[], Instant::now() + ATTACH_TIMEOUT);
+    let mut stop_wait: Option<StopWait> = None;
+    loop {
+        let waiting = match &attached {
+            Err(error) if protocol::stopping_error(error) => true,
+            Err(error) => {
+                stop_wait.is_some()
+                    && !error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<protocol::McpRestartRequired>())
+            }
+            Ok(_) => false,
+        };
+        if !waiting
+            || !stop_wait
+                .get_or_insert_with(|| StopWait::new(mcp_stop_wait()))
+                .pause(&mut |_| {})
+        {
+            break;
+        }
+        // Each attempt draws its connect and its attach from the wait's one
+        // absolute deadline, never a fresh budget per phase.
+        let wait = stop_wait.as_ref().expect("waiting");
+        let connected = reconnect(wait.deadline().min(Instant::now() + ATTACH_TIMEOUT));
+        let deadline = wait.deadline().min(Instant::now() + ATTACH_TIMEOUT);
+        attached = open(connected, 0, &[], deadline);
+    }
+    let (first, restart_required) = match attached {
         Ok(first) => (Some(first), false),
         Err(error)
             if error
@@ -1548,7 +1858,16 @@ pub fn relay_stdio(
         {
             (None, true)
         }
-        Err(error) => return Err(error),
+        // The daemon's own typed answer (for example `root_changed`), or the stop.
+        Err(error) if error.kind() == io::ErrorKind::Other => return Err(error),
+        Err(error) => {
+            return Err(io::Error::other(match error.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                    "daemon_unavailable: the daemon did not answer the MCP attach in time"
+                }
+                _ => "daemon_unavailable: the MCP attach failed",
+            }));
+        }
     };
     let mut relay = Relay {
         workspace,
@@ -1563,8 +1882,15 @@ pub fn relay_stdio(
         daemon: first,
         generation: 0,
         restart_required,
+        stopping: false,
         connect: Box::new(move |generation, attachments| {
-            open(reconnect(), generation, attachments)
+            let connected = reconnect(Instant::now() + ATTACH_TIMEOUT);
+            open(
+                connected,
+                generation,
+                attachments,
+                Instant::now() + ATTACH_TIMEOUT,
+            )
         }),
         attachments: Default::default(),
         legacy_init: None,
@@ -1630,6 +1956,127 @@ mod cancellation_tests {
     }
 
     /// #1288: a cancellation may carry an object `_meta`, which is ignored.
+    /// #1293 review: a stop wait's deadline that has passed stops the attempt before it
+    /// connects or writes, so not even a mutation is sent after the bound.
+    #[test]
+    fn an_expired_deadline_neither_connects_nor_writes() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let request = Request {
+            id: 7,
+            operation: "index".into(),
+            payload: serde_json::json!({}),
+        };
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        let mut client = Some(client);
+        let connected = AtomicBool::new(false);
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let result = call_until(
+            &request,
+            false,
+            || {
+                connected.store(true, Ordering::SeqCst);
+                client
+                    .take()
+                    .ok_or_else(|| io::Error::other("one connection"))
+            },
+            Some(deadline),
+        );
+        assert_eq!(result.unwrap_err(), CallError::DaemonUnavailable);
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "connected after the deadline"
+        );
+        // Nothing reached the peer: its end reads nothing, not a request.
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert!(
+            std::io::Read::read(&mut peer, &mut byte)
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock),
+            "a request was written after the deadline"
+        );
+    }
+
+    /// #1293 review: a reconnect inside a stop wait runs on the wait's owning deadline. A
+    /// start that returns after it (the single blocking call may finish) cannot lead to an
+    /// accepted connection.
+    #[test]
+    fn a_connection_after_a_delayed_start_past_the_deadline_is_refused() {
+        use super::*;
+        let dir = tempfile::Builder::new()
+            .prefix("t1293-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut listener = None;
+        let result = connect_or_start_until(
+            &socket,
+            || {
+                // A slow start: it returns only once the deadline has passed.
+                crate::testing::wait_until("the deadline passes", || Instant::now() > deadline);
+                listener = Some(std::os::unix::net::UnixListener::bind(&socket)?);
+                Ok(StartOutcome::Started)
+            },
+            deadline,
+        );
+        assert!(listener.is_some(), "the delayed start ran");
+        assert!(
+            result.is_err(),
+            "a connection made after the deadline was accepted"
+        );
+    }
+
+    /// #1293 review: a second `daemon stop` waiting for a stop under way reports a failed
+    /// probe as a typed failure, never as an observed release.
+    #[test]
+    fn a_failed_probe_of_a_stopping_owner_is_not_a_release() {
+        use super::*;
+        let dir = tempfile::Builder::new()
+            .prefix("t1293-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let closer = std::thread::spawn(move || {
+            // Accept the probe and close without an answer.
+            drop(crate::testing::accept_within_backstop(&listener));
+        });
+        let mut wait = StopWait::new(crate::testing::HANG_BACKSTOP);
+        let result = wait_for_stopping_owner(&socket, &mut wait, &mut |_| {});
+        closer.join().unwrap();
+        let error = result.expect_err("a failed probe was taken for a release");
+        assert!(
+            error.to_string().starts_with("daemon_unavailable"),
+            "{error}"
+        );
+    }
+
+    /// #1293 review: the probes run on the wait's owning deadline; a probe the owner never
+    /// answers ends the wait typed `daemon_stopping` at the deadline, not as a release.
+    #[test]
+    fn a_second_stop_wait_ends_typed_at_its_deadline() {
+        use super::*;
+        let dir = tempfile::Builder::new()
+            .prefix("t1293-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // Accept the probe and hold it unanswered until the wait has ended.
+            let _held = crate::testing::accept_within_backstop(&listener);
+            let _ = finished.recv_timeout(crate::testing::HANG_BACKSTOP);
+        });
+        let mut wait = StopWait::new(Duration::from_millis(200));
+        let result = wait_for_stopping_owner(&socket, &mut wait, &mut |_| {});
+        done.send(()).unwrap();
+        holder.join().unwrap();
+        let error = result.expect_err("an unanswered probe was taken for a release");
+        assert!(protocol::stopping_error(&error), "{error}");
+    }
+
     #[test]
     fn a_cancellation_with_meta_names_its_request() {
         assert_eq!(cancel(r#"{"requestId":3}"#), Some(serde_json::json!(3)));
@@ -1793,6 +2240,7 @@ mod reply_gate_tests {
                 daemon: None,
                 generation: 0,
                 restart_required: false,
+                stopping: false,
                 connect: Box::new(|_, _| Err(io::Error::other("no daemon in this fixture"))),
                 attachments: Default::default(),
                 legacy_init: None,
@@ -1972,7 +2420,12 @@ mod reply_gate_tests {
                     .recv_timeout(crate::testing::HANG_BACKSTOP)
                     .unwrap();
             });
-            let result = attach_mcp(client, &fixture.workspace, &[]);
+            let result = attach_mcp(
+                client,
+                &fixture.workspace,
+                &[],
+                Instant::now() + ATTACH_TIMEOUT,
+            );
             if expected {
                 assert!(result.is_ok(), "{result:?}");
             } else {
