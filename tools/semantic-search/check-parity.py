@@ -37,7 +37,10 @@ SOURCE_HASHES = {
     "results/cards.jsonl": "4ca5a9d3588944094ad2e7ee12a454b60498a3ffff7783d78ee99cb4eb28abe0",
     "eval/queries.json": "b4cf25fbfd7ba8b91c7c49f11a558de6defe4d78f22642a1ef9249eaa13e5e55",
     "results/eval.json": "78af93939d742974af8b2a4c5bf9b61aac2b24d0236f8f42908f6fe1adcf318f",  # #1323: voyage-4-nano only
+    "scripts/cards.py": "71384b41e2a689a93698939b7a89acaf1c9ccbcf87ac12941f911609da043fda",
+    "scripts/embed.py": "c3f185bb263eab10fac8cc9d33f80c2224cc25dc0257e7228cd93e6003cd1886",
     "scripts/evaluate.py": "1a76389a368fc823c6ba68f1ac206ca345cc11cedb15179cc041798322e41b1d",
+    "scripts/download.py": "2d44038187ccdedd0700614f91ebc51e628de2159cfe54f187509706f20045e2",
     "results/emb/voyage-4-nano.a.docs.npy": "4c80fc0658344ae5427427fc21186087edc0b235896502090ee3b874d4bc0c3d",
     "results/emb/voyage-4-nano.b.docs.npy": "1e6757ed955de1d7b2816b98e2031b14f65dd8f1363a49bfe3938ad03a102529",
     "results/emb/voyage-4-nano.c.docs.npy": "55de9fe1ca2aa0b42a5ddb23d67df2b6ca4a0cffbcedcf8a454e79e1865bb72f",
@@ -49,6 +52,8 @@ ORDER_HASHES = {
 }
 # The #1323 verified-download manifest; see docs/semantic-search-eval/reference-corpus.json.
 MODEL_PIN_MANIFEST_SHA256 = "84605f14234fa5e0388a96127eea9bd4de91c6c9298a4d80872212ae1b3371be"
+# The #214 harness, committed verbatim; the evidence root's scripts/ must be byte-identical copies.
+REFERENCE_SCRIPTS_DIR = Path(__file__).resolve().parent / "reference"
 
 
 class InvalidInput(ValueError):
@@ -293,6 +298,8 @@ def analyze(args, result):
         result["sourceArtifacts"][name] = {"path": str(path), "sha256": actual,
                                             "expectedSha256": SOURCE_HASHES[name]}
         require(actual == SOURCE_HASHES[name], f"saved reference artifact changed: {name}")
+    for path, expected in committed_script_pins().items():
+        require(path.is_file() and sha256(path) == expected, f"committed harness script changed: {path.name}")
     result["candidateArtifacts"] = {name: {"path": str(path), "sha256": sha256(path)}
                                      for name, path in candidate_paths.items()}
     manifest_bytes = args.model_pin_manifest.read_bytes()
@@ -454,11 +461,16 @@ def self_test():
     return 0
 
 
+def committed_script_pins():
+    return {REFERENCE_SCRIPTS_DIR / name.removeprefix("scripts/"): digest
+            for name, digest in SOURCE_HASHES.items() if name.startswith("scripts/")}
+
+
 def verify_reference(root, model_pin_manifest):
     """Release-checklist presence check: every pinned reference input exists with its pinned hash."""
     problems = []
     pinned = {**{root / name: digest for name, digest in SOURCE_HASHES.items()},
-              model_pin_manifest: MODEL_PIN_MANIFEST_SHA256}
+              **committed_script_pins(), model_pin_manifest: MODEL_PIN_MANIFEST_SHA256}
     for path, expected in pinned.items():
         if not path.is_file():
             problems.append(f"missing: {path}")

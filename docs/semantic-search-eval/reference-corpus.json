@@ -2,7 +2,7 @@
   "format": "trellis-semantic-search-reference-corpus/v1",
   "issue": "https://github.com/SquashMerge/trellis/issues/1323",
   "regenerated": "2026-11-27",
-  "method": "The #214 Python SentenceTransformer pipeline, regenerated with the original harness scripts, recovered verbatim from the #214 session record.",
+  "method": "The #214 Python SentenceTransformer pipeline, regenerated with the original harness scripts, recovered verbatim from the #214 session record and committed under tools/semantic-search/reference/.",
   "matchesPreLossPins": {
     "identical": [
       "results/cards.jsonl",
@@ -52,6 +52,7 @@
     "scripts/evaluate.py": "1a76389a368fc823c6ba68f1ac206ca345cc11cedb15179cc041798322e41b1d",
     "scripts/download.py": "2d44038187ccdedd0700614f91ebc51e628de2159cfe54f187509706f20045e2"
   },
+  "scriptsCommittedAt": "tools/semantic-search/reference/ (verbatim; byte-identical to the hashes above)",
   "environment": {
     "python": "3.12.14",
     "resolution": "uv venv --python 3.12; uv pip install --exclude-newer 2026-10-19T19:33:00Z torch sentence-transformers transformers onnxruntime tokenizers numpy huggingface_hub, then einops",

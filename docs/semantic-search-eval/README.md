@@ -206,7 +206,9 @@ hashes.
 
 **History.** The original #214 evidence root was lost in November 2026 with no backup. #1323
 regenerated it by the original method. The four harness scripts were recovered verbatim from the
-#214 session record, and the Python packages were resolved as of the original install time.
+#214 session record and are now committed, unchanged, in
+[`tools/semantic-search/reference/`](../../tools/semantic-search/reference/). The Python packages
+were resolved as of the original install time.
 The result is byte-identical to the pins the checker held before the loss:
 `scripts/evaluate.py`, `results/cards.jsonl` and all four voyage-4-nano `.npy` arrays. Only
 `results/eval.json` is new: it was re-run for voyage-4-nano alone, without the other models'
@@ -217,6 +219,9 @@ entries, which the checker never reads.
 Run every embedding step under the shared heavy-run lease. Never run the built `trellis` under
 your real `HOME`.
 
+0. **Scripts.** Copy the four files in `tools/semantic-search/reference/` to `<root>/scripts/`
+   without modification. Their hashes are the `scripts` pins in the manifest and in the
+   checker's `SOURCE_HASHES`; do not reformat them.
 1. **Indexer.** `git archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93` into a scratch directory
    and build it with `cargo build --locked --release --bin trellis`.
 2. **Index.** The snapshot has no `.git`, so the source-set ID, and with it every `sid:v1` ID,
