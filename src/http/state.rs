@@ -195,6 +195,8 @@ pub fn new_with_config(
         recovery_retry_after: Mutex::new(None),
         watcher_health: Arc::new(crate::watch::WatcherHealth::default()),
         retention_last_run: Mutex::new(Instant::now()),
+        #[cfg(feature = "test-support")]
+        timed_work_delayed: AtomicBool::new(false),
         startup_release_pass: AtomicBool::new(false),
         gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         gc_run: Mutex::new(None),

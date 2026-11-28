@@ -130,8 +130,10 @@ impl DaemonState {
     }
 
     /// Push all timed work out of reach: the watcher's periodic inventory
-    /// (see `WatcherWork::delay_periodic_inventory_for_tests`) and maintenance.
-    /// False without a watcher.
+    /// (see `WatcherWork::delay_periodic_inventory_for_tests`) and maintenance,
+    /// which stays undue until `on_next_maintenance_unit_for_tests`. A unit
+    /// already running when this is called still finishes. False without a
+    /// watcher.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn delay_timed_work_for_tests(&self) -> bool {
@@ -141,7 +143,7 @@ impl DaemonState {
         };
         watcher.delay_periodic_inventory_for_tests();
         drop(work);
-        *self.retention_last_run.lock().unwrap() = Instant::now() + Duration::from_secs(3600);
+        self.timed_work_delayed.store(true, Ordering::Release);
         // Make the worker recompute its sleep deadline from the delayed inventory.
         self.inbox.wake(WakeSource::Test);
         true
@@ -723,6 +725,10 @@ impl DaemonState {
     /// The next retention unit is due 60 s after the last idle one, or soon
     /// after a deferral (the unit sets this clock).
     fn maintenance_due_at(&self) -> Instant {
+        #[cfg(feature = "test-support")]
+        if self.timed_work_delayed.load(Ordering::Acquire) {
+            return Instant::now() + Duration::from_secs(3600);
+        }
         *self.retention_last_run.lock().unwrap() + MAINTENANCE_INTERVAL
     }
 
@@ -820,10 +826,12 @@ impl DaemonState {
     }
 
     /// Make the next retention unit due now, and run `hook` as it begins.
+    /// This ends a `delay_timed_work_for_tests` delay of maintenance.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn on_next_maintenance_unit_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
         *self.maintenance_hook.lock().unwrap() = Some(Box::new(hook));
+        self.timed_work_delayed.store(false, Ordering::Release);
         self.make_maintenance_due();
     }
 

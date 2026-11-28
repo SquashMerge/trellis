@@ -306,10 +306,14 @@ See [known limitations](known-limitations.md) before relying on the results. The
 unchanged from [0.2.1](release-notes-0.2.1.md#known-limitations), plus:
 
 - **Architecture on large checkouts:** Architecture fails with `bounded_work`
-  (`architecture source`) when the selected revision's stored source and native rows pass
-  512 MiB. The 1,000- and 10,000-file synthetic cohorts (550 MiB and 2.8 GiB `index.db`
-  after a first index) are past it; Trellis's own checkout is not. 0.2.1 has the same
-  limit.
+  (`architecture source`) when the selected revision's stored total passes 512 MiB. The
+  stored total is a charge on the revision's source, native and class rows, with ids and
+  keys counted per row, so it is far larger than the source itself. In 0.2.2 the error
+  doesn't say which bound it hit; it was this stored total
+  ([#1321](https://github.com/SquashMerge/trellis/issues/1321)). The 1,000- and
+  10,000-file synthetic cohorts charge 641 MiB and 2.73 GiB (16 and 128 MiB of source), so
+  they are past it. Trellis's own checkout charges 473 MiB, under the limit but close to
+  it. 0.2.1 has the same limit.
 - **The memory regressions** [above](#memory-regressions).
 - **MCP lookup keys under heavy load:** refusing a pathological document near the
   parse-work bound can take longer than MCP's 5-second call deadline, and the call then

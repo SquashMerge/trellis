@@ -349,6 +349,11 @@ pub struct DaemonState {
     /// lives as long as this state. Readers never wait for watcher work.
     watcher_health: Arc<crate::watch::WatcherHealth>,
     retention_last_run: Mutex<Instant>,
+    /// `delay_timed_work_for_tests` was called: retention is never due. A flag
+    /// the worker reads, not a clock it rewrites, so a unit that was already
+    /// running when the test asked cannot undo the delay (#1389).
+    #[cfg(feature = "test-support")]
+    timed_work_delayed: AtomicBool,
     /// The retention pass that settles releases owed at reconciliation is running
     /// (#1291). It releases revisions only; GC keeps its own cadence.
     startup_release_pass: AtomicBool,
@@ -1954,6 +1959,13 @@ async fn metrics_family_answer(
                         "No such Architecture edge at this pin and rules file",
                     ));
                 }
+            }
+            // #1321: a work bound is named, with the observed value, as on MCP.
+            if let Some(message) = crate::mcp::tools::bounded_work_message(&error) {
+                return Ok((
+                    api_error::error(StatusCode::SERVICE_UNAVAILABLE, "bounded_work", &message),
+                    false,
+                ));
             }
             return Err(ApiError::from(error));
         }
