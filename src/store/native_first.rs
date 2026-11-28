@@ -613,18 +613,26 @@ impl Store {
     }
 
     pub(crate) fn pending_semantic_target(&self) -> Result<Option<PendingSemanticTarget>> {
-        self.with_evidence(|db| {
-            let target = pending_target(db)?;
-            if let Some(target) = &target {
-                selected_ensure!(
-                    target.root_id == self.identity.root_key,
-                    "incompatible_index: pending semantic root differs"
-                );
-            }
-            Ok(target)
-        })
+        self.with_evidence(|db| pending_target_of(db, &self.identity.root_key))
     }
+}
 
+/// The pending semantic target recorded in `db`'s snapshot, checked against `root`.
+pub(super) fn pending_target_of(
+    db: &Connection,
+    root: &str,
+) -> Result<Option<PendingSemanticTarget>> {
+    let target = pending_target(db)?;
+    if let Some(target) = &target {
+        selected_ensure!(
+            target.root_id == root,
+            "incompatible_index: pending semantic root differs"
+        );
+    }
+    Ok(target)
+}
+
+impl Store {
     pub fn semantic_projection_at(
         &self,
         pin: IndexPin,

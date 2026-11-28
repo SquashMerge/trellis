@@ -948,15 +948,36 @@ fn details(code: &str) -> (&'static str, bool) {
 /// The error-text prefix of a document beyond a deterministic input bound.
 pub(crate) const INPUT_BOUNDS_PREFIX: &str = "input_bounds_exceeded: ";
 
-/// [`failure`] for a failed read's `error`: an `input_bounds_exceeded` message names the
-/// bound the document hit (the error text after its code); every other code keeps its
-/// fixed message.
+/// The error-text prefix of a read over a work bound.
+pub(crate) const BOUNDED_WORK_PREFIX: &str = "bounded_work: ";
+
+/// The public message of a read over a work bound: the fixed text, then the bound it hit
+/// and, where the read measured one, the observed value (the error text after its code,
+/// #1321, as the #1119 follow-up does for `input_bounds_exceeded`). `None` when no cause
+/// of `error` names a bound.
+pub(crate) fn bounded_work_message(error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| {
+        cause
+            .to_string()
+            .strip_prefix(BOUNDED_WORK_PREFIX)
+            .map(|bound| format!("{}: {bound}", details("bounded_work").0))
+    })
+}
+
+/// [`failure`] for a failed read's `error`: an `input_bounds_exceeded` or `bounded_work`
+/// message names the bound it hit (the error text after its code); every other code keeps
+/// its fixed message.
 pub fn failure_for(id: &Value, code: &str, error: &anyhow::Error) -> Value {
     let mut envelope = failure(id, code);
     if code == "input_bounds_exceeded"
         && let Some(bound) = error.to_string().strip_prefix(INPUT_BOUNDS_PREFIX)
     {
         envelope["error"]["message"] = json!(format!("Document is beyond an input bound: {bound}"));
+    }
+    if code == "bounded_work"
+        && let Some(message) = bounded_work_message(error)
+    {
+        envelope["error"]["message"] = json!(message);
     }
     envelope
 }

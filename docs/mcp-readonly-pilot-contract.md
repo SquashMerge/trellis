@@ -1506,6 +1506,26 @@ When a caller's binding is stale, possibly stale or absent, the [#724](#amendmen
 - **Catalog.** The `trellis_incoming_calls` output schema adds the required item property and the required data property, and its description names them; the `toolVersion` constant changes. The `tools/list` frame grows by 654 bytes, under the unchanged 235,520-byte compacted bound. Option D (narrowing by a measured call qualifier) is a separate 0.3 issue.
 - **Unchanged.** The name admission rules, `match`, the #724 exclusion and `boundElsewhereOmitted`, warnings, `partial`, the summary text, every other tool, and every bound and MCP budget.
 
+## Amendment (#1321): `bounded_work` names its bound
+
+**Status:** owner ruling 2026-11-26 ([#1321](https://github.com/SquashMerge/trellis/issues/1321), option A), extending the [#1119 follow-up ruling](https://github.com/SquashMerge/trellis/issues/1119)'s naming of `input_bounds_exceeded` bounds to `bounded_work`. It changes only the value of an existing message; no tool object, schema, field or bound changes, and `toolVersion` stays as it is.
+
+- **Scope.** Every `bounded_work` message names its bound, not only the Architecture snapshot's byte bounds: whichever work bound a read hits (reference work, sites, rules work, semantic rows, the snapshot's byte bounds and the rest), the message carries the refusal's text after `bounded_work: `.
+- **Message.** A `bounded_work` failure of the architecture tools, and of find, search and the call graph with `app`, says `Architecture projection work bound exceeded: <bound>`, where `<bound>` is the refusal's text after its code. The Architecture snapshot's byte bounds name the limit and the observed value, for example `architecture stored total: 672452376 bytes, over the 512 MiB limit` ([rules](rules.md#work-bounds-and-located-failures)). The browser's Architecture answer carries the same message with code `bounded_work`, instead of `Storage is unavailable`.
+- **Unchanged.** The code, `retryable:false`, the kept failure and every bound and its value.
+
+## Amendment (#1313 T10b): a head whose semantic catch-up is queued is built on the catch-up
+
+**Status: proposed (owner ruling 2026-11-27 on #1313, "build the proper version of T10b"), for ratification under the supervisor's delegation.** `toolVersion` is unchanged: no tool, schema or answer shape changes. This section wins over the [#798](#amendment-798-a-typed-building-answer-from-the-architecture-tools) "Eager build" sentence where they differ.
+
+- **The exception.** The Architecture owner builds every active runtime's new head eagerly, except a native publication whose semantic catch-up of that same head is already queued. The catch-up's publication supersedes that head, so the owner does not build it unasked.
+- **When it builds.** No timer or poll drives any of these cases.
+  - **On the catch-up's publication.** The catch-up's owner signals the Architecture owner when each catch-up unit ends. A published catch-up moves the head, and the owner builds the new head at once.
+  - **On a read.** A read of the skipped head asks the owner for it, which builds it at once. So `trellis_references`, `trellis_rules_check` and `trellis_rules_explain` still answer at the catch-up head, labelled as catching up (#934), under the #798 wait and `building` rules.
+  - **On a unit that does not publish.** A catch-up unit that ends without publishing (deferred, failed or idle) makes the owner build the skipped head.
+
+  A head built for a read or after such a unit is not skipped again.
+
 ## Amendment (#1293): daemon_stopping
 
 **Status: owner ruling 2026-11-26 ([#1293](https://github.com/SquashMerge/trellis/issues/1293)).** `toolVersion` is **37** (previously 36, #994).

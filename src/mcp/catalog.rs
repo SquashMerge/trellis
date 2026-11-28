@@ -593,9 +593,21 @@ mod tests {
                 all,
                 admission_failure(&id, "deadline_exceeded", &json!(null)),
             ),
+            // #1321: the message names the bound and the observed total.
             (
                 &app,
-                attributed_root(with_basis(failure(&id, "bounded_work")), root, false),
+                attributed_root(
+                    with_basis(crate::mcp::tools::failure_for(
+                        &id,
+                        "bounded_work",
+                        &anyhow::anyhow!(
+                            "bounded_work: architecture stored total: 672452376 bytes, \
+                             over the 512 MiB limit"
+                        ),
+                    )),
+                    root,
+                    false,
+                ),
             ),
             // #1278: an `app` filter answers `building` too.
             (

@@ -953,7 +953,12 @@ background, on one per-checkout owner thread. A worker step that leaves a differ
 rules file from the last step hints the owner (#798), which compares the head and the rules
 file's hash with what it last published and starts a build when they differ; a newer head stops a build that is under way. The owner builds every active runtime's
 new head, with or without a rules file, so the first read after an activation or a publication
-usually finds its result published (#798). Reads never compute the head: any number of them wait for
+usually finds its result published (#798). One head's eager build is skipped (owner ruling
+2026-11-27, "build the proper version of T10b", #1313): a native publication whose semantic
+catch-up of that same head is queued, since the catch-up's publication supersedes it. The owner
+builds on the catch-up's publication. It builds the skipped head itself as soon as a read asks for
+it, so reads still answer at the catch-up head (#934), or when a catch-up unit ends without
+publishing it. Each of these wakes the owner by signal, not a timer. Reads never compute the head: any number of them wait for
 the same build, and each rechecks the pin and rules hash, so a new revision or an edited rules
 file is never served from an older result. A daemon restart or an idle checkout's retirement
 drops the result, and the next activation builds it again.
@@ -1108,7 +1113,8 @@ comparison and final publication.
 A build accounts for references and prepares declaration rules for the whole revision, under the
 existing budgets; layer-edge and exception work is charged per read, on the references that
 read selects. A revision over those budgets fails `bounded_work` for the summary, details and
-unscoped reads. A path-scoped MCP or CLI read then computes on the request: it reads the
+unscoped reads; the browser answer is 503 with code `bounded_work` and a message that names the
+bound and, for the snapshot's byte bounds, the observed value (#1321). A path-scoped MCP or CLI read then computes on the request: it reads the
 revision itself, resolves references and evaluates rules only for its own paths, and answers
 under the budgets of that scope and its usual deadline. That read holds a read transaction
 while it computes. If it cannot finish in time it fails `deadline_exceeded`, which is retryable.

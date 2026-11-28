@@ -241,7 +241,7 @@ fn the_extraction_charge_covers_what_a_selected_read_charges() {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        let (_, stored, _) =
+        let (_, stored, _, _) =
             Store::selected_ancillary_byte_usage(&db, vid, cid, &version, &key.source_set_id)
                 .unwrap();
         let declarations: Vec<_> = native
