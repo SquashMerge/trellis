@@ -1172,3 +1172,21 @@ fn references_prefix_is_a_relative_directory() {
 fn spec_table_names_are_the_catalog_names() {
     assert_eq!(SPECS.map(|spec| spec.name), crate::mcp::catalog::NAMES);
 }
+
+/// #1321: an Architecture tool's `bounded_work` names the bound it hit and the observed
+/// value, as `input_bounds_exceeded` names its bound (#1119 follow-up).
+#[test]
+fn bounded_work_names_its_bound() {
+    let bound = "architecture stored total: 672452376 bytes, over the 512 MiB limit";
+    let error = anyhow::anyhow!("bounded_work: {bound}");
+    let named = format!("Architecture projection work bound exceeded: {bound}");
+    let envelope = crate::mcp::architecture::failure(&json!(7), &error);
+    assert_eq!(envelope["error"]["code"], "bounded_work");
+    assert_eq!(envelope["error"]["message"], named);
+    assert_eq!(envelope["error"]["retryable"], false);
+    // Other codes keep their fixed messages.
+    assert_eq!(
+        failure_for(&json!(7), "store_unavailable", &error)["error"]["message"],
+        "Store is unavailable"
+    );
+}
