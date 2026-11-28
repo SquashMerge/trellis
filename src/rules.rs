@@ -480,6 +480,20 @@ fn parse_bases(
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<BTreeMap<String, Bases>> {
     check()?;
+    // Only a type or an impl reads its syntax. A document without one, such as one published
+    // with only its file module (#1300) or one kept as its file module because it is over the
+    // snapshot's document bound (#1321), is not parsed: every row's bases are empty, and the
+    // parse bound below does not apply to it.
+    let typed = |d: &crate::native_evidence::Declaration| {
+        matches!(d.kind.as_str(), "type" | "implementation")
+    };
+    if !doc.declarations.iter().any(typed) {
+        return Ok(doc
+            .declarations
+            .iter()
+            .map(|d| (d.syntax_id.clone(), Bases::none()))
+            .collect());
+    }
     ensure!(
         doc.file.text.len() <= CONFIG_BYTES,
         "bounded_work: selector source exceeds file bound"
@@ -493,18 +507,6 @@ fn parse_bases(
         _ => anyhow::bail!("store_unavailable: unknown selector language"),
     };
     let source = &doc.file.text;
-    // Only a type or an impl reads its syntax. A document without one, such as one published
-    // with only its file module (#1300), is not parsed: every row's bases are empty.
-    let typed = |d: &crate::native_evidence::Declaration| {
-        matches!(d.kind.as_str(), "type" | "implementation")
-    };
-    if !doc.declarations.iter().any(typed) {
-        return Ok(doc
-            .declarations
-            .iter()
-            .map(|d| (d.syntax_id.clone(), Bases::none()))
-            .collect());
-    }
     // A Rust source past measurement's parse-work budget reads as one parser error (#1300).
     let tree = crate::syntax_bounds::parse_stored(
         &doc.key.language,

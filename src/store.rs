@@ -982,7 +982,7 @@ impl std::io::Write for EncodedSourceBudget {
 /// Each refusal is `bounded_work` and names its limit and the observed value (#1321).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArchitectureByteLimits {
-    /// One document's captured source.
+    /// One document's captured source: a document over it is read as its file module only.
     pub(crate) document: u64,
     /// All stored bytes the read charges: each document's source and the native rows the read
     /// decodes, plus the retained dependency and config inputs (owner ruling 2026-11-26,
@@ -1023,13 +1023,6 @@ impl ArchitectureByteLimits {
         }
         TEST_ARCHITECTURE_BYTE_LIMITS.set(Some(limits));
         Reset
-    }
-
-    fn document_refusal(self, path: &str, bytes: u64) -> anyhow::Error {
-        anyhow::anyhow!(
-            "bounded_work: architecture document source: {path} is {bytes} bytes, over the {} limit",
-            limit_text(self.document)
-        )
     }
 
     fn check_stored(self, total: u64) -> Result<()> {
@@ -2051,6 +2044,8 @@ impl EvidenceResponse {
         let mut unparsed = BTreeSet::new();
         let mut pending = Vec::new();
         let mut stored_bytes = 0u64;
+        // Documents over the per-document bound, read only for their file module.
+        let mut module_only = BTreeSet::new();
         // A refusal names the limit it hit and the whole revision's total (#1321). Once the
         // stored total is over its limit the read can only fail: it frees the rows it fetched,
         // fetches no more, and charges the remaining documents' sizes for the total it reports.
@@ -2131,10 +2126,7 @@ impl EvidenceResponse {
                 (None, Some(header)) => (header.bytes, header.read_a_bytes),
                 (None, None) => unreachable!("a document is kept or has a header"),
             };
-            let document_bytes = bytes.max(0) as u64;
-            if document_bytes > limits.document {
-                return Err(limits.document_refusal(&key.path, document_bytes));
-            }
+            let oversized = bytes.max(0) as u64 > limits.document;
             stored_bytes = stored_bytes.saturating_add(stored);
             if !over && stored_bytes > limits.stored {
                 over = true;
@@ -2144,7 +2136,16 @@ impl EvidenceResponse {
             if over {
                 continue;
             }
-            if let Some(reason) = crate::syntax_bounds::module_only_reason(diagnostic.as_deref()) {
+            if oversized {
+                // A source over the snapshot's per-document bound (owner ruling 2026-11-26,
+                // #1321) is kept as its file module, as capture keeps one over
+                // `--max-file-bytes`, and is never parsed: `partialFiles` names it `oversized`.
+                evidence_gaps.insert(key.clone(), crate::skipped_source::Skip::Oversized.reason());
+                unparsed.insert(key.clone());
+                module_only.insert(key.clone());
+            } else if let Some(reason) =
+                crate::syntax_bounds::module_only_reason(diagnostic.as_deref())
+            {
                 evidence_gaps.insert(key.clone(), reason);
             }
             if crate::syntax_bounds::past_parse_work(diagnostic.as_deref()) {
@@ -2272,10 +2273,18 @@ impl EvidenceResponse {
                 if decode.is_none() {
                     continue;
                 }
-                let fetched = decoded
+                let mut fetched = decoded
                     .next()
                     .flatten()
                     .context("cancelled: architecture decode not started")??;
+                if module_only.contains(key) {
+                    fetched.declarations.retain(|declaration| {
+                        declaration.kind == "module" && declaration.ancestors.is_empty()
+                    });
+                    fetched.declarations.shrink_to_fit();
+                    fetched.calls = Vec::new();
+                    fetched.regions = Vec::new();
+                }
                 selected_ensure!(
                     fetched.file.language == key.language,
                     "incompatible_index: architecture language mismatch"
