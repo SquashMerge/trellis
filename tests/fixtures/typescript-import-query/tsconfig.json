@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2020",
+    "jsx": "preserve"
+  },
+  "files": ["mock.ts", "mock.tsx", "vi.d.ts", "api/chat.ts"]
+}

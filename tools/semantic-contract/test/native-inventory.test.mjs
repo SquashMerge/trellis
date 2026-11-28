@@ -7,7 +7,7 @@ import {
 } from "../native-inventory.mjs";
 
 const producer = "trellis.native.syntax";
-const version = "native-v20";
+const version = "native-v21";
 const languages = ["java", "rust", "python", "javascript", "typescript"];
 
 test("NATIVE.INVENTORY production descriptor declares each supported language", () => {
@@ -38,6 +38,7 @@ test("NATIVE.INVENTORY unknown producer, future version and language fail closed
     [producer, "native-unregistered-future", "rust"],
     [producer, "native-v3", "rust"],
     [producer, "native-v4", "rust"],
+    [producer, "native-v20", "rust"],
     [producer, version, "go"],
   ]) {
     assert.equal(trustedInventory(id, descriptorVersion, language), undefined);
