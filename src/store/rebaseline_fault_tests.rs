@@ -2309,7 +2309,7 @@ fn real_source_above_injected_ancillary_cap_keeps_selected_source_available() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
-    let (max_ancillary, native_ancillary, class_ancillary) =
+    let (max_ancillary, native_ancillary, class_ancillary, _) =
         Store::selected_ancillary_byte_usage(&db, vid, cid, &version_id, &source_set_id).unwrap();
     let total_ancillary = native_ancillary + class_ancillary;
     let source_json_bytes: i64 = db
