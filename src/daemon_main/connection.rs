@@ -677,6 +677,7 @@ impl SelectedRead<'_> {
                     .err()
                     .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
+                && !checkout.stopping()
             {
                 #[cfg(all(feature = "test-support", unix))]
                 if let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET") {
@@ -1069,6 +1070,11 @@ fn await_first_head(
         // on every wake.
         if let Some(blocker) = checkout.recovery_blocker() {
             anyhow::bail!("{blocker}");
+        }
+        // An explicit daemon stop cancelled the first index: it restarts on
+        // the next activation, so this wait ends now (#1293).
+        if checkout.stopping() {
+            anyhow::bail!("daemon_unavailable: the daemon is stopping");
         }
         #[cfg(all(feature = "test-support", unix))]
         if reported.is_none()

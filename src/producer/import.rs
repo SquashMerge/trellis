@@ -34,6 +34,11 @@ pub trait ImportScheduler: Send + Sync {
     fn state_version(&self) -> u64;
     /// Wait until the runtime state changes after `seen`, or `timeout` passes.
     fn wait_state_change(&self, seen: u64, timeout: Duration);
+    /// Whether an explicit daemon stop was requested (#1293): a wait for an accepted
+    /// request then ends, leaving the request for the next activation.
+    fn stopping(&self) -> bool {
+        false
+    }
     /// Enqueue `options` as request `id`. Only `submit` calls this.
     fn enqueue_generated_semantic_import(
         &self,
@@ -201,9 +206,22 @@ pub fn wait(
     options: &GeneratedImportOptions,
     id: String,
 ) -> Result<ImportOutcome> {
+    // An explicit daemon stop ends the wait without settling the request: it stays
+    // queued or running, its inputs stay, and the next activation completes it
+    // (Decision 0008 section 3, #1293).
+    let stopped = |id: &str| {
+        anyhow::anyhow!(
+            "{}; request {id} stays accepted",
+            crate::daemon::registry::STOPPING_ACCEPTED
+        )
+    };
     loop {
-        let row = read_request(store, &id)?
-            .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
+        let row = match read_request(store, &id) {
+            Ok(row) => row,
+            Err(_) if scheduler.stopping() => return Err(stopped(&id)),
+            Err(error) => return Err(error),
+        }
+        .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
         match row.state.as_str() {
             "done" => {
                 let pin = row.revision.ok_or_else(|| {
@@ -233,6 +251,7 @@ pub fn wait(
                     error_code: Some(row.error_code.unwrap_or_else(|| "index_failed".into())),
                 });
             }
+            "queued" | "running" if scheduler.stopping() => return Err(stopped(&id)),
             "queued" | "running" => {
                 // A running request is the closing worker's to finish; a queued one is
                 // never started by a closing runtime.

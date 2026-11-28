@@ -27,6 +27,7 @@ mod daemon_lifecycle;
 mod daemon_mcp;
 mod daemon_registry;
 mod daemon_socket;
+mod daemon_stop;
 mod gc_record_report;
 mod git_status;
 mod index_coordinator;

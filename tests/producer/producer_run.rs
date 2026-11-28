@@ -1339,3 +1339,47 @@ fn crash_abandoned_auto_run_restarts_after_min_interval() {
     assert_abandoned_and_stripped(&world, &foreign);
     assert_eq!(auto_records(&world).len(), 2);
 }
+
+/// #1293: an explicit `daemon stop` while a CLI producer run's generated import is claimed.
+/// The run's import wait ends on the stop command, so the stop returns and releases the lock
+/// instead of joining a wait that the cancelled claim would never end. The request stays
+/// `running` with the run's batch in place, and the next daemon completes it.
+#[test]
+fn a_stop_during_a_runs_claimed_import_leaves_its_request_for_the_next_daemon() {
+    let world = World::with(&[
+        (
+            "TRELLIS_TEST_SEMANTIC_CRASH_AFTER_CLAIM_SOCKET",
+            "claim.sock",
+        ),
+        ("TRELLIS_TEST_DAEMON_STOP_SOCKET", "stop.sock"),
+    ]);
+    let stop_hook = std::os::unix::net::UnixListener::bind(world.hook("stop.sock")).unwrap();
+    world.emitting();
+    let run = world.spawn_run(&[]);
+    let claim = world.hook("claim.sock");
+    trellis::testing::wait_until("the run's import claim", || claim.exists());
+    let stop = support::stop_reaching_runtimes(&world.checkout.home, &stop_hook);
+    drop(UnixStream::connect(&claim).unwrap());
+    let stopped = support::output_within_backstop(stop, "daemon stop");
+    crate::child::assert_cli_success(&stopped, "daemon stop");
+    let output = run.wait_with_output().unwrap();
+    // The stop ended this client's connection; the wait behind it ended on the stop.
+    assert!(
+        !output.status.success(),
+        "the import cannot complete in a stopping daemon"
+    );
+    let (id, state, _) = support::request_rows(&world.checkout).pop().unwrap();
+    assert_eq!(state, "running");
+
+    crate::child::run_cli(
+        world
+            .checkout
+            .cli()
+            .args(["status", "--workspace"])
+            .arg(&world.checkout.root),
+        "status after the stop",
+    );
+    trellis::testing::wait_until("the next daemon completes the import", || {
+        support::request_state(&world.checkout, &id).as_deref() == Some("done")
+    });
+}

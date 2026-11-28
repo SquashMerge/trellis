@@ -724,3 +724,61 @@ fn stat_check_repairs_a_corrupt_head_before_any_read() {
     assert_ne!(revision, corrupted);
     assert_reimported(&world, &pid);
 }
+
+/// #1293: an explicit `daemon stop` while a pickup import's request is claimed. The stop
+/// command reaches the runtime first, so the pickup's import wait ends on it instead of
+/// holding the stop for the import. The stop returns and releases the lock; the request
+/// stays `running` with its batch in place, and the next daemon completes it.
+#[test]
+fn a_stop_during_a_pickup_import_leaves_its_request_for_the_next_daemon() {
+    let gate = Builder::new().prefix("stop-").tempdir_in("/tmp").unwrap();
+    let claim = gate.path().join("claim.sock");
+    let stop_path = gate.path().join("stop.sock");
+    let stop_hook = UnixListener::bind(&stop_path).unwrap();
+    let mut env = fast();
+    env.push((
+        "TRELLIS_TEST_SEMANTIC_CRASH_AFTER_CLAIM_SOCKET".into(),
+        claim.display().to_string(),
+    ));
+    env.push((
+        "TRELLIS_TEST_DAEMON_STOP_SOCKET".into(),
+        stop_path.display().to_string(),
+    ));
+    let checkout = start_checkout(workspace, &env);
+    let (tripwire, _marker) = tripwire_dir(checkout.temp.path());
+    let artifact = checkout.temp.path().join("index.scip");
+    fs::write(&artifact, java_bytes(&checkout, None)).unwrap();
+    let pickup = set_command(&checkout, &tripwire, &artifact)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The worker has claimed the import and holds it at the hook.
+    trellis::testing::wait_until("the pickup import's claim", || claim.exists());
+    let stop = support::stop_reaching_runtimes(&checkout.home, &stop_hook);
+    drop(UnixStream::connect(&claim).unwrap());
+    let stopped = support::output_within_backstop(stop, "daemon stop");
+    crate::child::assert_cli_success(&stopped, "daemon stop");
+    let output = pickup.wait_with_output().unwrap();
+    // The stop ended this client's connection; the wait behind it ended on the stop.
+    assert!(
+        !output.status.success(),
+        "the import cannot complete in a stopping daemon"
+    );
+    // Not settled: the claimed request is still running for the next activation.
+    let (id, state, _) = request_rows(&checkout).pop().unwrap();
+    assert_eq!(state, "running");
+
+    // The next daemon reclaims and completes it from the batch the stop left in place.
+    crate::child::run_cli(
+        checkout
+            .cli()
+            .args(["status", "--workspace"])
+            .arg(&checkout.root),
+        "status after the stop",
+    );
+    trellis::testing::wait_until("the next daemon completes the import", || {
+        support::request_state(&checkout, &id).as_deref() == Some("done")
+    });
+    stop_daemon(&checkout.home);
+}

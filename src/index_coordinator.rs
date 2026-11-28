@@ -1339,9 +1339,12 @@ pub(crate) fn enqueue_retained_runs(store: &Store) -> Result<()> {
 pub(crate) type OwningWatcher =
     std::sync::Mutex<Option<(std::sync::Weak<WriterSession>, WatcherWork)>>;
 
+/// `cancel` is the daemon's stop command (#1293): a claim it interrupts stays
+/// running for the next activation's verified reclaim.
 pub(crate) fn drain_one_request_with_watcher(
     store: &Store,
     session: &Arc<WriterSession>,
+    cancel: &CancelFlag,
     watcher: &OwningWatcher,
     progress: impl Fn(&str, IndexProgress) + Sync,
     before_claim: impl Fn(&dyn Fn() -> Result<Option<Request>>) -> Result<Option<Request>>,
@@ -1349,7 +1352,7 @@ pub(crate) fn drain_one_request_with_watcher(
     drain_requests_observed_with_cancel(
         store,
         session,
-        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel,
         progress,
         |_, _, _| {},
         1,

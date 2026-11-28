@@ -24,8 +24,23 @@ impl CheckoutRegistry {
         Ok(())
     }
 
-    /// Explicit shutdown bypasses idle grace, not accepted work or retirement.
-    /// Call only after closing and draining client/browser ingress.
+    /// Send every active runtime the explicit stop command (#1293). Accepted
+    /// work stops at its next cancellation point instead of draining, so
+    /// client waits on it end too. Idempotent.
+    pub async fn request_stop(registry: Arc<tokio::sync::Mutex<Self>>) {
+        let checked = registry.lock().await;
+        for runtime in checked.runtimes.values() {
+            if let Ok(resources) = runtime.resources() {
+                resources.scheduler.request_stop();
+            }
+        }
+    }
+
+    /// Explicit shutdown bypasses idle grace and accepted work (#1293, owner
+    /// ruling 2026-11-26): each runtime closes at its worker's next step
+    /// boundary. Queued and running requests stay durable and recover on the
+    /// next activation (Decision 0008 §3). Call after closing client and
+    /// browser ingress.
     pub async fn shutdown(registry: Arc<tokio::sync::Mutex<Self>>) -> anyhow::Result<()> {
         let signal = {
             let mut checked = registry.lock().await;
@@ -39,12 +54,25 @@ impl CheckoutRegistry {
             let notified = signal.notified();
             {
                 let mut checked = registry.lock().await;
-                for key in checked.entries.keys().cloned().collect::<Vec<_>>() {
-                    checked
-                        .release(&key)
-                        .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+                for key in checked.runtimes.keys().cloned().collect::<Vec<_>>() {
+                    let retired = match checked.runtimes[&key].resources() {
+                        Ok(resources) => {
+                            resources.scheduler.request_stop();
+                            resources.scheduler.runtime_phase() == http::RuntimePhase::Retired
+                        }
+                        Err(_) => true,
+                    };
+                    if retired {
+                        checked.finish_retired(&key);
+                    }
                 }
                 if checked.runtimes.is_empty() {
+                    // Nothing is active any more; accepted work left is durable
+                    // and belongs to the next activation.
+                    for entry in checked.entries.values_mut() {
+                        entry.released = true;
+                        entry.pending_work = false;
+                    }
                     return Ok(());
                 }
             }
