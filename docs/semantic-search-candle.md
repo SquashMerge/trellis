@@ -191,8 +191,8 @@ Full-vector recall@5/10 and MRR were **0.44/0.56/0.28934607**.
 CPU forms `a` and `b` were not run; no claim about those forms follows from `c`.
 
 The source, binary, model, input and output hashes, ordered-ID restoration and full
-per-card/per-query reports were local in
-`~/projects/odin/trellis-evidence/issue-211/`, which was lost with the reference corpus.
+per-card/per-query reports were kept in a local evidence directory outside Git, which was
+lost with the reference corpus.
 CPU and Metal seven-row model checks
 and explicit real-model fixture tests passed separately. The first full `./tools/verify` passed
 on Rust 1.99.1: all five lanes passed, including 1,510 Rust tests (7 skipped).

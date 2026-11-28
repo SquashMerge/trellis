@@ -197,10 +197,12 @@ identity, the card and query hashes and ordered-ID hashes, the harness script ha
 resolved Python packages, the vector and `eval.json` hashes, and the model pin manifest.
 `tools/semantic-search/check-parity.py` pins the same hashes.
 
-**Location.** On the owner's Mac the corpus is `~/projects/squashmerge/trellis-evidence/1323/reference/`,
-which is the `--evidence-root` for the checker. It holds `results/cards.jsonl`, `results/emb/`,
-`results/eval.json`, `eval/queries.json`, `scripts/`, `venv/`, `models/voyage-4-nano/` and
-`verified-download-manifest.json`.
+**Location.** The corpus is a local evidence root outside Git on the release machine, passed to
+the checker as `--evidence-root`. It holds `results/cards.jsonl`, `results/emb/`,
+`results/eval.json`, `eval/queries.json`, `scripts/`, `venv/`, `models/voyage-4-nano/`,
+`verified-download-manifest.json` and `local-manifest.json`. The last one records the literal
+local inputs, such as the original workspace path, that this public manifest keeps only as
+hashes.
 
 **History.** The original #214 evidence root was lost in November 2026 with no backup. #1323
 regenerated it by the original method. The four harness scripts were recovered verbatim from the
@@ -218,10 +220,12 @@ your real `HOME`.
 1. **Indexer.** `git archive 693c32cb2d47a16cf69c8265ae7a1291b71fbd93` into a scratch directory
    and build it with `cargo build --locked --release --bin trellis`.
 2. **Index.** The snapshot has no `.git`, so the source-set ID, and with it every `sid:v1` ID,
-   hashes the canonical workspace path. Extract the same snapshot at the original #214 path named
-   in the manifest's `inputs.workspaceRoot`, index it with
+   hashes the canonical workspace path. Re-index at the original canonical workspace path
+   recorded in the local reference manifest (`local-manifest.json` in the evidence root): extract
+   the same snapshot there, run
    `HOME=<root>/home XDG_CACHE_HOME= trellis index --workspace <that path>`, stop the daemon it
-   started, and remove the path. The index's source set must equal `inputs.sourceSetId`.
+   started, and remove the path. The index key must equal `79e73f12…` (`inputs.indexKey`), and the
+   index's source set must equal `inputs.sourceSetId`.
 3. **Cards.** `venv/bin/python -I scripts/cards.py <index.db> results/cards.jsonl`. The output
    must match `cards.sha256` byte for byte; if it doesn't, stop: the inputs differ.
 4. **Venv.** `uv venv --python 3.12 venv`, then `uv pip install --exclude-newer

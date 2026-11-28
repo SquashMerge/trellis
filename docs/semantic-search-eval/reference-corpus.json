@@ -17,12 +17,13 @@
       "results/eval.json": "Re-run for voyage-4-nano only. The lost file also held qwen3-embedding-0.6b, jina-v2-base-code and nomic-embed-text-v2-moe entries, which the parity check never reads; its voyage-4-nano and BM25 entries are computed by the same script from identical inputs."
     }
   },
-  "location": "Local only, outside Git: ~/projects/squashmerge/trellis-evidence/1323/reference/ (the --evidence-root for check-parity.py).",
+  "location": "A local evidence root outside Git, passed to check-parity.py as --evidence-root.",
   "inputs": {
     "sourceCommit": "693c32cb2d47a16cf69c8265ae7a1291b71fbd93",
     "indexer": "release `trellis` built from the same commit: cargo build --locked --release --bin trellis (default features, Rust 1.99.1)",
-    "workspaceRoot": "~/projects/odin/trellis-evidence/semantic-search/repo (the original #214 path; sourceSetId hashes its expanded canonical form)",
-    "workspaceRootNote": "`git archive` snapshot with no .git, so the source-set ID and every sid:v1 declaration ID hash the canonical root path. Index the snapshot at this exact path (create it, index, remove it) to reproduce the saved IDs.",
+    "workspaceRoot": "The original #214 canonical workspace path, recorded only in local-manifest.json inside the evidence root.",
+    "workspaceRootNote": "`git archive` snapshot with no .git, so the source-set ID and every sid:v1 declaration ID hash the canonical root path. Re-index at the original canonical workspace path (create it, index, remove it); the index key must equal indexKey.",
+    "indexKey": "79e73f121e23a118631a8796a238a34aacb916c681fa4151f093237b382cd207",
     "extractorVersion": "native-v6-delta-v1",
     "indexRevision": 2,
     "sourceSetId": "source-set:v1:path-79e73f121e23a118631a8796a238a34aacb916c681fa4151f093237b382cd207"
