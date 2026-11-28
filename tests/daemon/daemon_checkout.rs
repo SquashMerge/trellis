@@ -2192,10 +2192,23 @@ async fn idle_without_periodic_inventory(
     registry.attach_launch(1, id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
     ready(&runtime).await;
+    assert!(
+        runtime
+            .browser_scheduler()
+            .unwrap()
+            .delay_timed_work_for_tests()
+    );
+    worker_idle_without_timed_work(&runtime).await;
+    runtime
+}
+
+/// Once timed work is delayed: wait for the worker to block with no wake
+/// pending and no deadline within reach of the test.
+#[cfg(feature = "test-support")]
+async fn worker_idle_without_timed_work(
+    runtime: &std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+) {
     let scheduler = runtime.browser_scheduler().unwrap();
-    assert!(scheduler.delay_timed_work_for_tests());
-    // Synchronize on the worker blocking with no wake pending and no deadline
-    // within reach of this test.
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Some(deadline) = scheduler.worker_asleep_until_for_tests()
@@ -2210,7 +2223,46 @@ async fn idle_without_periodic_inventory(
     })
     .await
     .expect("worker did not go idle");
-    runtime
+}
+
+/// #1389: the readiness wait does not cover maintenance, so the retention pass
+/// after startup reconciliation can still be running when a test delays timed
+/// work. That unit's end must not bring maintenance back within reach.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_running_retention_unit_does_not_undo_delayed_timed_work() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    // Hold startup so the retention hook is installed before the release pass
+    // that follows it can begin.
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_startup_tx, resume_startup_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let resume_startup_rx = std::sync::Mutex::new(resume_startup_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        let _ = startup_tx.try_send(());
+        let _ = resume_startup_rx.lock().unwrap().recv();
+    }));
+    let runtime = registry.activate(&id.root_key).unwrap();
+    entered(startup_rx, "startup reconciliation hook").await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (unit_tx, unit_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_unit_tx, resume_unit_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    scheduler.on_next_maintenance_unit_for_tests(move || {
+        unit_tx.send(()).unwrap();
+        let _ = resume_unit_rx.recv();
+    });
+    resume_startup_tx.send(()).unwrap();
+    entered(unit_rx, "retention unit hook").await;
+    ready(&runtime).await;
+    // Timed work is delayed while the unit runs; the unit then finishes.
+    assert!(scheduler.delay_timed_work_for_tests());
+    resume_unit_tx.send(()).unwrap();
+    worker_idle_without_timed_work(&runtime).await;
 }
 
 /// Decision 0009 §8: a durable enqueue through any Store instance wakes the idle
