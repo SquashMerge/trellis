@@ -13,11 +13,6 @@ const INVENTORIES = new Map([
     "trellis.native.syntax\u0000native-v21",
     { java: [], rust: [], python: [], javascript: [], typescript: [] },
   ],
-  // Retained conformance captures made before the import type-query grammar fix.
-  [
-    "trellis.native.syntax\u0000native-v20",
-    { java: [], rust: [], python: [], javascript: [], typescript: [] },
-  ],
   // Conformance producer used by the example fixture and the toolkit tests. Like the Rust
   // native producer (`EXTRACTION_INPUTS` in src/native_evidence.rs), it measures a document
   // from only its own bytes, path and language, so every language declares `[]`.

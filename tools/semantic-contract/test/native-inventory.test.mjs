@@ -13,7 +13,6 @@ const languages = ["java", "rust", "python", "javascript", "typescript"];
 test("NATIVE.INVENTORY production descriptor declares each supported language", () => {
   assert.deepEqual(productionInventoryEntries(), [
     [producer, version, languages.map((language) => [language, []])],
-    [producer, "native-v20", languages.map((language) => [language, []])],
   ]);
   for (const language of languages) {
     assert.deepEqual(trustedInventory(producer, version, language), []);
@@ -39,6 +38,7 @@ test("NATIVE.INVENTORY unknown producer, future version and language fail closed
     [producer, "native-unregistered-future", "rust"],
     [producer, "native-v3", "rust"],
     [producer, "native-v4", "rust"],
+    [producer, "native-v20", "rust"],
     [producer, version, "go"],
   ]) {
     assert.equal(trustedInventory(id, descriptorVersion, language), undefined);
